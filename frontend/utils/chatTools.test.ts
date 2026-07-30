@@ -1,9 +1,35 @@
 import "fake-indexeddb/auto";
-import { describe, expect, it } from "vitest";
-import { replaceDocument, setActiveRagOwner, setShelbyBlobInventory } from "@/utils/ragOrama";
-import { runChatTool } from "@/utils/chatTools";
+import { describe, expect, it, vi } from "vitest";
+import { invalidateShelbyBlobInventory, replaceDocument, setActiveRagOwner, setShelbyBlobInventory } from "@/utils/ragOrama";
+import { asksForLiveBlobInventoryRefresh, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, runChatTool } from "@/utils/chatTools";
 
 describe("chat tools", () => {
+  it("recognizes only narrow inventory confirmation follow-ups", () => {
+    expect(isBlobInventoryConfirmationFollowUp("chắc chưa?")).toBe(true);
+    expect(isBlobInventoryConfirmationFollowUp("Kiểm tra lại đi")).toBe(true);
+    expect(isBlobInventoryConfirmationFollowUp("Are you sure?")).toBe(true);
+    expect(isBlobInventoryConfirmationFollowUp("Thời tiết hôm nay thế nào?")).toBe(false);
+  });
+
+  it("recognizes explicit requests for a live inventory refresh", () => {
+    expect(asksForLiveBlobInventoryRefresh("Kiểm tra số blob hiện tại")).toBe(true);
+    expect(asksForLiveBlobInventoryRefresh("Refresh my wallet blob count")).toBe(true);
+    expect(asksForLiveBlobInventoryRefresh("Ví này có bao nhiêu blob?")).toBe(false);
+  });
+
+  it("routes an explicit live wallet inventory request to the inventory tool", async () => {
+    const owner = "0xlive-inventory-test";
+    await setActiveRagOwner(owner);
+    await setShelbyBlobInventory(owner, ["one.txt", "two.pdf"]);
+
+    const result = await runChatTool("Kiểm tra số blob hiện tại của ví tôi");
+
+    expect(result).toMatchObject({
+      name: "blob_inventory",
+      data: { count: 2, status: "verified" },
+    });
+  });
+
   it("stops before hydrating tools when the request was aborted", async () => {
     const controller = new AbortController();
     controller.abort();
@@ -17,6 +43,79 @@ describe("chat tools", () => {
     expect((await runChatTool("Ví tôi có bao nhiêu blob?"))?.text).toContain("1 blob");
     expect(await runChatTool("How many blobs exist across the entire Shelby network?", undefined, { language: "en" })).toBeNull();
     expect((await runChatTool("How many blobs does my wallet have?", undefined, { language: "en" }))?.text).toContain("1 blob");
+  });
+
+  it("returns only the requested inventory detail", async () => {
+    const owner = "0xinventory-summary-test";
+    const names = ["one.pdf", "two.png", "three.txt", "four.mp4", "five.zip"];
+    await setActiveRagOwner(owner);
+    await setShelbyBlobInventory(owner, names);
+
+    const summary = await runChatTool("Ví tôi có bao nhiêu blob?");
+    expect(summary).toMatchObject({
+      name: "blob_inventory",
+      data: {
+        kind: "blob_inventory",
+        status: "verified",
+        count: 5,
+        examples: [],
+      },
+    });
+    expect(summary?.text).toContain("5 blob");
+    expect(summary?.text).not.toContain("one.pdf");
+    expect(summary?.data?.names).toBeUndefined();
+
+    const sample = await runChatTool("Ví tôi có những blob nào?");
+    expect(sample?.data?.examples).toEqual(names.slice(0, 3));
+    expect(sample?.text).toContain("one.pdf");
+    expect(sample?.text).not.toContain("four.mp4");
+    expect(sample?.data?.names).toBeUndefined();
+
+    const full = await runChatTool("Liệt kê tất cả blob của tôi");
+    expect(full?.data?.names).toEqual(names);
+    expect(full?.text).toContain("five.zip");
+  });
+
+  it("rejects model phrasing that changes a verified inventory count or examples", async () => {
+    const owner = "0xinventory-answer-check";
+    await setActiveRagOwner(owner);
+    await setShelbyBlobInventory(owner, ["one.pdf", "two.png"]);
+    const count = readBlobInventory("count");
+    const sample = readBlobInventory("sample");
+
+    expect(isBlobInventoryAnswerConsistent(count, "Ví này có 2 blob.")).toBe(true);
+    expect(isBlobInventoryAnswerConsistent(count, "Ví này có 3 blob.")).toBe(false);
+    expect(isBlobInventoryAnswerConsistent(count, "Có 2 blob, không phải 3 blob.")).toBe(false);
+    expect(isBlobInventoryAnswerConsistent(sample, "Có 2 blob, ví dụ one.pdf và two.png.")).toBe(true);
+    expect(isBlobInventoryAnswerConsistent(sample, "Có 2 blob, ví dụ one.pdf.")).toBe(false);
+  });
+
+  it("does not present an invalidated inventory snapshot as current", async () => {
+    const owner = "0xinventory-stale-test";
+    await setActiveRagOwner(owner);
+    await setShelbyBlobInventory(owner, ["cached.pdf"]);
+    await invalidateShelbyBlobInventory(owner);
+
+    const result = await runChatTool("Ví tôi có bao nhiêu blob?");
+    expect(result?.data).toMatchObject({ status: "stale", count: 1 });
+    expect(result?.text).toContain("chưa thể xác nhận số hiện tại");
+  });
+
+  it("does not call an old successful snapshot current", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(new Date("2026-07-30T00:00:00Z").getTime());
+    try {
+      const owner = "0xinventory-old-test";
+      await setActiveRagOwner(owner);
+      await setShelbyBlobInventory(owner, ["cached.pdf"]);
+      now.mockReturnValue(new Date("2026-07-30T00:06:00Z").getTime());
+
+      const result = await runChatTool("Ví tôi có bao nhiêu blob?");
+
+      expect(result?.data).toMatchObject({ status: "stale", freshness: "stale_cache", count: 1 });
+      expect(result?.text).toContain("Snapshot này có thể đã cũ");
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("shows the image and its indexed description instead of sending its filename to an LLM", async () => {

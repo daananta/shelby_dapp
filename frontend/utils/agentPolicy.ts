@@ -41,7 +41,7 @@ export function buildAgentSystemInstruction(intent: QueryIntent): string {
  * the authority for normal Cloud conversations.
  */
 export function buildAdaptiveAgentSystemInstruction(): string {
-  const skills = [generalKnowledge, documentRetrieval]
+  const skills = [generalKnowledge, walletShelby, documentRetrieval]
     .map(removeFrontmatter)
     .join("\n\n");
   return `${agentPolicy.trim()}\n\nAvailable operating skills:\n${skills}`;

@@ -12,6 +12,13 @@ export interface AccessPolicyInfo {
   canAccess?: boolean | null;
 }
 
+export interface AccessPoliciesSnapshot {
+  policies: Map<string, AccessPolicyInfo>;
+  /** False means at least one policy could not be verified or decoded. */
+  verified: boolean;
+  unresolvedNames: string[];
+}
+
 class BcsReader {
   private offset = 0;
   constructor(private readonly data: Uint8Array) {}
@@ -98,30 +105,40 @@ export function createAccessControlBlobName(ownerAddress: string, blobNameSuffix
  * Queries the same on-chain source as shelbyproject's Explorer. A query error
  * deliberately remains `unknown`, never silently becomes a public blob.
  */
-export async function queryAccessPolicy(ownerAddress: string, blobNameSuffix: string): Promise<AccessPolicyInfo> {
+export async function queryAccessPolicy(ownerAddress: string, blobNameSuffix: string, signal?: AbortSignal): Promise<AccessPolicyInfo> {
   try {
+    signal?.throwIfAborted();
     const result = await aptosClient().view({
       payload: {
         function: `${ACCESS_CONTROL_MODULE_ADDRESS}::access_control::query3_bcs`,
         functionArguments: [ownerAddress, createAccessControlBlobName(ownerAddress, blobNameSuffix)],
       },
     });
+    signal?.throwIfAborted();
     if (typeof result[0] !== "string") return { type: "unknown", canAccess: null };
     return parseAccessPolicyQuery(result[0]);
   } catch (error) {
+    if (signal?.aborted) throw error;
     console.warn(`Không thể truy vấn access policy cho ${blobNameSuffix}:`, error);
     return { type: "unknown", canAccess: null };
   }
 }
 
-export async function queryAccessPolicies(ownerAddress: string, blobNames: string[]): Promise<Map<string, AccessPolicyInfo>> {
-  const result = new Map<string, AccessPolicyInfo>();
+export async function queryAccessPolicies(ownerAddress: string, blobNames: string[], signal?: AbortSignal): Promise<AccessPoliciesSnapshot> {
+  const policiesByName = new Map<string, AccessPolicyInfo>();
   const uniqueNames = [...new Set(blobNames.filter(Boolean))];
   const batchSize = 6;
   for (let offset = 0; offset < uniqueNames.length; offset += batchSize) {
+    signal?.throwIfAborted();
     const batch = uniqueNames.slice(offset, offset + batchSize);
-    const policies = await Promise.all(batch.map((blobName) => queryAccessPolicy(ownerAddress, blobName)));
-    batch.forEach((blobName, index) => result.set(blobName, policies[index]));
+    const policies = await Promise.all(batch.map((blobName) => queryAccessPolicy(ownerAddress, blobName, signal)));
+    signal?.throwIfAborted();
+    batch.forEach((blobName, index) => policiesByName.set(blobName, policies[index]));
   }
-  return result;
+  const unresolvedNames = uniqueNames.filter((name) => policiesByName.get(name)?.type === "unknown");
+  return {
+    policies: policiesByName,
+    verified: unresolvedNames.length === 0,
+    unresolvedNames,
+  };
 }

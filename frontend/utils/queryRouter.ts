@@ -44,7 +44,7 @@ export function classifyQueryIntent(question: string): RoutedQuery {
   if (/(tên|tựa|tác giả|dài bao nhiêu trang|bao nhiêu trang|title|author|how many pages|page count).*(sách|pdf|tài liệu|book|document)|(sách|pdf|tài liệu|book|document).*(tên|tựa|tác giả|bao nhiêu trang|title|author|how many pages|page count)/i.test(normalized)) {
     return { intent: "metadata", documentScoped: true };
   }
-  if (/(liệt kê|danh sách|bao nhiêu|mấy|list|show|how many|which).*(blob|tệp|files?|documents?)|(?:do i have|tôi|mình).*(?:có|những|have).*(sách|pdf|ảnh|hình|books?|images?|photos?)|^(?:my|của tôi|của mình)\s+(?:blobs?|files?|documents?|books?|pdfs?|images?|photos?)\??$/i.test(normalized)) {
+  if (/(liệt kê|danh sách|bao nhiêu|mấy|list|show|how many|which).*(blob|tệp|files?|documents?)|(?:kiểm tra|làm mới|cập nhật|check|refresh|update).*(?:blob|tệp|files?)|(?:do i have|tôi|mình).*(?:có|những|have).*(sách|pdf|ảnh|hình|books?|images?|photos?)|^(?:my|của tôi|của mình)\s+(?:blobs?|files?|documents?|books?|pdfs?|images?|photos?)\??$/i.test(normalized)) {
     return { intent: "inventory", documentScoped: true };
   }
   if (/(tóm tắt|summarize|study guide|đề cương|bản tóm tắt|tổng hợp)/i.test(normalized) && (ownedDataCue || documentLocationCue || /(?:tài liệu|đã nạp|indexed documents?|knowledge base)/i.test(normalized))) {

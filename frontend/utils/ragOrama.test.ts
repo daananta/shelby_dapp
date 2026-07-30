@@ -1,6 +1,6 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
-import { clearActiveRagWorkspace, deactivateActiveRagOwner, exportPortableRagPackage, findExactQuoteInPages, getRagSources, hasRemoteRagProvider, importPortableRagPackage, invalidateShelbyBlobInventory, lookupExactQuote, recordSourceFailure, replaceDocument, searchDocuments, setActiveRagOwner, setRemoteRagProvider, setShelbyBlobInventory } from "@/utils/ragOrama";
+import { clearActiveRagWorkspace, deactivateActiveRagOwner, exportPortableRagPackage, findExactQuoteInPages, getRagSources, getShelbyBlobInventory, hasRemoteRagProvider, importPortableRagPackage, invalidateShelbyBlobInventory, lookupExactQuote, recordSourceFailure, replaceDocument, searchDocuments, setActiveRagOwner, setRemoteRagProvider, setShelbyBlobInventory } from "@/utils/ragOrama";
 import type { DocumentReplacement, PageRecord } from "@/utils/ragTypes";
 
 const quote = "Người ấy thấy Dương Bố ướt cả cho mượn cái áo thâm";
@@ -188,6 +188,14 @@ describe("v4 page store", () => {
     await replaceDocument(replacement("0xpolicy-offline"));
     await setShelbyBlobInventory("0xpolicy-offline", ["sach.pdf"], ["sach.pdf"]);
     await invalidateShelbyBlobInventory("0xpolicy-offline");
+    expect(getShelbyBlobInventory()).toMatchObject({
+      verified: false,
+      eligibleNames: ["sach.pdf"],
+    });
+    expect(await searchDocuments("Dương Bố", 2)).toHaveLength(0);
+
+    await setActiveRagOwner("0xpolicy-offline-other-wallet");
+    await setActiveRagOwner("0xpolicy-offline");
     expect(await searchDocuments("Dương Bố", 2)).toHaveLength(0);
 
     await setShelbyBlobInventory("0xpolicy-offline", ["sach.pdf"], ["sach.pdf"]);

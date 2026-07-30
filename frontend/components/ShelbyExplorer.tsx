@@ -29,6 +29,7 @@ import { assessRemoteSnapshot, blobContentIdentity, blobPipelineRevision, needsL
 import { rpcClient } from "@/utils/shelbyConfig";
 import { getGeminiUsagePreferences } from "@/utils/geminiUsage";
 import { localize, useLanguage } from "@/i18n";
+import type { RegisterBlobInventoryRefresh } from "@/utils/agentCapabilities";
 
 const isPortableRagBlobName = (name: string) => /\.shelby-rag\.json$/i.test(name);
 const LOCAL_RAG_RECOMMEND_BYTES = 8 * 1024 * 1024;
@@ -48,7 +49,11 @@ const base64ToBytes = (value: string) => {
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 };
 
-export function ShelbyExplorer() {
+interface ShelbyExplorerProps {
+  registerBlobInventoryRefresh: RegisterBlobInventoryRefresh;
+}
+
+export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerProps) {
   const { t } = useLanguage();
   const { toast } = useToast();
   const [activeTab, setActiveTab] = useState<"library" | "upload" | "capsule" | "config">("library");
@@ -72,8 +77,15 @@ export function ShelbyExplorer() {
     isPurchasableAndLocked,
     handlePurchaseAccess,
     fetchBlobs,
+    refreshBlobInventory,
     uploadFiles,
   } = useShelby();
+  const refreshBlobInventoryRef = useRef(refreshBlobInventory);
+  refreshBlobInventoryRef.current = refreshBlobInventory;
+
+  useEffect(() => registerBlobInventoryRefresh(
+    (detail, signal) => refreshBlobInventoryRef.current(detail, signal),
+  ), [registerBlobInventoryRefresh]);
 
   const {
     ragSources,

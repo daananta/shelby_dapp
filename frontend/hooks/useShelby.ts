@@ -7,11 +7,12 @@ import { aptosClient } from "@/utils/aptosClient";
 import { useToast } from "@/components/ui/use-toast";
 import { queryAccessPolicies } from "@/utils/accessControl";
 import { isRagSourceEligible } from "@/utils/blobAccess";
-import { invalidateShelbyBlobInventory, setShelbyBlobInventory, setActiveRagOwner } from "@/utils/ragOrama";
+import { getShelbyBlobInventory, invalidateShelbyBlobInventory, setShelbyBlobInventory, setActiveRagOwner } from "@/utils/ragOrama";
 import { isMockWorkspace } from "@/utils/devMode";
 import { bytesToHex } from "@/utils/contentIntegrity";
 import { getErasureProvider } from "@/utils/shelbyErasure";
 import { localize } from "@/i18n";
+import { unavailableBlobInventoryRefresh, type BlobInventoryRefreshCapability } from "@/utils/agentCapabilities";
 
 const MOCK_ACCOUNT = { address: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef" };
 const YEAR_IN_MICROSECONDS = 365 * 24 * 60 * 60 * 1_000_000;
@@ -123,12 +124,17 @@ export function useShelby() {
     });
   };
 
-  const fetchBlobs = async (): Promise<any[]> => {
+  const fetchBlobs = async (signal?: AbortSignal): Promise<any[]> => {
+    signal?.throwIfAborted();
     if (!account) return [];
     const requestGeneration = ++fetchGenerationRef.current;
     const ownerAddress = account.address.toString();
     const normalizedOwner = ownerAddress.toLowerCase();
-    const isCurrentRequest = () => requestGeneration === fetchGenerationRef.current && currentOwnerRef.current === normalizedOwner;
+    const isCurrentGeneration = () => requestGeneration === fetchGenerationRef.current && currentOwnerRef.current === normalizedOwner;
+    const isCurrentRequest = () => isCurrentGeneration() && !signal?.aborted;
+    signal?.addEventListener("abort", () => {
+      if (isCurrentGeneration()) setLoading(false);
+    }, { once: true });
     const mockUploadKey = `shelby-rag-explorer.mock-uploads:${ownerAddress.toLowerCase()}`;
     const mockUploadedBlobs = mockWorkspace ? (() => {
       try {
@@ -217,12 +223,28 @@ export function useShelby() {
       if (!isCurrentRequest()) return [];
       data = await blobClient.getAccountBlobs({ account: account.address });
       if (!isCurrentRequest()) return [];
-      const accessPolicies = await queryAccessPolicies(ownerAddress, data.map((blob: any) => getBlobName(blob)));
-      enrichedData = data.map((blob: any) => ({ ...blob, accessPolicy: accessPolicies.get(getBlobName(blob)) ?? { type: "unknown", canAccess: null } }));
+      const accessSnapshot = await queryAccessPolicies(ownerAddress, data.map((blob: any) => getBlobName(blob)), signal);
+      enrichedData = data.map((blob: any) => ({ ...blob, accessPolicy: accessSnapshot.policies.get(getBlobName(blob)) ?? { type: "unknown", canAccess: null } }));
       const finalData = [...enrichedData, ...sandboxBlobs];
       if (!isCurrentRequest()) return [];
       const names = finalData.map((blob: any) => getBlobName(blob));
       const ragEligibleNames = finalData.map(getModifiedBlobForRag).filter((blob: any) => isRagSourceEligible(blob, ownerAddress)).map((blob: any) => getBlobName(blob));
+      if (!accessSnapshot.verified) {
+        // A transient policy RPC/BCS failure is not authoritative revocation.
+        // Disable search, but preserve already indexed bytes until a fully
+        // verified policy snapshot can reconcile them.
+        await invalidateShelbyBlobInventory(ownerAddress);
+        if (!isCurrentRequest()) return [];
+        setBlobs(finalData);
+        toast({
+          title: localize("Shelby loaded; access check is unavailable", "Đã tải Shelby; chưa kiểm tra được quyền truy cập"),
+          description: localize(
+            "Your local RAG was preserved, but document search is paused until access policies can be verified.",
+            "RAG trên máy vẫn được giữ, nhưng tra cứu tài liệu tạm dừng đến khi xác minh lại được quyền truy cập.",
+          ),
+        });
+        return finalData;
+      }
       await setShelbyBlobInventory(ownerAddress, names, ragEligibleNames);
       if (!isCurrentRequest()) return [];
       setBlobs(finalData);
@@ -244,8 +266,39 @@ export function useShelby() {
       reconcileSelection(ragEligibleNames);
       return sandboxBlobs;
     } finally {
-      if (isCurrentRequest()) setLoading(false);
+      if (isCurrentGeneration()) setLoading(false);
     }
+  };
+
+  const refreshBlobInventory: BlobInventoryRefreshCapability = async (detail, signal) => {
+    signal?.throwIfAborted();
+    const refreshOwner = currentOwnerRef.current;
+    if (!refreshOwner || !account) return unavailableBlobInventoryRefresh("wallet_not_connected");
+    const startedAt = Date.now();
+    await fetchBlobs(signal);
+    signal?.throwIfAborted();
+    if (currentOwnerRef.current !== refreshOwner) return unavailableBlobInventoryRefresh("wallet_changed");
+    const inventory = getShelbyBlobInventory();
+    if (
+      !inventory
+      || inventory.owner.toLowerCase() !== refreshOwner
+      || inventory.verified !== true
+      || inventory.fetchedAt < startedAt
+    ) {
+      return unavailableBlobInventoryRefresh("shelby_refresh_failed");
+    }
+    const count = inventory.names.length;
+    return {
+      status: "refreshed",
+      count,
+      ...(detail === "sample" ? { examples: inventory.names.slice(0, 3) } : {}),
+      ...(detail === "all" ? {
+        names: inventory.names.slice(0, 100),
+        truncated: count > 100,
+      } : {}),
+      fetchedAt: inventory.fetchedAt,
+      source: mockWorkspace ? "demo" : "shelby",
+    };
   };
 
   const uploadFiles = async (files: File[], successTitle = localize("Upload complete", "Tải lên thành công!")) => {
@@ -459,6 +512,7 @@ export function useShelby() {
     isPurchasableAndLocked,
     handlePurchaseAccess,
     fetchBlobs,
+    refreshBlobInventory,
     uploadFiles,
   };
 }

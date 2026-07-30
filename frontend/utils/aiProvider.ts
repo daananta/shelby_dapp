@@ -3,6 +3,14 @@ import type { Tool } from "@google/generative-ai";
 import { clearStoredCloudApiKey, getStoredCloudApiKey, storeCloudApiKey } from "@/utils/cloudKeyStorage";
 import { normalizeConversationRoute, type ConversationRoute } from "@/utils/conversationRoute";
 import { currentLanguage, localize } from "@/i18n";
+import {
+  AgentHarnessLimitError,
+  DEFAULT_AGENT_HARNESS_BUDGET,
+  createAgentHarnessState,
+  executeAgentToolCalls,
+  type AgentFunctionCall,
+  type AgentToolDefinition,
+} from "@/utils/agentHarness";
 
 export { clearStoredCloudApiKey, getStoredCloudApiKey, storeCloudApiKey };
 
@@ -25,6 +33,16 @@ export interface KnowledgeSearchResponse {
     excerpt: string;
   }>;
   message?: string;
+}
+
+export interface BlobInventoryAgentRequest {
+  detail: "count" | "sample" | "all";
+}
+
+export interface AgentToolHandlers {
+  searchKnowledge: (request: KnowledgeSearchRequest, signal?: AbortSignal) => Promise<KnowledgeSearchResponse>;
+  getWalletBlobInventory: (request: BlobInventoryAgentRequest, signal?: AbortSignal) => Promise<Record<string, unknown>>;
+  refreshWalletBlobInventory?: (signal?: AbortSignal) => Promise<Record<string, unknown>>;
 }
 
 const CLOUD_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-lite-latest"];
@@ -198,15 +216,14 @@ export async function streamCloudAnswer(
 }
 
 /**
- * Gives Gemini one optional, narrowly scoped memory tool. General questions
- * finish in a single model request; document questions use one tool round-trip.
- * This replaces the keyword router as the authority without spending a
- * separate request on intent classification.
+ * Gives Gemini narrowly scoped read-only tools through a bounded multi-round
+ * harness. General questions finish directly; data-backed questions may chain
+ * up to three tool rounds without exposing internal execution logs to the UI.
  */
 export async function streamCloudAgentAnswer(
   { contents, cloudApiKey, systemInstruction }: AiRequest,
   onChunk: (text: string) => void,
-  searchKnowledge: (request: KnowledgeSearchRequest, signal?: AbortSignal) => Promise<KnowledgeSearchResponse>,
+  handlers: AgentToolHandlers,
   signal?: AbortSignal,
 ): Promise<string> {
   if (!cloudApiKey?.trim()) throw new Error(localize("Enter your Gemini API key to use Cloud AI.", "Nhập Gemini API key của bạn để dùng Cloud AI."));
@@ -217,40 +234,103 @@ export async function streamCloudAgentAnswer(
   const latestParts = latest?.parts;
   if (!Array.isArray(latestParts) || !latestParts.length) throw new Error(localize("The question is invalid.", "Câu hỏi không hợp lệ."));
 
-  const knowledgeTool: Tool = {
-    functionDeclarations: [{
-      name: "search_user_knowledge",
-      description: "Search the user's private/imported Shelby documents. Call this only when the latest request depends on the user's own documents or clearly follows up on document evidence. Do not call it for general knowledge, ordinary conversation, or merely because words such as blob/file/this/that appear.",
-      parameters: {
-        type: SchemaType.OBJECT,
-        properties: {
-          query: {
-            type: SchemaType.STRING,
-            description: "A self-contained semantic search query that resolves conversational references without inventing a filename.",
+  const agentTools: Tool = {
+    functionDeclarations: [
+      {
+        name: "search_user_knowledge",
+        description: "Search the user's private/imported Shelby documents. Call this only when the latest request depends on document content or clearly follows up on cited document evidence. Never use it for wallet state, blob counts/lists, general knowledge, or ordinary conversation.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            query: {
+              type: SchemaType.STRING,
+              description: "A self-contained semantic search query that resolves conversational references without inventing a filename.",
+            },
           },
+          required: ["query"],
         },
-        required: ["query"],
+      },
+      {
+        name: "get_wallet_blob_inventory",
+        description: "Read the connected wallet's latest app-cached Shelby blob inventory snapshot. This does not refresh the Shelby network. Call it for blob counts/lists and follow-ups that ask to confirm a previous blob-inventory answer. Report the supplied snapshot time honestly and never use document search for these requests.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            detail: {
+              type: SchemaType.STRING,
+              format: "enum",
+              enum: ["count", "sample", "all"],
+              description: "Use count for totals or confirmation, sample only when examples are requested, and all only when every name is explicitly requested.",
+            },
+          },
+          required: ["detail"],
+        },
+      },
+      ...(handlers.refreshWalletBlobInventory ? [{
+        name: "refresh_wallet_blob_inventory",
+        description: "Refresh the connected wallet's Shelby blob inventory from the network. Use this only when the user explicitly asks for current/live data or when the inventory tool reports a stale snapshot. This is read-only and must be followed by get_wallet_blob_inventory before answering.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {},
+        },
+      }] : []),
+    ],
+  };
+
+  const latestText = String(latestParts.find((part: { text?: string }) => part.text)?.text ?? "").slice(0, 1_000);
+  const toolRegistry = new Map<string, AgentToolDefinition>([
+    ["search_user_knowledge", {
+      name: "search_user_knowledge",
+      maxExecutions: 1,
+      unavailableCode: "knowledge_search_unavailable",
+      execute: async (args, requestSignal) => {
+        const rawQuery = args.query;
+        const query = typeof rawQuery === "string" && rawQuery.trim()
+          ? rawQuery.trim().slice(0, 1_000)
+          : latestText;
+        return { ...await handlers.searchKnowledge({ query }, requestSignal) };
       },
     }],
-  };
+    ["get_wallet_blob_inventory", {
+      name: "get_wallet_blob_inventory",
+      maxExecutions: 2,
+      allowRepeatedSignature: true,
+      unavailableCode: "blob_inventory_unavailable",
+      execute: async (args, requestSignal) => {
+        const detail = args.detail === "all" || args.detail === "sample"
+          ? args.detail
+          : "count";
+        return handlers.getWalletBlobInventory({ detail }, requestSignal);
+      },
+    }],
+    ["refresh_wallet_blob_inventory", {
+      name: "refresh_wallet_blob_inventory",
+      maxExecutions: 1,
+      unavailableCode: "blob_inventory_refresh_unavailable",
+      execute: async (_args, requestSignal) => handlers.refreshWalletBlobInventory
+        ? handlers.refreshWalletBlobInventory(requestSignal)
+        : { ok: false, code: "blob_inventory_refresh_unavailable" },
+    }],
+  ]);
 
   let lastError: unknown;
   for (const modelName of CLOUD_MODELS) {
     let emitted = false;
+    let harnessStarted = false;
     try {
       signal?.throwIfAborted();
       const model = clientFor(cloudApiKey).getGenerativeModel({
         model: modelName,
         systemInstruction,
-        tools: [knowledgeTool],
+        tools: [agentTools],
         toolConfig: { functionCallingConfig: { mode: FunctionCallingMode.AUTO } },
       });
       const chat = model.startChat({ history });
       const first = await chat.sendMessage(latestParts, { signal });
       signal?.throwIfAborted();
-      const call = first.response.functionCalls()?.find((item) => item.name === "search_user_knowledge");
+      let calls = (first.response.functionCalls() ?? []) as AgentFunctionCall[];
 
-      if (!call) {
+      if (!calls.length) {
         const direct = first.response.text().trim();
         if (direct) {
           emitted = true;
@@ -259,38 +339,75 @@ export async function streamCloudAgentAnswer(
         }
         throw new Error(localize("Gemini did not produce an answer.", "Gemini không tạo được câu trả lời."));
       }
-
-      const rawQuery = (call.args as { query?: unknown })?.query;
-      const query = typeof rawQuery === "string" && rawQuery.trim()
-        ? rawQuery.trim().slice(0, 1_000)
-        : String(latestParts.find((part: { text?: string }) => part.text)?.text ?? "").slice(0, 1_000);
-      const evidence = await searchKnowledge({ query }, signal);
-      signal?.throwIfAborted();
-
-      const result = await chat.sendMessageStream([{
-        functionResponse: {
-          name: "search_user_knowledge",
-          response: evidence,
-        },
-      }], { signal });
-      let answer = "";
-      for await (const chunk of result.stream) {
+      harnessStarted = true;
+      const harnessState = createAgentHarnessState();
+      for (let round = 1; round <= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds; round += 1) {
+        const batch = await executeAgentToolCalls({
+          calls,
+          registry: toolRegistry,
+          state: harnessState,
+          round,
+          signal,
+        });
         signal?.throwIfAborted();
-        const text = chunk.text();
-        if (!text) continue;
+        const result = await chat.sendMessageStream(batch.responses, { signal });
+        const bufferedChunks: string[] = [];
+        for await (const chunk of result.stream) {
+          signal?.throwIfAborted();
+          const chunkCalls = typeof chunk.functionCalls === "function" ? chunk.functionCalls() ?? [] : [];
+          if (chunkCalls.length) continue;
+          const text = chunk.text();
+          if (text) bufferedChunks.push(text);
+        }
+        const finalResponse = await result.response;
+        signal?.throwIfAborted();
+        const nextCalls = (finalResponse.functionCalls() ?? []) as AgentFunctionCall[];
+        const bufferedAnswer = bufferedChunks.join("");
+        if (nextCalls.length) {
+          if (round >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
+            throw new AgentHarnessLimitError("agent_round_limit");
+          }
+          // Planning text can precede a function call. Keep it private and
+          // commit only the first model response that no longer requests work.
+          calls = nextCalls;
+          continue;
+        }
+        const answer = bufferedAnswer || finalResponse.text().trim();
+        if (answer) {
+          emitted = true;
+          if (bufferedChunks.length) {
+            for (const chunk of bufferedChunks) {
+              signal?.throwIfAborted();
+              onChunk(chunk);
+            }
+          } else {
+            signal?.throwIfAborted();
+            onChunk(answer);
+          }
+          return answer;
+        }
+        const fallback = localize(
+          "There is not enough information for a confident answer.",
+          "Không tìm thấy đủ thông tin để trả lời chắc chắn.",
+        );
+        signal?.throwIfAborted();
         emitted = true;
-        answer += text;
-        onChunk(text);
+        onChunk(fallback);
+        return fallback;
       }
-      return answer || localize(
-        "There is not enough information for a confident answer.",
-        "Không tìm thấy đủ thông tin để trả lời chắc chắn.",
-      );
+      throw new AgentHarnessLimitError("agent_round_limit");
     } catch (error) {
       if (signal?.aborted) throw error;
       if (emitted) throw error;
+      const boundedError = error instanceof AgentHarnessLimitError
+        ? new Error(localize(
+          "The AI requested too many app actions in one response.",
+          "AI yêu cầu quá nhiều thao tác ứng dụng trong một phản hồi.",
+        ))
+        : error;
+      if (harnessStarted) throw normalizeCloudError(boundedError);
       if (shouldStopModelFallback(error)) throw normalizeCloudError(error);
-      lastError = error;
+      lastError = boundedError;
     }
   }
   throw normalizeCloudError(lastError);

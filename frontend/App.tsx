@@ -1,6 +1,6 @@
 import { useWallet } from "@aptos-labs/wallet-adapter-react";
 import { BookOpen, MessageSquare, Play } from "lucide-react";
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Header } from "@/components/Header";
 import { WalletSelector } from "@/components/WalletSelector";
 import { isMockWorkspace } from "@/utils/devMode";
@@ -8,6 +8,11 @@ import { JudgeMode, type JudgeModeReadiness } from "@/components/JudgeMode";
 import { Button } from "@/components/ui/button";
 import type { JudgeModeTarget } from "@/utils/judgeMode";
 import { useLanguage } from "@/i18n";
+import {
+  unavailableBlobInventoryRefresh,
+  type BlobInventoryRefreshCapability,
+  type RegisterBlobInventoryRefresh,
+} from "@/utils/agentCapabilities";
 
 // Lazy-loaded heavy components
 const ShelbyExplorer = lazy(() => import("@/components/ShelbyExplorer").then((module) => ({ default: module.ShelbyExplorer })));
@@ -26,6 +31,26 @@ function App({ onOpenDemo }: AppProps) {
   const [mobileView, setMobileView] = useState<"library" | "chat">("library");
   const [judgeModeOpen, setJudgeModeOpen] = useState(false);
   const [judgeReadiness, setJudgeReadiness] = useState<JudgeModeReadiness>({ walletConnected: connected });
+  const blobInventoryRefreshRef = useRef<{
+    token: symbol;
+    capability: BlobInventoryRefreshCapability;
+  } | null>(null);
+  const registerBlobInventoryRefresh = useCallback<RegisterBlobInventoryRefresh>((capability) => {
+    const token = Symbol("blob-inventory-refresh");
+    blobInventoryRefreshRef.current = { token, capability };
+    return () => {
+      if (blobInventoryRefreshRef.current?.token === token) {
+        blobInventoryRefreshRef.current = null;
+      }
+    };
+  }, []);
+  const refreshBlobInventory = useCallback<BlobInventoryRefreshCapability>((detail, signal) => {
+    signal?.throwIfAborted();
+    const registered = blobInventoryRefreshRef.current;
+    return registered
+      ? registered.capability(detail, signal)
+      : Promise.resolve(unavailableBlobInventoryRefresh());
+  }, []);
 
   useEffect(() => {
     const openAiSettings = () => setMobileView("chat");
@@ -86,13 +111,13 @@ function App({ onOpenDemo }: AppProps) {
               {/* Sidebar (Explorer / List) */}
               <aside data-testid="knowledge-panel" role="tabpanel" className={`${mobileView === "library" ? "flex" : "hidden"} h-[760px] min-h-0 flex-col overflow-hidden xl:h-full xl:flex`}>
                 <Suspense fallback={<div className="section-surface p-6 text-center text-xs text-slate-400"><BookOpen className="mx-auto mb-1.5 h-4 w-4 text-emerald-600" />{t("Loading…", "Đang tải…")}</div>}>
-                  <ShelbyExplorer />
+                  <ShelbyExplorer registerBlobInventoryRefresh={registerBlobInventoryRefresh} />
                 </Suspense>
               </aside>
               {/* Main Workspace (Chat) */}
               <section data-testid="chat-panel" role="tabpanel" className={`${mobileView === "chat" ? "block" : "hidden"} h-[max(620px,calc(100dvh-8.5rem))] min-h-0 min-w-0 overflow-hidden xl:h-full xl:block`}>
                 <Suspense fallback={<div className="section-surface p-6 text-center text-xs text-slate-400"><MessageSquare className="mx-auto mb-1.5 h-4 w-4 text-emerald-600" />{t("Loading…", "Đang tải…")}</div>}>
-                  <UnifiedChat />
+                  <UnifiedChat refreshBlobInventory={refreshBlobInventory} />
                 </Suspense>
               </section>
             </div>

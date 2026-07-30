@@ -10,6 +10,7 @@ export interface ChatToolResult {
   links?: { label: string; url: string }[];
   /** Stable RAG sources referenced by this tool result for follow-up resolution. */
   referencedSources?: string[];
+  data?: BlobInventoryToolData;
 }
 
 export interface ChatToolContext {
@@ -21,7 +22,169 @@ export interface ChatToolContext {
   language?: "en" | "vi";
 }
 
+export interface BlobInventoryToolData {
+  kind: "blob_inventory";
+  status: "verified" | "stale" | "not_loaded";
+  count?: number;
+  examples: string[];
+  names?: string[];
+  truncated?: boolean;
+  fetchedAt?: number;
+  observedAt: number;
+  ageMs?: number;
+  freshness: "recent_cache" | "stale_cache" | "unavailable";
+}
+
+export interface ChatToolObservation {
+  version: 1;
+  kind: "blob_inventory";
+  status: BlobInventoryToolData["status"];
+  observedAt: number;
+  fetchedAt?: number;
+}
+
 const OCTAS_PER_APT = 100_000_000n;
+const BLOB_EXAMPLE_LIMIT = 3;
+const BLOB_LIST_LIMIT = 100;
+const RECENT_INVENTORY_MS = 5 * 60_000;
+
+export type BlobInventoryDetail = "count" | "sample" | "all";
+
+export function asksForCompleteBlobList(question: string): boolean {
+  return /(?:liệt kê|danh sách|hiển thị).*(?:tất cả|toàn bộ)|(?:tất cả|toàn bộ).*(?:blob|tệp|file)|(?:list|show).*(?:all|every).*(?:blobs?|files?)|(?:full|complete)\s+list/i.test(question);
+}
+
+export function blobInventoryDetailForQuestion(question: string): BlobInventoryDetail {
+  if (asksForCompleteBlobList(question)) return "all";
+  if (/(?:danh sách|liệt kê|hiển thị|những)\s+(?:blob|tệp|file)|(?:blob|tệp|file).*(?:nào|gì)|(?:list|show|which|what).*(?:blobs?|files?)/i.test(question)) return "sample";
+  return "count";
+}
+
+/**
+ * Narrow fail-safe for a structurally known inventory turn. The model remains
+ * responsible for normal conversational routing; these short confirmations
+ * must not be answered from memory without rereading the app snapshot.
+ */
+export function isBlobInventoryConfirmationFollowUp(question: string): boolean {
+  return /^(?:chắc\s*(?:chưa|chứ|không)?|(?:bạn\s+)?có\s+chắc(?:\s+không)?|thật\s+(?:không|chứ)|xác\s+nhận(?:\s+lại)?(?:\s+đi)?|kiểm\s+tra\s+lại(?:\s+đi)?|are\s+you\s+sure|really|confirm(?:\s+that)?|check\s+again)\s*[?!.]*$/i.test(question.trim());
+}
+
+export function asksForLiveBlobInventoryRefresh(question: string): boolean {
+  return /(?:làm mới|đồng bộ lại|cập nhật lại|kiểm tra lại|mới nhất|hiện tại|ngay bây giờ|refresh|sync again|check again|latest|current|right now)/i.test(question);
+}
+
+export function createChatToolObservation(result: ChatToolResult | null | undefined): ChatToolObservation | undefined {
+  if (result?.data?.kind !== "blob_inventory") return undefined;
+  return {
+    version: 1,
+    kind: "blob_inventory",
+    status: result.data.status,
+    observedAt: result.data.observedAt,
+    fetchedAt: result.data.fetchedAt,
+  };
+}
+
+export function readBlobInventory(
+  detail: BlobInventoryDetail = "count",
+  context: Pick<ChatToolContext, "language"> = {},
+): ChatToolResult {
+  const t = (english: string, vietnamese: string) => context.language === "en" ? english : vietnamese;
+  const inventory = getShelbyBlobInventory();
+  const observedAt = Date.now();
+  if (!inventory) {
+    return {
+      name: "blob_inventory",
+      text: t(
+        "The Shelby blob list has not been loaded yet. Select Refresh in the Library, then ask again.",
+        "Danh sách blob Shelby chưa được tải. Hãy bấm Làm mới trong Thư viện rồi hỏi lại.",
+      ),
+      data: { kind: "blob_inventory", status: "not_loaded", examples: [], observedAt, freshness: "unavailable" },
+    };
+  }
+
+  const count = inventory.names.length;
+  const examples = detail === "sample" ? inventory.names.slice(0, BLOB_EXAMPLE_LIMIT) : [];
+  const names = detail === "all" ? inventory.names.slice(0, BLOB_LIST_LIMIT) : undefined;
+  const truncated = detail === "all" && inventory.names.length > BLOB_LIST_LIMIT;
+  const ageMs = inventory.fetchedAt > 0 ? Math.max(0, observedAt - inventory.fetchedAt) : Number.POSITIVE_INFINITY;
+  const freshness = inventory.verified && ageMs <= RECENT_INVENTORY_MS ? "recent_cache" : "stale_cache";
+  const data: BlobInventoryToolData = {
+    kind: "blob_inventory",
+    status: freshness === "recent_cache" ? "verified" : "stale",
+    count,
+    examples,
+    names,
+    truncated,
+    fetchedAt: inventory.fetchedAt,
+    observedAt,
+    ageMs: Number.isFinite(ageMs) ? ageMs : undefined,
+    freshness,
+  };
+
+  if (!inventory.verified) {
+    return {
+      name: "blob_inventory",
+      text: t(
+        `The last successful refresh found ${count} ${count === 1 ? "blob" : "blobs"}, but the latest Shelby refresh failed, so I cannot confirm the current count. Select Refresh in the Library and try again.`,
+        `Lần làm mới thành công trước ghi nhận ${count} blob, nhưng lần đồng bộ Shelby gần nhất bị lỗi nên chưa thể xác nhận số hiện tại. Hãy bấm Làm mới trong Thư viện rồi thử lại.`,
+      ),
+      data,
+    };
+  }
+
+  const fetchedLabel = inventory.fetchedAt > 0
+    ? new Date(inventory.fetchedAt).toLocaleString(context.language === "en" ? "en-US" : "vi-VN")
+    : t("an unknown time", "thời điểm không xác định");
+  if (freshness === "stale_cache") {
+    return {
+      name: "blob_inventory",
+      text: t(
+        `The last successful Shelby refresh at ${fetchedLabel} found ${count} ${count === 1 ? "blob" : "blobs"}. This snapshot may be outdated; select Refresh in the Library before treating it as current.`,
+        `Lần đồng bộ Shelby thành công gần nhất lúc ${fetchedLabel} ghi nhận ${count} blob. Snapshot này có thể đã cũ; hãy bấm Làm mới trong Thư viện trước khi xem đó là số hiện tại.`,
+      ),
+      data,
+    };
+  }
+
+  if (detail === "all") {
+    const list = names?.length ? `\n- ${names.join("\n- ")}` : "";
+    const limitNote = truncated
+      ? t(`\n\nShowing the first ${BLOB_LIST_LIMIT} of ${count} blobs.`, `\n\nĐang hiển thị ${BLOB_LIST_LIMIT} blob đầu tiên trong tổng số ${count}.`)
+      : "";
+    return {
+      name: "blob_inventory",
+      text: t(
+        `The Shelby snapshot refreshed at ${fetchedLabel} contains ${count} ${count === 1 ? "blob" : "blobs"}:${list}${limitNote}`,
+        `Snapshot Shelby được làm mới lúc ${fetchedLabel} có ${count} blob:${list}${limitNote}`,
+      ),
+      data,
+    };
+  }
+
+  const exampleText = examples.length
+    ? t(` Examples include ${examples.join(", ")}.`, ` Ví dụ: ${examples.join(", ")}.`)
+    : "";
+  return {
+    name: "blob_inventory",
+    text: t(
+      `The Shelby snapshot refreshed at ${fetchedLabel} contains ${count} ${count === 1 ? "blob" : "blobs"}.${exampleText}`,
+      `Snapshot Shelby được làm mới lúc ${fetchedLabel} có ${count} blob.${exampleText}`,
+    ),
+    data,
+  };
+}
+
+/** Rejects model phrasing that changes an app-verified inventory fact. */
+export function isBlobInventoryAnswerConsistent(result: ChatToolResult, answer: string): boolean {
+  const data = result.data;
+  if (result.name !== "blob_inventory" || data?.kind !== "blob_inventory" || data.count === undefined) return false;
+  const statedCounts = [...answer.matchAll(/(\d[\d\s.,]*)\s*(?:blobs?|tệp|files?)/giu)]
+    .map((match) => Number(match[1].replace(/\D/g, "")))
+    .filter(Number.isFinite);
+  if (!statedCounts.length || statedCounts.some((count) => count !== data.count)) return false;
+  const disclosedNames = data.names ?? data.examples;
+  return disclosedNames.every((name) => answer.includes(name));
+}
 
 function formatApt(balance: bigint): string {
   const whole = balance / OCTAS_PER_APT;
@@ -206,8 +369,15 @@ export async function runChatTool(question: string, address?: string, context: C
     };
   }
 
-  // General questions and wallet RPC tools never need to open the local RAG
-  // database. Hydrate only when the remaining document/image tools may use it.
+  const asksForBlobInventory = /(?:danh sách|liệt kê)(?:\s+(?:tất cả|toàn bộ))?\s+(?:blob|tệp|file)|(?:bao nhiêu|mấy)\s+(?:blob|tệp|file)|(?:blob|tệp|file).*(?:nào|gì)|(list|show|how many|which|what).*(blobs?|files?)/i.test(normalized)
+    || (asksForLiveBlobInventoryRefresh(normalized) && /(?:blob|tệp|files?)/i.test(normalized));
+  const asksAboutOwnInventory = /(ví|kho|tài khoản|của\s+(?:tôi|mình)|tôi\s+(?:có|đang)|mình\s+(?:có|đang)|wallet|library|account|\bmy\b|\bi have\b|\bdo i\b)/i.test(normalized);
+  if (asksForBlobInventory && asksAboutOwnInventory && !/(toàn mạng|toàn bộ mạng|shelby\s+(?:có|đang có)|entire network|network-wide|across (?:the )?shelby network|does shelby have)/i.test(normalized)) {
+    return readBlobInventory(blobInventoryDetailForQuestion(question), context);
+  }
+
+  // General questions, wallet RPC and blob inventory never need to open the
+  // local RAG database. Hydrate only when document/image tools may use it.
   const mayUseLocalData = Boolean(
     context.forceImage
     || context.preferredSources?.length
@@ -216,28 +386,6 @@ export async function runChatTool(question: string, address?: string, context: C
   if (!mayUseLocalData) return null;
   await getVectorDB();
   signal?.throwIfAborted();
-
-  const asksForBlobInventory = /(danh sách|liệt kê|bao nhiêu|mấy)\s+(blob|tệp|file)|(list|show|how many|which|what).*(blobs?|files?)/i.test(normalized);
-  const asksAboutOwnInventory = /(ví|kho|tài khoản|của\s+(?:tôi|mình)|tôi\s+(?:có|đang)|mình\s+(?:có|đang)|wallet|library|account|\bmy\b|\bi have\b|\bdo i\b)/i.test(normalized);
-  if (asksForBlobInventory && asksAboutOwnInventory && !/(toàn mạng|toàn bộ mạng|shelby\s+(?:có|đang có)|entire network|network-wide|across (?:the )?shelby network|does shelby have)/i.test(normalized)) {
-    const inventory = getShelbyBlobInventory();
-    if (!inventory) {
-      return {
-        name: "blob_inventory",
-        text: t(
-          "The blob list has not been loaded. Select Refresh in the Shelby Library.",
-          "Chưa tải danh sách blob. Hãy bấm Làm mới trong Kho Shelby.",
-        ),
-      };
-    }
-    return {
-      name: "blob_inventory",
-      text: t(
-        `This wallet has ${inventory.names.length} ${inventory.names.length === 1 ? "blob" : "blobs"} on Shelby:\n- ${inventory.names.join("\n- ")}`,
-        `Ví này có tổng cộng ${inventory.names.length} blob trên Shelby:\n- ${inventory.names.join("\n- ")}`,
-      ),
-    };
-  }
 
   if (/(bao nhiêu|mấy|tổng số|dài bao nhiêu)\s+trang|how many pages|page count/i.test(normalized)) {
     const documents = getRagSources().filter((source) => source.type === "text" && source.status === "indexed" && source.pageCount);

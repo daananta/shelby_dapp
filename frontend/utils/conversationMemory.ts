@@ -3,6 +3,13 @@ interface MemoryMessage {
   text: string;
   sources?: unknown[];
   tool?: string;
+  toolObservation?: {
+    version: 1;
+    kind: "blob_inventory";
+    status: "verified" | "stale" | "not_loaded";
+    observedAt: number;
+    fetchedAt?: number;
+  };
   imageUrls?: string[];
 }
 
@@ -38,14 +45,17 @@ export function buildAdaptiveGeminiHistory(messages: MemoryMessage[]) {
     const answer = messages[index + 1];
     if (user.role !== "user" || answer.role !== "ai") continue;
     const documentGrounded = Boolean(answer.sources?.length || answer.tool || answer.imageUrls?.length);
+    const safeToolMemory = answer.toolObservation?.kind === "blob_inventory"
+      ? "I answered using the connected wallet's cached Shelby inventory snapshot. If the user asks to confirm, recheck, continue, or list that inventory, call get_wallet_blob_inventory again. If it is stale, call refresh_wallet_blob_inventory once and then reread it. Report fetchedAt honestly and never use document search for that follow-up."
+      : null;
     output.push(
       { role: "user", parts: [{ text: user.text.slice(0, 2_000) }] },
       {
         role: "model",
         parts: [{
-          text: documentGrounded
+          text: safeToolMemory ?? (documentGrounded
             ? "I answered this turn with app-provided data. If the user follows up, resolve the subject from their previous question and use the tool to search again; do not rely on the previous answer text."
-            : answer.text.slice(0, 4_000),
+            : answer.text.slice(0, 4_000)),
         }],
       },
     );

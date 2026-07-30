@@ -24,6 +24,7 @@ describe("query router", () => {
     expect(classifyQueryIntent("Kể câu chuyện 243").intent).toBe("story_lookup");
     expect(classifyQueryIntent("Tôi có sách không, kể câu chuyện thứ 112 trong sách").intent).toBe("story_lookup");
     expect(classifyQueryIntent("How many blobs does my wallet have?").intent).toBe("inventory");
+    expect(classifyQueryIntent("Kiểm tra số blob hiện tại của ví tôi").intent).toBe("inventory");
     expect(classifyQueryIntent("Tell me story number 12 from my book").intent).toBe("story_lookup");
   });
 

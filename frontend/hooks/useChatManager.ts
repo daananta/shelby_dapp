@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { ChatToolResult } from "@/utils/chatTools";
+import type { ChatToolObservation, ChatToolResult } from "@/utils/chatTools";
 import type { AnswerReceipt, RetrievalResult } from "@/utils/ragTypes";
 import type { HotRagProofSnapshot } from "@/utils/hotRagProof";
 import { localize } from "@/i18n";
@@ -12,6 +12,7 @@ export interface ChatMessage {
   links?: { label: string; url: string }[];
   sources?: RetrievalResult[];
   tool?: ChatToolResult["name"];
+  toolObservation?: ChatToolObservation;
   referencedSources?: string[];
   typing?: boolean;
   receipt?: AnswerReceipt;
@@ -20,6 +21,18 @@ export interface ChatMessage {
 }
 
 const CHAT_STORAGE = "shelby-rag-explorer.chat-v1";
+const CHAT_TOOL_NAMES = new Set<ChatToolResult["name"]>([
+  "wallet_address",
+  "apt_balance",
+  "shelbyusd_balance",
+  "account_info",
+  "blob_inventory",
+  "document_inventory",
+  "document_lookup",
+  "show_images",
+  "identity",
+  "calculator",
+]);
 
 let fallbackMessageSequence = 0;
 
@@ -40,19 +53,88 @@ function isChatMessage(value: unknown): value is Partial<ChatMessage> & Pick<Cha
   return (candidate.role === "user" || candidate.role === "ai") && typeof candidate.text === "string";
 }
 
+function normalizeStringList(value: unknown, limit: number): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const normalized = value.filter((item): item is string => typeof item === "string").slice(0, limit);
+  return normalized.length ? normalized : undefined;
+}
+
+function normalizeLinks(value: unknown): ChatMessage["links"] {
+  if (!Array.isArray(value)) return undefined;
+  const links = value
+    .filter((item): item is { label: string; url: string } => (
+      Boolean(item)
+      && typeof item === "object"
+      && typeof (item as { label?: unknown }).label === "string"
+      && typeof (item as { url?: unknown }).url === "string"
+    ))
+    .slice(0, 8)
+    .map(({ label, url }) => ({ label, url }));
+  return links.length ? links : undefined;
+}
+
+function normalizeChatTool(value: unknown): ChatToolResult["name"] | undefined {
+  return typeof value === "string" && CHAT_TOOL_NAMES.has(value as ChatToolResult["name"])
+    ? value as ChatToolResult["name"]
+    : undefined;
+}
+
+function normalizeToolObservation(value: unknown): ChatToolObservation | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Partial<ChatToolObservation>;
+  if (
+    candidate.version !== 1
+    || candidate.kind !== "blob_inventory"
+    || (
+      candidate.status !== "verified"
+      && candidate.status !== "stale"
+      && candidate.status !== "not_loaded"
+    )
+    || typeof candidate.observedAt !== "number"
+    || !Number.isFinite(candidate.observedAt)
+  ) return undefined;
+  const fetchedAt = typeof candidate.fetchedAt === "number" && Number.isFinite(candidate.fetchedAt)
+    ? candidate.fetchedAt
+    : undefined;
+  return {
+    version: 1,
+    kind: "blob_inventory",
+    status: candidate.status,
+    observedAt: candidate.observedAt,
+    fetchedAt,
+  };
+}
+
 export function normalizeStoredChatMessages(value: unknown): ChatMessage[] {
   if (!Array.isArray(value)) return [];
   return value
     .filter(isChatMessage)
     .slice(-20)
-    .map((message) => createChatMessage({
-      ...message,
-      typing: undefined,
-      interrupted: message.interrupted || message.typing ? true : undefined,
-      text: message.text || (message.typing
-        ? localize("The response was interrupted when the page closed.", "Phản hồi bị gián đoạn khi đóng trang.")
-        : ""),
-    }));
+    .map((message) => {
+      const tool = message.role === "ai" ? normalizeChatTool(message.tool) : undefined;
+      return createChatMessage({
+        id: typeof message.id === "string" ? message.id : undefined,
+        role: message.role,
+        text: message.text || (message.typing
+          ? localize("The response was interrupted when the page closed.", "Phản hồi bị gián đoạn khi đóng trang.")
+          : ""),
+        imageUrls: message.role === "ai" ? normalizeStringList(message.imageUrls, 12) : undefined,
+        links: message.role === "ai" ? normalizeLinks(message.links) : undefined,
+        sources: message.role === "ai" && Array.isArray(message.sources)
+          ? message.sources.filter((source): source is RetrievalResult => Boolean(source) && typeof source === "object").slice(0, 12)
+          : undefined,
+        tool,
+        toolObservation: tool === "blob_inventory" ? normalizeToolObservation(message.toolObservation) : undefined,
+        referencedSources: message.role === "ai" ? normalizeStringList(message.referencedSources, 20) : undefined,
+        receipt: message.role === "ai" && message.receipt && typeof message.receipt === "object"
+          ? message.receipt
+          : undefined,
+        hotReadProof: message.role === "ai" && message.hotReadProof && typeof message.hotReadProof === "object"
+          ? message.hotReadProof
+          : undefined,
+        interrupted: message.interrupted === true || message.typing === true ? true : undefined,
+      });
+    });
 }
 
 export function prepareMessagesForPersistence(messages: ChatMessage[]): ChatMessage[] {

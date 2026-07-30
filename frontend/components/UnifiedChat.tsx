@@ -7,7 +7,7 @@ import { ArrowDown, Bookmark, ChevronDown, Cloud, Database, FileCheck2, Fingerpr
 import { deactivateActiveRagOwner, getPageRecord, getRagSources, hasRemoteRagProvider, isHotRemoteRagProvider, lookupExactQuote, searchDocuments, setActiveRagOwner } from "@/utils/ragOrama";
 import type { AnswerReceipt, RetrievalResult } from "@/utils/ragTypes";
 import { clearStoredCloudApiKey, getCloudErrorKind, getStoredCloudApiKey, normalizeCloudError, resolveConversationRouteWithCloud, storeCloudApiKey, streamCloudAgentAnswer, verifyCloudApiKey } from "@/utils/aiProvider";
-import { runChatTool } from "@/utils/chatTools";
+import { asksForLiveBlobInventoryRefresh, blobInventoryDetailForQuestion, createChatToolObservation, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, runChatTool, type ChatToolResult } from "@/utils/chatTools";
 import { classifyQueryIntent } from "@/utils/queryRouter";
 import { buildAdaptiveAgentSystemInstruction, isInternalGuideSource } from "@/utils/agentPolicy";
 import ReactMarkdown from "react-markdown";
@@ -21,12 +21,17 @@ import { LiveProofMeter } from "@/components/chat/LiveProofMeter";
 import { useGeminiUsage } from "@/hooks/useGeminiUsage";
 import type { HotRagProofSnapshot } from "@/utils/hotRagProof";
 import { useLanguage } from "@/i18n";
+import type { BlobInventoryRefreshCapability } from "@/utils/agentCapabilities";
 const MOCK_ACCOUNT = { address: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef" };
 
 const shortProof = (value: string | undefined, unavailable: string) => value ? (value.length > 24 ? `${value.slice(0, 12)}…${value.slice(-8)}` : value) : unavailable;
 const formatBytes = (value: number | undefined, unavailable: string) => value === undefined ? unavailable : value < 1024 ? `${value} B` : value < 1024 ** 2 ? `${(value / 1024).toFixed(1)} KB` : `${(value / 1024 ** 2).toFixed(1)} MB`;
 
-export function UnifiedChat() {
+interface UnifiedChatProps {
+  refreshBlobInventory?: BlobInventoryRefreshCapability;
+}
+
+export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
   const { language, t } = useLanguage();
   const unavailable = t("Unavailable", "Chưa có");
   const accessLabel = (value?: NonNullable<RetrievalResult["provenance"]>["accessTag"]) => ({
@@ -253,6 +258,8 @@ export function UnifiedChat() {
     const request = beginRequest();
     const { signal } = request;
     let pendingMessageId: string | undefined;
+    let deferredToolFallback: ChatToolResult | null = null;
+    let streamedText = "";
     let preserveStatus = false;
     const updateCurrentMessages = (updater: (previous: ChatMessage[]) => ChatMessage[]) => {
       setMessages((previous) => isRequestCurrent(request) ? updater(previous) : previous);
@@ -277,6 +284,9 @@ export function UnifiedChat() {
       if (account) await setActiveRagOwner(account.address.toString());
       assertRequestCurrent();
       const routed = classifyQueryIntent(userQuery);
+      const previousWasBlobInventory = messages.at(-1)?.role === "ai"
+        && messages.at(-1)?.tool === "blob_inventory"
+        && messages.at(-1)?.toolObservation?.kind === "blob_inventory";
       if ((routed.intent === "exact_quote" || routed.intent === "page_lookup") && routed.quotedText) {
         const result = await lookupExactQuote(routed.quotedText, signal);
         assertRequestCurrent();
@@ -318,8 +328,57 @@ export function UnifiedChat() {
         language,
       }, signal);
       assertRequestCurrent();
+      const inventoryDetail = blobInventoryDetailForQuestion(userQuery);
+      const inventoryData = toolResult?.data;
+      const liveInventoryRefreshRequested = Boolean(
+        asksForLiveBlobInventoryRefresh(userQuery)
+        && (routed.intent === "inventory" || toolResult?.name === "blob_inventory")
+      );
+      const allowsLiveInventoryRefresh = Boolean(
+        refreshBlobInventory
+        && inventoryDetail !== "all"
+        && (
+          liveInventoryRefreshRequested
+          || (previousWasBlobInventory && isBlobInventoryConfirmationFollowUp(userQuery))
+        )
+      );
+      const letAgentPhraseInventory = Boolean(
+        chatApiKey
+        && toolResult?.name === "blob_inventory"
+        && inventoryDetail !== "all"
+        && (
+          (inventoryData?.status === "verified" && inventoryData.freshness === "recent_cache")
+          || allowsLiveInventoryRefresh
+        )
+      );
+      if (toolResult && !letAgentPhraseInventory) {
+        updateCurrentMessages((previous) => [...previous, createChatMessage({
+          role: "ai",
+          text: toolResult.text,
+          imageUrls: toolResult.imageUrls,
+          links: toolResult.links,
+          tool: toolResult.name,
+          toolObservation: createChatToolObservation(toolResult),
+          referencedSources: toolResult.referencedSources,
+        })]);
+        return;
+      }
       if (toolResult) {
-        updateCurrentMessages((previous) => [...previous, createChatMessage({ role: "ai", text: toolResult.text, imageUrls: toolResult.imageUrls, links: toolResult.links, tool: toolResult.name, referencedSources: toolResult.referencedSources })]);
+        deferredToolFallback = toolResult;
+      } else if (previousWasBlobInventory && isBlobInventoryConfirmationFollowUp(userQuery)) {
+        deferredToolFallback = readBlobInventory(inventoryDetail, { language });
+      }
+      const localInventoryFallback = deferredToolFallback;
+      if (!chatApiKey && localInventoryFallback) {
+        updateCurrentMessages((previous) => [...previous, createChatMessage({
+          role: "ai",
+          text: localInventoryFallback.text,
+          imageUrls: localInventoryFallback.imageUrls,
+          links: localInventoryFallback.links,
+          tool: localInventoryFallback.name,
+          toolObservation: createChatToolObservation(localInventoryFallback),
+          referencedSources: localInventoryFallback.referencedSources,
+        })]);
         return;
       }
       if (!chatApiKey) {
@@ -339,8 +398,11 @@ export function UnifiedChat() {
       const pendingMessage = createChatMessage({ role: "ai", text: "", typing: true });
       pendingMessageId = pendingMessage.id;
       updateCurrentMessages((previous) => [...previous, pendingMessage]);
-      let streamedText = "";
       let knowledgeSearchAttempted = false;
+      let recoveredInventoryMisroute = false;
+      let inventoryRefreshSucceeded = false;
+      let inventoryReadAfterRefresh = false;
+      let agentToolResult: ChatToolResult | null = null;
       await streamCloudAgentAnswer(
         { contents, cloudApiKey: chatApiKey, systemInstruction: buildAdaptiveAgentSystemInstruction() },
         (chunk) => {
@@ -348,35 +410,158 @@ export function UnifiedChat() {
           streamedText += chunk;
           updateCurrentMessages((previous) => previous.map((message) => message.id === pendingMessageId ? { ...message, text: streamedText } : message));
         },
-        async ({ query: semanticQuery }, requestSignal) => {
-          knowledgeSearchAttempted = true;
-          assertRequestCurrent();
-          requestSignal?.throwIfAborted();
-          if (!ragReady) {
-            return { found: false, evidence: [], message: "The user has no searchable knowledge base on this device or Shelby." };
-          }
-          let matches = await searchDocuments(semanticQuery, 12, requestSignal ?? signal);
-          requestSignal?.throwIfAborted();
-          assertRequestCurrent();
-          const explicitlyRequestsGuide = /\b(?:agents?|skill)\.md\b/i.test(userQuery);
-          matches = matches.filter((doc) => !doc.imageUrl && (explicitlyRequestsGuide || !isInternalGuideSource(doc.source) && !isInternalGuideSource(doc.displayName)));
-          relevantDocs = assignCitationIds(matches.slice(0, 8));
-          return {
-            found: relevantDocs.length > 0,
-            evidence: relevantDocs.map((doc) => ({
-              citation: doc.citationId ?? "",
-              page: doc.pageNumber,
-              excerpt: doc.excerpt,
-            })),
-            message: relevantDocs.length
-              ? "Answer naturally in the user's language. Use only the supplied citation ids for document-derived claims; do not mention filenames or retrieval steps."
-              : "No sufficiently relevant passage was found. State this limitation in the user's language and do not guess document content.",
-          };
+        {
+          searchKnowledge: async ({ query: semanticQuery }, requestSignal) => {
+            assertRequestCurrent();
+            requestSignal?.throwIfAborted();
+            if (
+              toolResult?.name === "blob_inventory"
+              || (previousWasBlobInventory && isBlobInventoryConfirmationFollowUp(userQuery))
+            ) {
+              recoveredInventoryMisroute = true;
+              agentToolResult = deferredToolFallback ?? readBlobInventory(inventoryDetail, { language });
+              return {
+                found: false,
+                evidence: [],
+                message: "This follows an app inventory answer, not document evidence. Do not infer a count from RAG; the app will render its inventory snapshot directly.",
+              };
+            }
+            knowledgeSearchAttempted = true;
+            if (!ragReady) {
+              return { found: false, evidence: [], message: "The user has no searchable knowledge base on this device or Shelby." };
+            }
+            let matches = await searchDocuments(semanticQuery, 12, requestSignal ?? signal);
+            requestSignal?.throwIfAborted();
+            assertRequestCurrent();
+            const explicitlyRequestsGuide = /\b(?:agents?|skill)\.md\b/i.test(userQuery);
+            matches = matches.filter((doc) => !doc.imageUrl && (explicitlyRequestsGuide || !isInternalGuideSource(doc.source) && !isInternalGuideSource(doc.displayName)));
+            relevantDocs = assignCitationIds(matches.slice(0, 8));
+            return {
+              found: relevantDocs.length > 0,
+              evidence: relevantDocs.map((doc) => ({
+                citation: doc.citationId ?? "",
+                page: doc.pageNumber,
+                excerpt: doc.excerpt,
+              })),
+              message: relevantDocs.length
+                ? "Answer naturally in the user's language. Use only the supplied citation ids for document-derived claims; do not mention filenames or retrieval steps."
+                : "No sufficiently relevant passage was found. State this limitation in the user's language and do not guess document content.",
+            };
+          },
+          getWalletBlobInventory: async (_request, requestSignal) => {
+            assertRequestCurrent();
+            requestSignal?.throwIfAborted();
+            const result = readBlobInventory(inventoryDetail, { language });
+            agentToolResult = result;
+            if (inventoryRefreshSucceeded) inventoryReadAfterRefresh = true;
+            const data = result.data;
+            if (!data || data.kind !== "blob_inventory") return { ok: false, code: "inventory_unavailable" };
+            if (liveInventoryRefreshRequested && !inventoryRefreshSucceeded) {
+              return {
+                ok: false,
+                code: "live_refresh_required",
+                fetchedAt: data.fetchedAt,
+                message: "The user requested current network data. Refresh Shelby before using this snapshot.",
+              };
+            }
+            if (data.status !== "verified" || data.freshness !== "recent_cache") {
+              return {
+                ok: false,
+                code: data.status === "not_loaded" ? "not_loaded" : "stale_snapshot",
+                lastKnownCount: data.count,
+                fetchedAt: data.fetchedAt,
+                freshness: data.freshness,
+                message: "This is not a current network reading. Do not claim the count is current; the app will show a safe refresh instruction.",
+              };
+            }
+            return {
+              ok: true,
+              count: data.count,
+              ...(inventoryDetail === "sample" ? { examples: data.examples } : {}),
+              fetchedAt: data.fetchedAt,
+              freshness: data.freshness,
+              verified: true,
+            };
+          },
+          ...(allowsLiveInventoryRefresh ? {
+            refreshWalletBlobInventory: async (requestSignal?: AbortSignal) => {
+              assertRequestCurrent();
+              const activeSignal = requestSignal ?? signal;
+              activeSignal.throwIfAborted();
+              if (!refreshBlobInventory) {
+                return { ok: false, code: "refresh_not_authorized_for_turn" };
+              }
+              const refreshed = await refreshBlobInventory(inventoryDetail, activeSignal);
+              activeSignal.throwIfAborted();
+              assertRequestCurrent();
+              const result = readBlobInventory(inventoryDetail, { language });
+              agentToolResult = result;
+              if (refreshed.status !== "refreshed") {
+                return {
+                  ok: false,
+                  code: refreshed.code ?? "shelby_refresh_failed",
+                  message: "The live Shelby refresh did not complete. Do not present cached data as current.",
+                };
+              }
+              inventoryRefreshSucceeded = true;
+              return {
+                ok: true,
+                refreshedAt: refreshed.fetchedAt,
+                source: refreshed.source,
+                message: "Refresh completed. Call get_wallet_blob_inventory before answering.",
+              };
+            },
+          } : {}),
         },
         signal,
       );
       assertRequestCurrent();
-      const grounding = finalizeCitationGrounding(
+      let finalAgentToolResult = agentToolResult as ChatToolResult | null;
+      if (liveInventoryRefreshRequested && !inventoryRefreshSucceeded) {
+        const lastSnapshot = finalAgentToolResult ?? deferredToolFallback ?? readBlobInventory(inventoryDetail, { language });
+        finalAgentToolResult = {
+          ...lastSnapshot,
+          text: t(
+            `I could not complete a live Shelby refresh. Last available information:\n\n${lastSnapshot.text}`,
+            `Chưa thể hoàn tất lần cập nhật trực tiếp từ Shelby. Thông tin gần nhất:\n\n${lastSnapshot.text}`,
+          ),
+          data: lastSnapshot.data ? {
+            ...lastSnapshot.data,
+            status: "stale",
+            freshness: "stale_cache",
+          } : undefined,
+        };
+        streamedText = finalAgentToolResult.text;
+        relevantDocs = [];
+        knowledgeSearchAttempted = false;
+      } else if (inventoryRefreshSucceeded && !inventoryReadAfterRefresh && finalAgentToolResult) {
+        streamedText = finalAgentToolResult.text;
+      } else if (recoveredInventoryMisroute && finalAgentToolResult) {
+        streamedText = finalAgentToolResult.text;
+      } else if (
+        finalAgentToolResult?.data?.kind === "blob_inventory"
+        && (finalAgentToolResult.data.status !== "verified" || finalAgentToolResult.data.freshness !== "recent_cache")
+      ) {
+        streamedText = finalAgentToolResult.text;
+      } else if (
+        finalAgentToolResult?.data?.kind === "blob_inventory"
+        && !isBlobInventoryAnswerConsistent(finalAgentToolResult, streamedText)
+      ) {
+        streamedText = finalAgentToolResult.text;
+      }
+      if (deferredToolFallback && !finalAgentToolResult && !knowledgeSearchAttempted) {
+        streamedText = deferredToolFallback.text;
+        finalAgentToolResult = deferredToolFallback;
+        relevantDocs = [];
+      }
+      if (deferredToolFallback && !finalAgentToolResult && knowledgeSearchAttempted) {
+        finalAgentToolResult = deferredToolFallback;
+        if (!relevantDocs.length) {
+          streamedText = deferredToolFallback.text;
+          knowledgeSearchAttempted = false;
+        }
+      }
+      let grounding = finalizeCitationGrounding(
         streamedText,
         relevantDocs,
         t(
@@ -391,6 +576,12 @@ export function UnifiedChat() {
           ),
         },
       );
+      if (finalAgentToolResult?.name === "blob_inventory" && knowledgeSearchAttempted) {
+        grounding = {
+          ...grounding,
+          answer: `${finalAgentToolResult.text}\n\n${grounding.answer}`,
+        };
+      }
       const citedSources = grounding.sources;
       const citedLinks = citedSources.flatMap((doc) => doc.link ? [{
         label: t(
@@ -399,7 +590,17 @@ export function UnifiedChat() {
         ),
         url: doc.link,
       }] : []);
-      updateCurrentMessages((previous) => previous.map((message) => message.id === pendingMessageId ? { ...message, text: grounding.answer, typing: false, interrupted: undefined, sources: citedSources, links: citedLinks.slice(0, 4), hotReadProof } : message));
+      updateCurrentMessages((previous) => previous.map((message) => message.id === pendingMessageId ? {
+        ...message,
+        text: grounding.answer,
+        typing: false,
+        interrupted: undefined,
+        sources: citedSources,
+        links: citedLinks.slice(0, 4),
+        hotReadProof,
+        tool: finalAgentToolResult?.name,
+        toolObservation: createChatToolObservation(finalAgentToolResult),
+      } : message));
     } catch (error) {
       if (!isRequestCurrent(request)) return;
       if (signal.aborted) {
@@ -409,7 +610,8 @@ export function UnifiedChat() {
           updateCurrentMessages((previous) => [...previous, createChatMessage({ role: "ai", text: t("Request stopped.", "Đã dừng yêu cầu."), interrupted: true })]);
         }
       } else {
-        if (getCloudErrorKind(error) === "rate_limit") {
+        const cloudErrorKind = getCloudErrorKind(error);
+        if (cloudErrorKind === "rate_limit") {
           clearStoredCloudApiKey();
           setCloudKeyState("limited");
           setShowApiPanel(true);
@@ -418,6 +620,28 @@ export function UnifiedChat() {
             `Project của key …${cloudApiKey.slice(-4)} đang bị Gemini giới hạn. Key đã tạm ngừng để tránh gửi thêm request thất bại.`,
           ));
           preserveStatus = true;
+        }
+        const localFallback = deferredToolFallback;
+        if (pendingMessageId && localFallback && !streamedText) {
+          updateCurrentMessages((previous) => previous.map((message) => message.id === pendingMessageId ? {
+            ...message,
+            text: localFallback.text,
+            typing: false,
+            interrupted: undefined,
+            imageUrls: localFallback.imageUrls,
+            links: localFallback.links,
+            tool: localFallback.name,
+            toolObservation: createChatToolObservation(localFallback),
+            referencedSources: localFallback.referencedSources,
+          } : message));
+          if (cloudErrorKind !== "rate_limit") {
+            setStatus(t(
+              "AI wording was unavailable, so the app showed the available Shelby data directly.",
+              "AI chưa thể diễn đạt câu trả lời, nên ứng dụng đã hiển thị trực tiếp dữ liệu Shelby hiện có.",
+            ));
+          }
+          preserveStatus = true;
+          return;
         }
         const errorText = `❌ ${pendingMessageId ? cloudErrorMessage(error) : error instanceof Error ? error.message : String(error)}`;
         if (pendingMessageId) {
@@ -666,6 +890,8 @@ export function UnifiedChat() {
                     <span className="text-indigo-500 dark:text-indigo-400">{t("You", "Bạn")}</span>
                   ) : message.tool === "document_lookup" ? (
                     <><Bookmark className="h-3 w-3 text-emerald-600" /><span>{t("Sourced answer", "Trả lời có nguồn")}</span></>
+                  ) : message.tool === "blob_inventory" ? (
+                    <><Database className="h-3 w-3 text-emerald-600" /><span>{t("Shelby data", "Dữ liệu Shelby")}</span></>
                   ) : message.tool ? (
                     <><Database className="h-3 w-3 text-emerald-600" /><span>{t("App data", "Dữ liệu từ ứng dụng")}</span></>
                   ) : (

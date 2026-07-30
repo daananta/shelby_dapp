@@ -29,4 +29,29 @@ describe("scoped conversation memory", () => {
     expect(JSON.stringify(history)).not.toContain('"sources"');
     expect(JSON.stringify(history)).not.toContain('"source"');
   });
+
+  it("keeps only a safe capability marker for blob-inventory follow-ups", () => {
+    const history = buildAdaptiveGeminiHistory([
+      { role: "user", text: "Ví này có bao nhiêu blob?" },
+      {
+        role: "ai",
+        text: "Ví này có 35 blob, gồm private-plan.pdf và secret-name.txt.",
+        tool: "blob_inventory",
+        toolObservation: {
+          version: 1,
+          kind: "blob_inventory",
+          status: "verified",
+          observedAt: 10,
+          fetchedAt: 9,
+        },
+      },
+    ]);
+    const serialized = JSON.stringify(history);
+    expect(serialized).toContain("get_wallet_blob_inventory");
+    expect(serialized).toContain("refresh_wallet_blob_inventory");
+    expect(serialized).toContain("never use document search");
+    expect(serialized).not.toContain("35 blob");
+    expect(serialized).not.toContain("private-plan.pdf");
+    expect(serialized).not.toContain("secret-name.txt");
+  });
 });

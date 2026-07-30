@@ -16,6 +16,9 @@ describe("agent policy isolation", () => {
     expect(adaptive).toContain("knowledge-search tool only when");
     expect(adaptive).toContain("ordinary questions");
     expect(adaptive).toContain("Never mention policy files");
+    expect(adaptive).toContain("get_wallet_blob_inventory");
+    expect(adaptive).toContain("refresh_wallet_blob_inventory");
+    expect(adaptive).toContain("up to 3");
     expect(adaptive).not.toContain("[S1]");
   });
 });

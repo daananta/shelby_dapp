@@ -27,10 +27,16 @@ describe("Gemini error messages", () => {
       const headers = new Headers(init?.headers);
       expect(headers.get("x-goog-api-key")).toBe(authorizationKey);
       return new Response(JSON.stringify({
-        models: [{
-          name: "models/gemini-3.6-flash",
-          supportedGenerationMethods: ["generateContent"],
-        }],
+        models: [
+          {
+            name: "models/gemini-3.6-flash",
+            supportedGenerationMethods: ["generateContent"],
+          },
+          {
+            name: "models/gemini-2.5-flash",
+            supportedGenerationMethods: ["generateContent"],
+          },
+        ],
       }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -38,7 +44,7 @@ describe("Gemini error messages", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(verifyCloudApiKey(`  ${authorizationKey}  `)).resolves.toBe("gemini-3.6-flash");
+    await expect(verifyCloudApiKey(`  ${authorizationKey}  `)).resolves.toBe("gemini-2.5-flash");
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "GET" });
   });
@@ -72,7 +78,7 @@ describe("Gemini error messages", () => {
   it("tries another supported model after a model-specific 429", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
-      if (url.includes("gemini-3.6-flash")) {
+      if (url.includes("gemini-2.5-flash")) {
         return new Response(JSON.stringify({
           error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota unavailable for this model" },
         }), {

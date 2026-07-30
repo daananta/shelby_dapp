@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { ArrowDown, Bookmark, ChevronDown, Cloud, Database, FileCheck2, Fingerprint, KeyRound, MessageSquare, Send, ShieldCheck, Sparkles, Square, Trash2, X } from "lucide-react";
 import { deactivateActiveRagOwner, getPageRecord, getRagSources, hasRemoteRagProvider, isHotRemoteRagProvider, lookupExactQuote, searchDocuments, setActiveRagOwner } from "@/utils/ragOrama";
 import type { AnswerReceipt, RetrievalResult } from "@/utils/ragTypes";
-import { clearStoredCloudApiKey, getCloudErrorKind, getStoredCloudApiKey, isCloudProviderError, normalizeCloudError, resolveConversationRouteWithCloud, storeCloudApiKey, verifyCloudApiKey } from "@/utils/aiProvider";
+import { clearStoredCloudApiKey, getCloudErrorKind, getStoredCloudApiKey, isCloudProviderError, normalizeCloudError, resolveConversationRouteWithCloud, storeCloudApiKey, streamCloudAgentAnswer, verifyCloudApiKey } from "@/utils/aiProvider";
 import { streamHostedAgentAnswer } from "@/utils/openRouterProvider";
 import { asksForLiveBlobInventoryRefresh, blobInventoryDetailForQuestion, createChatToolObservation, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, runChatTool, type ChatToolResult } from "@/utils/chatTools";
 import { classifyQueryIntent } from "@/utils/queryRouter";
@@ -67,6 +67,10 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
   const { query, setQuery, messages, setMessages, loading, status, setStatus, beginRequest, isRequestCurrent, finishRequest, abortRequest, clearMessages } = useChatManager(ownerKey);
   const [cloudApiKey, setCloudApiKey] = useState("");
   const [cloudKeyState, setCloudKeyState] = useState<"empty" | "checking" | "ready" | "limited" | "unverified" | "invalid">("empty");
+  const activeGeminiApiKey = cloudKeyState === "empty" || cloudKeyState === "invalid"
+    ? ""
+    : getStoredCloudApiKey();
+  const activeChatProvider = activeGeminiApiKey ? "gemini" : "qwen";
   const keyCheckGenerationRef = useRef(0);
   const [activeVisualSource, setActiveVisualSource] = useState<RetrievalResult | null>(null);
   const [activeReceipt, setActiveReceipt] = useState<AnswerReceipt | null>(null);
@@ -286,9 +290,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
   const handleAsk = async (presetQuestion?: string) => {
     const userQuery = (presetQuestion ?? query).trim();
     if (!userQuery || loading) return;
-    const geminiApiKey = cloudKeyState === "empty" || cloudKeyState === "invalid"
-      ? ""
-      : getStoredCloudApiKey();
+    const geminiApiKey = activeGeminiApiKey;
     const request = beginRequest();
     const { signal } = request;
     let pendingMessageId: string | undefined;
@@ -437,8 +439,13 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       let inventoryRefreshSucceeded = false;
       let inventoryReadAfterRefresh = false;
       let agentToolResult: ChatToolResult | null = null;
-      await streamHostedAgentAnswer(
-        { contents, systemInstruction: buildAdaptiveAgentSystemInstruction() },
+      const streamAgentAnswer = geminiApiKey ? streamCloudAgentAnswer : streamHostedAgentAnswer;
+      await streamAgentAnswer(
+        {
+          contents,
+          systemInstruction: buildAdaptiveAgentSystemInstruction(),
+          ...(geminiApiKey ? { cloudApiKey: geminiApiKey } : {}),
+        },
         (chunk) => {
           if (signal.aborted || !isRequestCurrent(request)) return;
           streamedText += chunk;
@@ -786,6 +793,16 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
     t("Which wallet is connected?", "Ví đang kết nối là gì?"),
     t("What is Shelby Protocol used for?", "Shelby Protocol dùng để làm gì?"),
   ];
+  const geminiCtaClass = cloudKeyState === "ready"
+    ? "border-emerald-300 bg-gradient-to-r from-emerald-50 to-lime-50 text-emerald-800 shadow-[0_4px_16px_rgba(16,185,129,0.12)] hover:border-emerald-400 hover:shadow-[0_6px_20px_rgba(16,185,129,0.18)] dark:border-lime-300/30 dark:from-lime-300/10 dark:to-emerald-300/5 dark:text-lime-200"
+    : cloudKeyState === "limited" || cloudKeyState === "unverified"
+      ? "border-amber-300 bg-amber-50 text-amber-800 hover:border-amber-400 hover:bg-amber-100/80 dark:border-amber-300/25 dark:bg-amber-300/10 dark:text-amber-200"
+      : "border-lime-300 bg-lime-50/80 text-emerald-900 shadow-[0_3px_12px_rgba(132,204,22,0.10)] hover:border-lime-400 hover:bg-lime-100/80 dark:border-lime-300/25 dark:bg-lime-300/10 dark:text-lime-200";
+  const geminiCtaLabel = cloudKeyState === "ready"
+    ? t("Gemini ready", "Gemini sẵn sàng")
+    : cloudKeyState === "limited" || cloudKeyState === "unverified"
+      ? t("Check Gemini", "Kiểm tra Gemini")
+      : t("Use Gemini", "Dùng Gemini");
 
   return (
     <Card className="glass-panel border-white/40 dark:border-white/10 mt-0 flex h-full min-h-0 flex-col overflow-hidden rounded-[24px] shadow-sm">
@@ -800,14 +817,32 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             {/* Inline status chips */}
             <div className="hidden items-center gap-3 sm:flex">
               <span className={ragReady ? "status-chip ok" : "status-chip"} title={ragMode === "hot" ? t("Fetch only relevant parts from Shelby", "Chỉ đọc các phần liên quan từ Shelby") : t("Reference data", "Dữ liệu tham khảo")}><span className={`status-dot ${ragReady ? "green" : "gray"}`} /> {ragMode === "hot" ? t("Reading from Shelby", "Đọc từ Shelby") : ragReady ? t("Data ready", "Đã có dữ liệu") : t("No data yet", "Chưa có dữ liệu")}</span>
-              <span className={geminiUsage.chat ? "status-chip ok" : "status-chip"} title={geminiUsage.chat ? t("Qwen3.7 Flash is provided by this app", "Ứng dụng cung cấp sẵn Qwen3.7 Flash") : t("AI chat is off in Settings", "Chat AI đang tắt trong Cấu hình")}><span className={`status-dot ${geminiUsage.chat ? "green" : "gray"}`} /> {geminiUsage.chat ? "Qwen 3.7" : t("Chat off", "Chat đã tắt")}</span>
+              <span
+                className={geminiUsage.chat ? "status-chip ok" : "status-chip"}
+                title={geminiUsage.chat
+                  ? activeChatProvider === "gemini"
+                    ? t("Chat uses your saved Gemini key; Gemini 2.5 Flash is preferred", "Chat dùng Gemini key đã lưu; ưu tiên Gemini 2.5 Flash")
+                    : t("No Gemini key is saved, so chat uses the app's Qwen3.7 Flash", "Chưa lưu Gemini key nên chat dùng Qwen3.7 Flash của ứng dụng")
+                  : t("AI chat is off in Settings", "Chat AI đang tắt trong Cấu hình")}
+              >
+                <span className={`status-dot ${geminiUsage.chat ? "green" : "gray"}`} />
+                {geminiUsage.chat
+                  ? activeChatProvider === "gemini" ? "Gemini" : "Qwen 3.7"
+                  : t("Chat off", "Chat đã tắt")}
+              </span>
             </div>
-            <button className="flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-bold text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-900 dark:hover:bg-white/[0.05] dark:hover:text-white" onClick={() => setShowApiPanel((value) => !value)} title={t("Optional Gemini key for RAG content processing", "Gemini key tùy chọn để xử lý nội dung RAG")}>
-              <KeyRound className="h-3.5 w-3.5" /> {cloudKeyState === "ready"
-                ? t("RAG AI ready", "AI tạo RAG sẵn sàng")
-                : cloudKeyState === "limited" || cloudKeyState === "unverified"
-                  ? t("RAG AI saved", "Đã lưu AI tạo RAG")
-                  : t("RAG AI optional", "AI tạo RAG tùy chọn")}
+            <button
+              type="button"
+              aria-expanded={showApiPanel}
+              aria-controls="gemini-key-panel"
+              data-state={cloudKeyState}
+              className={`flex h-9 items-center gap-1.5 rounded-xl border px-2.5 text-[11px] font-extrabold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 ${geminiCtaClass}`}
+              onClick={() => setShowApiPanel((value) => !value)}
+              title={t("Use Gemini for chat and richer RAG processing", "Dùng Gemini cho chat và xử lý RAG tốt hơn")}
+            >
+              <KeyRound className="h-3.5 w-3.5" />
+              {geminiCtaLabel}
+              <ChevronDown className={`h-3.5 w-3.5 transition-transform ${showApiPanel ? "rotate-180" : ""}`} />
             </button>
             {messages.length > 0 && (
               <button
@@ -829,15 +864,24 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
           </button>
         )}
         {showApiPanel ? (
-          <div className="mx-4 mt-3 rounded-xl border border-[#dfe4dc] bg-[#f5f6f2] p-3 dark:border-white/[0.06] dark:bg-white/[0.025]">
+          <div id="gemini-key-panel" className="mx-4 mt-3 rounded-xl border border-[#dfe4dc] bg-[#f5f6f2] p-3 dark:border-white/[0.06] dark:bg-white/[0.025]">
             <div className="flex items-center justify-between mb-2">
               <div>
-                <span className="block text-[12px] font-semibold text-slate-700 dark:text-slate-300">{t("Chat uses Qwen3.7 Flash by default", "Chat mặc định dùng Qwen3.7 Flash")}</span>
-                <span className="mt-0.5 block text-[10px] text-slate-500 dark:text-slate-400">{t("No API key is required for chat. Gemini below is optional for OCR, images, video, and semantic indexing.", "Chat không cần API key. Gemini bên dưới chỉ tùy chọn cho OCR, ảnh, video và lập chỉ mục ngữ nghĩa.")}</span>
+                <span className="block text-[12px] font-semibold text-slate-700 dark:text-slate-300">
+                  {activeChatProvider === "gemini"
+                    ? t("Chat is using Gemini", "Chat đang dùng Gemini")
+                    : t("Chat is using Qwen3.7 Flash", "Chat đang dùng Qwen3.7 Flash")}
+                </span>
+                <span className="mt-0.5 block text-[10px] text-slate-500 dark:text-slate-400">
+                  {t(
+                    "Save a Gemini key to switch chat to Gemini 2.5 Flash first and enable richer OCR, image, video, and semantic indexing.",
+                    "Lưu Gemini key để chuyển chat sang Gemini 2.5 Flash trước, đồng thời mở khóa OCR, ảnh, video và lập chỉ mục ngữ nghĩa tốt hơn.",
+                  )}
+                </span>
               </div>
               <button className="text-[11px] text-slate-400 hover:text-slate-600" onClick={() => setShowApiPanel(false)}>{t("Close", "Đóng")}</button>
             </div>
-            <span className="mb-1.5 block text-[11px] font-semibold text-slate-500 dark:text-slate-400">{t("Optional Gemini API key for building RAG", "Gemini API key tùy chọn để tạo RAG")}</span>
+            <span className="mb-1.5 block text-[11px] font-semibold text-slate-500 dark:text-slate-400">{t("Gemini API key", "Gemini API key")}</span>
             <div className="flex gap-1.5">
               <Input
                 type="password"
@@ -860,7 +904,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
                   setStatus("");
                 }}
                 onKeyDown={(event) => event.key === "Enter" && void saveCloudKey()}
-                placeholder={t("Paste optional Gemini API key…", "Dán Gemini API key tùy chọn…")}
+                placeholder={t("Paste Gemini API key…", "Dán Gemini API key…")}
               />
               <Button
                 size="sm"
@@ -881,7 +925,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             </div>
             <div className="flex items-center justify-between mt-1.5">
               <p className={`text-[11px] leading-4 ${cloudKeyState === "ready" ? "text-emerald-600 dark:text-emerald-400" : "text-slate-400"}`}>
-                {t("This optional Gemini key stays only in this browser tab. It is never added to RAG or uploaded to Shelby.", "Gemini key tùy chọn chỉ được lưu trong phiên tab này. Key không được đưa vào RAG hay tải lên Shelby.")}
+                {t("This Gemini key stays only in this browser tab. It is never added to RAG or uploaded to Shelby.", "Gemini key chỉ được lưu trong phiên tab này. Key không được đưa vào RAG hay tải lên Shelby.")}
               </p>
               {normalizeGeminiApiKey(cloudApiKey) && <span className="shrink-0 pl-3 font-mono text-[10px] font-bold text-slate-500 dark:text-slate-400">Key …{normalizeGeminiApiKey(cloudApiKey).slice(-4)}</span>}
             </div>

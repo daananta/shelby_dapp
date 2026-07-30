@@ -46,8 +46,8 @@ export interface AgentToolHandlers {
   refreshWalletBlobInventory?: (signal?: AbortSignal) => Promise<Record<string, unknown>>;
 }
 
-const CLOUD_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"];
-const ROUTER_MODELS = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash"];
+const CLOUD_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"];
+const ROUTER_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"];
 const GEMINI_MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000";
 const conversationRouteCache = new Map<string, ConversationRoute>();
 

@@ -15,6 +15,7 @@ import { sha256Text } from "@/utils/contentIntegrity";
 import { getCloudErrorKind } from "@/utils/aiProvider";
 import { useGeminiUsage } from "@/hooks/useGeminiUsage";
 import { localize } from "@/i18n";
+import type { RagIndexLog, RagIndexProgress, RagIndexStage } from "@/utils/ragProgress";
 
 const RAG_OPTIONS_STORAGE_KEY = "shelby-rag-explorer.rag-options-v1";
 
@@ -40,8 +41,8 @@ export function useRag(account: any, signMessage: any) {
   const { preferences: geminiUsage } = useGeminiUsage();
   const [ragSources, setRagSources] = useState<RagSource[]>([]);
   const [indexingAll, setIndexingAll] = useState(false);
-  const [indexProgress, setIndexProgress] = useState<{ done: number; total: number; currentName: string; stage?: string } | null>(null);
-  const [indexLogs, setIndexLogs] = useState<{ at: number; text: string }[]>([]);
+  const [indexProgress, setIndexProgress] = useState<RagIndexProgress | null>(null);
+  const [indexLogs, setIndexLogs] = useState<RagIndexLog[]>([]);
 
   const options = loadRagOptions();
   const [fullPdfOcr, setFullPdfOcr] = useState(options.fullPdfOcr);
@@ -103,7 +104,11 @@ export function useRag(account: any, signMessage: any) {
     blobCreatedAtMicros: Number.isFinite(Number(blob?.creationMicros)) ? Number(blob.creationMicros) : undefined,
   });
 
-  const addSemanticEmbeddings = async (chunkRecords: ChunkRecord[], setStage: (stage: string) => void, signal?: AbortSignal) => {
+  const addSemanticEmbeddings = async (
+    chunkRecords: ChunkRecord[],
+    setStage: (detail: string, stage: RagIndexStage) => void,
+    signal?: AbortSignal,
+  ) => {
     let embeddingStatus: DocumentManifest["embeddingStatus"] = "unavailable";
     const resolvedEmbeddingProvider: EmbeddingProvider | null = effectiveEmbeddingMode === "off" ? null : effectiveEmbeddingMode;
     if (!resolvedEmbeddingProvider) return { embeddingStatus, embeddingProvider: null as EmbeddingProvider | null };
@@ -112,8 +117,15 @@ export function useRag(account: any, signMessage: any) {
     if (resolvedEmbeddingProvider === "gemini" && !cloudKey) return { embeddingStatus, embeddingProvider: resolvedEmbeddingProvider };
     embeddingStatus = "ready";
     try {
-      setStage(localize("Creating semantic search data", "Tạo dữ liệu tìm kiếm theo ý nghĩa"));
-      const embeddings = await embedTexts(chunkRecords.map((chunk) => chunk.text), "passage", setStage, resolvedEmbeddingProvider, cloudKey, signal);
+      setStage(localize("Creating semantic search data", "Tạo dữ liệu tìm kiếm theo ý nghĩa"), "embed");
+      const embeddings = await embedTexts(
+        chunkRecords.map((chunk) => chunk.text),
+        "passage",
+        (detail) => setStage(detail, "embed"),
+        resolvedEmbeddingProvider,
+        cloudKey,
+        signal,
+      );
       signal?.throwIfAborted();
       embeddings.forEach((embedding, index) => {
         if (!chunkRecords[index]) return;
@@ -165,8 +177,15 @@ export function useRag(account: any, signMessage: any) {
           `Preparing ${eligibleTargets.length} eligible public or unlocked blobs.`,
           `Bắt đầu tạo RAG từ ${eligibleTargets.length} blob public/time lock đủ điều kiện.`,
         ),
+        stage: "prepare",
       }]);
-      setIndexProgress({ done: 0, total: eligibleTargets.length, currentName: "", stage: localize("Preparing", "Chuẩn bị") });
+      setIndexProgress({
+        done: 0,
+        total: eligibleTargets.length,
+        currentName: "",
+        stage: "prepare",
+        detail: localize("Preparing", "Chuẩn bị"),
+      });
       toast({ title: localize(`Building RAG from ${eligibleTargets.length} files…`, `Tạo RAG từ ${eligibleTargets.length} tệp…`) });
 
       let failed = 0;
@@ -184,13 +203,13 @@ export function useRag(account: any, signMessage: any) {
         const publicUrl = getShelbyBlobUrl(ownerAddress, blobName);
         const displayName = getDisplayName(blobName, b);
 
-        const setStage = (stage: string) => {
+        const setStage = (detail: string, stage: RagIndexStage) => {
           if (!isCurrentRun() || controller.signal.aborted) return;
-          setIndexProgress({ done: i, total: eligibleTargets.length, currentName: displayName, stage });
-          setIndexLogs((previous) => [...previous, { at: Date.now(), text: `${displayName}: ${stage}` }].slice(-7));
+          setIndexProgress({ done: i, total: eligibleTargets.length, currentName: displayName, stage, detail });
+          setIndexLogs((previous) => [...previous, { at: Date.now(), text: `${displayName}: ${detail}`, detail, stage }].slice(-7));
         };
 
-        setStage(localize("Checking access", "Kiểm tra quyền truy cập"));
+        setStage(localize("Checking access", "Kiểm tra quyền truy cập"), "access");
 
         try {
           const access = getBlobAccessDecision(b, ownerAddress);
@@ -204,8 +223,9 @@ export function useRag(account: any, signMessage: any) {
             setIndexLogs((previous) => [...previous, {
               at: Date.now(),
               text: localize(`${displayName}: skipped — ${access.reason ?? "not eligible"}`, `${displayName}: bỏ qua — ${access.reason ?? "không đủ điều kiện"}`),
+              stage: "complete" as const,
             }].slice(-7));
-            setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName, stage: localize("Skipped", "Bỏ qua") });
+            setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName, stage: "complete", detail: localize("Skipped", "Bỏ qua") });
             continue;
           }
 
@@ -216,7 +236,7 @@ export function useRag(account: any, signMessage: any) {
               runOwner,
             );
             skipped += 1;
-            setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName });
+            setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName, stage: "complete", detail: localize("Skipped", "Bỏ qua") });
             continue;
           }
 
@@ -225,13 +245,13 @@ export function useRag(account: any, signMessage: any) {
           const existing = ragSources.find((source) => source.source === blobName);
 
           if (!options.force && !needsLocalIndex(existing, revision)) {
-            setStage(localize("Unchanged · keeping the current index", "Không thay đổi · giữ index hiện tại"));
-            setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName, stage: localize("Up to date", "Đã cập nhật") });
+            setStage(localize("Unchanged · keeping the current index", "Không thay đổi · giữ index hiện tại"), "complete");
+            setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName, stage: "complete", detail: localize("Up to date", "Đã cập nhật") });
             continue;
           }
 
           if (b.isDemoBlob) {
-            setStage(localize("Loading sample RAG", "Đang nạp demo RAG"));
+            setStage(localize("Loading sample RAG", "Đang nạp demo RAG"), "extract");
             const rawText = b.demoText;
             const manifest: DocumentManifest = {
               id: documentId, owner, source: blobName, displayName, revision, blobUrl: "", accessTag: access.info.tag, ...blobProof(b), mimeType: "text/plain", type: "text", aliases: [], authors: [], pageCount: 1, chunkCount: 1, ocrCoverage: 0, embeddingStatus: "unavailable", status: "indexed", indexedAt: Date.now()
@@ -245,17 +265,22 @@ export function useRag(account: any, signMessage: any) {
             };
             throwIfStale();
             await replaceDocument({ manifest, pages: [pageRecord], chunks: [chunkRecord], stories: [] });
-            setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName });
+            setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName, stage: "complete", detail: localize("Complete", "Hoàn tất") });
             continue;
           }
 
-          setStage(access.needsBroker ? localize("Verifying wallet and downloading blob", "Xác thực ví và tải blob") : localize("Downloading blob", "Tải blob"));
+          setStage(
+            access.needsBroker
+              ? localize("Verifying wallet and downloading blob", "Xác thực ví và tải blob")
+              : localize("Downloading blob", "Tải blob"),
+            "download",
+          );
           const downloaded = await downloadBlobForRag({ owner: ownerAddress, blobName, blob: b, walletAddress: ownerAddress, signMessage, signal: controller.signal });
           throwIfStale();
           const url = downloaded.url;
 
           try {
-            setStage(localize("Identifying file content", "Nhận diện nội dung từ bytes"));
+            setStage(localize("Identifying file content", "Nhận diện nội dung từ bytes"), "detect");
             const detected = await sniffRagContent(downloaded.content);
             throwIfStale();
             if (detected.kind === "unsupported") {
@@ -265,21 +290,22 @@ export function useRag(account: any, signMessage: any) {
               setIndexLogs((previous) => [...previous, {
                 at: Date.now(),
                 text: localize(`${displayName}: skipped — ${detected.format}`, `${displayName}: bỏ qua — ${detected.format}`),
+                stage: "complete" as const,
               }].slice(-7));
-              setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName, stage: localize("Skipped", "Bỏ qua") });
+              setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName, stage: "complete", detail: localize("Skipped", "Bỏ qua") });
               continue;
             }
 
             const inputKind = detected.kind;
             if (inputKind === "package") {
-              setStage(localize("Importing the RAG backup", "Nhập gói RAG portable"));
+              setStage(localize("Importing the RAG backup", "Nhập gói RAG portable"), "extract");
               const packageData = JSON.parse(await downloaded.content.text());
               throwIfStale();
               const imported = await importPortableRagPackage(packageData, runOwner, controller.signal);
               throwIfStale();
               toast({ title: localize(`Imported ${imported} documents from the RAG backup.`, `Đã nhập ${imported} tài liệu từ gói RAG.`) });
             } else if (inputKind === "image") {
-              setStage(localize("Reading image", "Phân tích ảnh"));
+              setStage(localize("Reading image", "Phân tích ảnh"), "extract");
               let description: string | null = null;
               if (cloudContentKey) {
                 try {
@@ -295,6 +321,7 @@ export function useRag(account: any, signMessage: any) {
                       `${displayName}: preview indexed; AI can inspect the image again when needed.`,
                       `${displayName}: đã index preview; AI có thể xem lại ảnh khi cần.`,
                     ),
+                    stage: "extract" as const,
                   }].slice(-7));
                 }
               }
@@ -315,7 +342,7 @@ export function useRag(account: any, signMessage: any) {
                 "An active Gemini API key is required to understand video content and speech.",
                 "Video cần Gemini API key đang hoạt động để nhận dạng nội dung và lời nói.",
               ));
-              setStage(localize("Reading video with Gemini", "Phân tích video với Gemini"));
+              setStage(localize("Reading video with Gemini", "Phân tích video với Gemini"), "extract");
               const videoText = await describeVideoWithCloud(downloaded.content, displayName, cloudContentKey, controller.signal);
               throwIfStale();
               const normalizedPageText = normalizeSearchText(videoText);
@@ -335,7 +362,7 @@ export function useRag(account: any, signMessage: any) {
               if (!chunkRecords.length) throw new Error(localize("No searchable content could be created from this video.", "Không tạo được nội dung tìm kiếm từ video."));
               const semantic = await addSemanticEmbeddings(chunkRecords, setStage, controller.signal);
               throwIfStale();
-              setStage(localize("Saving search index", "Lưu chỉ mục tìm kiếm"));
+              setStage(localize("Saving search index", "Lưu chỉ mục tìm kiếm"), "save");
               const manifest: DocumentManifest = {
                 id: documentId, owner, source: blobName, displayName, revision, blobUrl: downloaded.blobUrl,
                 accessTag: access.info.tag, ...blobProof(b), mimeType: detected.mimeType, type: "video",
@@ -347,17 +374,35 @@ export function useRag(account: any, signMessage: any) {
               throwIfStale();
               await replaceDocument({ manifest, pages: [page], chunks: chunkRecords, stories: [] });
             } else {
-              setStage(detected.mimeType === "application/pdf"
-                ? localize("Reading PDF text", "Đọc text PDF")
-                : localize(`Reading ${detected.format}`, `Đọc ${detected.format}`));
-              const extractedPages = await extractPagesFromUrl(url, blobName, 500, setStage, detected.mimeType, controller.signal);
+              setStage(
+                detected.mimeType === "application/pdf"
+                  ? localize("Reading PDF text", "Đọc text PDF")
+                  : localize(`Reading ${detected.format}`, `Đọc ${detected.format}`),
+                "extract",
+              );
+              const extractedPages = await extractPagesFromUrl(
+                url,
+                blobName,
+                500,
+                (detail) => setStage(detail, "extract"),
+                detected.mimeType,
+                controller.signal,
+              );
               throwIfStale();
               let ocrResult: Awaited<ReturnType<typeof ocrPdfPages>> = { pages: [], attemptedPages: 0 };
 
               if (detected.mimeType === "application/pdf") {
                 try {
-                  setStage(localize("Reading pages with little text", "OCR trang ít chữ"));
-                  ocrResult = await ocrPdfPages(url, extractedPages, fullPdfOcr, setStage, () => cancelIndexRef.current, cloudContentKey, controller.signal);
+                  setStage(localize("Reading pages with little text", "OCR trang ít chữ"), "ocr");
+                  ocrResult = await ocrPdfPages(
+                    url,
+                    extractedPages,
+                    fullPdfOcr,
+                    (detail) => setStage(detail, "ocr"),
+                    () => cancelIndexRef.current,
+                    cloudContentKey,
+                    controller.signal,
+                  );
                 } catch (ocrError) {
                   console.warn("OCR unavailable; continuing with the document text layer.", ocrError);
                 }
@@ -404,7 +449,7 @@ export function useRag(account: any, signMessage: any) {
               const semantic = await addSemanticEmbeddings(chunkRecords, setStage, controller.signal);
               throwIfStale();
 
-              setStage(localize("Saving search index", "Lưu chỉ mục tìm kiếm"));
+              setStage(localize("Saving search index", "Lưu chỉ mục tìm kiếm"), "save");
               const nonEmptyPages = pageRecords.filter((page) => page.rawText.trim().length >= 30).length;
               const appliedOcrPages = pageRecords.filter((page) => page.extractionMethod !== "text_layer").length;
               const manifest: DocumentManifest = { id: documentId, owner, source: blobName, displayName, revision, blobUrl: downloaded.blobUrl, accessTag: access.info.tag, ...blobProof(b), mimeType: detected.mimeType, type: "text", title: inferred.title, aliases: [...new Set([...(existing?.aliases ?? []), ...inferred.aliases])], authors: inferred.authors, pageCount: pageRecords.length, chunkCount: chunkRecords.length, ocrCoverage: pageRecords.length ? appliedOcrPages / pageRecords.length : 0, textCoverage: pageRecords.length ? nonEmptyPages / pageRecords.length : 0, embeddingStatus: semantic.embeddingStatus, embeddingProvider: semantic.embeddingProvider ?? undefined, status: "indexed", indexedAt: Date.now() };
@@ -434,7 +479,7 @@ export function useRag(account: any, signMessage: any) {
           });
         }
 
-        setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName, stage: localize("Complete", "Hoàn tất") });
+        setIndexProgress({ done: i + 1, total: eligibleTargets.length, currentName: displayName, stage: "complete", detail: localize("Complete", "Hoàn tất") });
       }
 
       if (isCurrentRun()) {

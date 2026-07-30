@@ -23,6 +23,7 @@ test("shows a deterministic page-level RAG proof without a wallet", async ({ pag
   await page.goto("/");
   await page.getByRole("button", { name: "Try the wallet-free demo", exact: true }).click();
   await expect(page.getByText("Wallet-free walkthrough · sample data", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Back to home", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Find source", exact: true }).click();
   await expect(page.getByText("page 2/3", { exact: false })).toBeVisible();
   await expect(page.getByText("DEMO ONLY", { exact: true })).toBeVisible();

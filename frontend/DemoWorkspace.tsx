@@ -181,7 +181,7 @@ export default function DemoWorkspace({ onConnect, onExit }: DemoWorkspaceProps)
             </div>
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={onExit}>
+            <Button variant="outline" size="sm" onClick={onExit} aria-label={t("Back to home", "Về trang đầu")}>
               <ArrowLeft className="mr-1 h-4 w-4" />
               <span className="hidden sm:inline">{t("Home", "Trang đầu")}</span>
             </Button>

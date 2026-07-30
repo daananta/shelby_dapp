@@ -253,6 +253,15 @@ describe("RAG quality benchmark", () => {
       });
     });
 
+    it("fails closed when valid evidence is mixed with an unavailable citation", () => {
+      const candidates = assignCitationIds([source("a.pdf"), source("b.pdf")]);
+      expect(finalizeCitationGrounding("Supported [S1], invented [S99].", candidates, "retry")).toEqual({
+        answer: "retry",
+        grounded: false,
+        sources: [],
+      });
+    });
+
     it("does not require citations for a general answer without document candidates", () => {
       expect(finalizeCitationGrounding("Paris is in France.", [], "retry")).toEqual({
         answer: "Paris is in France.",

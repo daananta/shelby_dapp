@@ -295,7 +295,7 @@ function checkReceiptSemantics(receipt: AnswerReceipt, errors: string[], warning
       errors.push(`${citationId}: nội dung OCR/AI không được phép ghi là content_verified nếu không có dữ liệu tái tạo độc lập.`);
     }
   }
-  const citedIds = Array.from(receipt.answer.matchAll(/\[(S\d+)\]/gi), (match) => match[1].toUpperCase());
+  const citedIds = [...extractCitationIds(receipt.answer)];
   if (!citedIds.length && receipt.sources.length) errors.push("Câu trả lời không liên kết tới nguồn nào trong receipt.");
   for (const citationId of citedIds) if (!sourceMap.has(citationId)) errors.push(`Câu trả lời tham chiếu ${citationId} nhưng receipt không có nguồn này.`);
   for (const citationId of sourceMap.keys()) if (!citedIds.includes(citationId)) errors.push(`Nguồn ${citationId} không được dùng trong câu trả lời.`);
@@ -474,15 +474,59 @@ export function assignCitationIds(sources: RetrievalResult[]): RetrievalResult[]
   return sources.map((source, index) => ({ ...source, citationId: `S${index + 1}` }));
 }
 
-/** Keeps only evidence IDs the model explicitly cited in its final answer. */
-export function selectCitedSources(answer: string, candidates: RetrievalResult[]): RetrievalResult[] {
+function normalizeCitationId(value: string | undefined): string | undefined {
+  const match = /^S([1-9]\d*)$/i.exec(value?.trim() ?? "");
+  return match ? `S${BigInt(match[1]).toString()}` : undefined;
+}
+
+function extractCitationIds(answer: string): Set<string> {
   const citedIds = new Set<string>();
   for (const group of answer.matchAll(/\[([^\]]+)\]/g)) {
     for (const citation of group[1].matchAll(/\bS(\d+)\b/gi)) {
-      citedIds.add(`S${Number(citation[1])}`);
+      citedIds.add(`S${BigInt(citation[1]).toString()}`);
     }
   }
-  return candidates.filter((source) => source.citationId && citedIds.has(source.citationId.toUpperCase()));
+  return citedIds;
+}
+
+/** Preserves grounded IDs, labels missing sources, and rejects ambiguous IDs. */
+function ensureCitationIds(sources: RetrievalResult[]): RetrievalResult[] {
+  const normalizedIds = sources.map((source) => normalizeCitationId(source.citationId));
+  const reservedIds = new Set<string>();
+  for (const [index, source] of sources.entries()) {
+    const citationId = normalizedIds[index];
+    if (source.citationId !== undefined && !citationId) {
+      throw new TypeError(`Invalid citation id: ${source.citationId}`);
+    }
+    if (citationId && reservedIds.has(citationId)) {
+      throw new TypeError(`Duplicate citation id: ${citationId}`);
+    }
+    if (citationId) reservedIds.add(citationId);
+  }
+  const assignedIds = new Set<string>();
+  let nextId = 1;
+
+  return sources.map((source, index) => {
+    const existingId = normalizedIds[index];
+    if (existingId && !assignedIds.has(existingId)) {
+      assignedIds.add(existingId);
+      return { ...source, citationId: existingId };
+    }
+    while (reservedIds.has(`S${nextId}`) || assignedIds.has(`S${nextId}`)) nextId += 1;
+    const citationId = `S${nextId}`;
+    assignedIds.add(citationId);
+    nextId += 1;
+    return { ...source, citationId };
+  });
+}
+
+/** Keeps only evidence IDs the model explicitly cited in its final answer. */
+export function selectCitedSources(answer: string, candidates: RetrievalResult[]): RetrievalResult[] {
+  const citedIds = extractCitationIds(answer);
+  return candidates.filter((source) => {
+    const citationId = normalizeCitationId(source.citationId);
+    return citationId ? citedIds.has(citationId) : false;
+  });
 }
 
 export function finalizeCitationGrounding(
@@ -494,6 +538,7 @@ export function finalizeCitationGrounding(
     noEvidenceMessage?: string;
   } = {},
 ): { answer: string; sources: RetrievalResult[]; grounded: boolean | null } {
+  const citedIds = extractCitationIds(answer);
   const sources = selectCitedSources(answer, candidates);
   if (!candidates.length) {
     if (options.retrievalAttempted) {
@@ -505,7 +550,13 @@ export function finalizeCitationGrounding(
     }
     return { answer, sources, grounded: null };
   }
-  if (!sources.length) return { answer: missingCitationMessage, sources: [], grounded: false };
+  const availableIds = new Set(
+    candidates
+      .map((source) => normalizeCitationId(source.citationId))
+      .filter((id): id is string => Boolean(id)),
+  );
+  const hasUnknownCitation = [...citedIds].some((citationId) => !availableIds.has(citationId));
+  if (!sources.length || hasUnknownCitation) return { answer: missingCitationMessage, sources: [], grounded: false };
   return { answer, sources, grounded: true };
 }
 
@@ -621,7 +672,7 @@ export async function createAnswerReceipt(input: {
   signal?: AbortSignal;
   onProgress?: (message: string) => void;
 }): Promise<AnswerReceipt> {
-  const labeledSources = assignCitationIds(input.sources);
+  const labeledSources = ensureCitationIds(input.sources);
   const verifiedSources: AnswerReceiptSource[] = [];
   for (let index = 0; index < labeledSources.length; index += 1) {
     input.signal?.throwIfAborted();

@@ -1,11 +1,18 @@
 import { CheckCircle2, ScanText, Square } from "lucide-react";
 import type { CSSProperties } from "react";
 import { useLanguage } from "@/i18n";
+import {
+  estimateRagBatchProgress,
+  estimateRagFileProgress,
+  ragStageStep,
+  type RagIndexLog,
+  type RagIndexProgress,
+} from "@/utils/ragProgress";
 
 interface IndexingStepperProps {
   indexingAll: boolean;
-  indexProgress: { done: number; total: number; currentName: string; stage?: string } | null;
-  indexLogs: { at: number; text: string }[];
+  indexProgress: RagIndexProgress | null;
+  indexLogs: RagIndexLog[];
   onCancel?: () => void;
 }
 
@@ -22,32 +29,6 @@ const MATRIX_COLUMNS = [
   "10101QUERY00110APTOS111000",
 ];
 
-function ratioFromText(text: string): number | undefined {
-  const percent = [...text.matchAll(/(\d{1,3})\s*%/g)].at(-1);
-  if (percent) return Math.max(0, Math.min(1, Number(percent[1]) / 100));
-  const ratios = [...text.matchAll(/(\d+)\s*\/\s*(\d+)/g)];
-  const ratio = ratios.at(-1);
-  if (!ratio || Number(ratio[2]) <= 0) return undefined;
-  return Math.max(0, Math.min(1, Number(ratio[1]) / Number(ratio[2])));
-}
-
-/** An honest UI estimate assembled from known pipeline boundaries and real subtask ratios. */
-function fileProgressFromStage(stage: string): number {
-  const normalized = stage.toLocaleLowerCase("vi-VN");
-  const ratio = ratioFromText(stage);
-  if (/hoàn tất|đã cập nhật/.test(normalized)) return 100;
-  if (/commit/.test(normalized)) return 98;
-  if (/embedding/.test(normalized)) return Math.round(76 + (ratio ?? 0.2) * 20);
-  if (/ocr/.test(normalized)) return Math.round(48 + (ratio ?? 0.15) * 27);
-  if (/đọc text pdf|đọc nội dung|đọc json|đọc văn bản/.test(normalized)) return Math.round(31 + (ratio ?? 0.15) * 17);
-  if (/phân tích video/.test(normalized)) return 55;
-  if (/phân tích ảnh|nhập gói rag|nhận diện nội dung/.test(normalized)) return 30;
-  if (/tải blob|xác thực ví và tải/.test(normalized)) return 18;
-  if (/kiểm tra quyền/.test(normalized)) return 7;
-  if (/chuẩn bị/.test(normalized)) return 2;
-  return 4;
-}
-
 export function IndexingStepper({
   indexingAll,
   indexProgress,
@@ -58,25 +39,21 @@ export function IndexingStepper({
   if (!indexingAll || !indexProgress) return null;
 
   const stages = [
-    { key: "policy", label: t("Check access", "Kiểm tra quyền"), match: ["Kiểm tra quyền truy cập"] },
-    { key: "download", label: t("Load data", "Tải dữ liệu"), match: ["Xác thực ví và tải blob", "Tải blob"] },
-    { key: "ocr", label: t("Read content", "Đọc nội dung"), match: ["Nhận diện nội dung", "Đọc ", "OCR", "Phân tích ảnh", "Phân tích video", "Nhập gói RAG portable"] },
-    { key: "embeddings", label: t("Build index", "Lập chỉ mục"), match: ["embedding"] },
-    { key: "commit", label: t("Complete", "Hoàn tất"), match: ["Commit index", "Hoàn tất"] }
+    { key: "policy", label: t("Check access", "Kiểm tra quyền") },
+    { key: "download", label: t("Load data", "Tải dữ liệu") },
+    { key: "ocr", label: t("Read content", "Đọc nội dung") },
+    { key: "embeddings", label: t("Build index", "Lập chỉ mục") },
+    { key: "commit", label: t("Complete", "Hoàn tất") }
   ];
 
-  const currentStage = indexProgress.stage ?? "";
-  let activeIndex = stages.findIndex((stage) => stage.match.some((match) => currentStage.toLowerCase().includes(match.toLowerCase())));
-  if (activeIndex === -1) {
-    if (currentStage === "Chuẩn bị") activeIndex = 0;
-    else if (currentStage === "Hoàn tất") activeIndex = 4;
-    else activeIndex = 0;
-  }
-  const currentFilePercent = fileProgressFromStage(currentStage);
-  const rawBatchPercent = indexProgress.total > 0
-    ? ((Math.min(indexProgress.done, indexProgress.total) + (indexProgress.done < indexProgress.total ? currentFilePercent / 100 : 0)) / indexProgress.total) * 100
-    : 0;
-  const batchPercent = rawBatchPercent > 0 ? Math.min(100, Math.max(1, Math.round(rawBatchPercent))) : 0;
+  const activeIndex = ragStageStep(indexProgress.stage);
+  const currentFilePercent = estimateRagFileProgress(indexProgress.stage, indexProgress.detail);
+  const batchPercent = estimateRagBatchProgress(
+    indexProgress.done,
+    indexProgress.total,
+    indexProgress.stage,
+    currentFilePercent,
+  );
 
   return (
     <div className="rounded-2xl border border-[#d9e1d6] bg-gradient-to-br from-[#f8faf5] to-white p-4 shadow-[0_10px_30px_rgba(43,61,47,.05)] dark:border-white/10 dark:from-white/[0.045] dark:to-white/[0.02]">
@@ -182,7 +159,7 @@ export function IndexingStepper({
             <div key={`${log.at}:${index}`} className="flex justify-between text-[11px] leading-4 text-slate-600 dark:text-slate-300">
               <span className="truncate">{log.text}</span>
               <span className="ml-3 flex shrink-0 items-center gap-2">
-                <span className="rounded-full bg-emerald-950/[0.06] px-1.5 py-0.5 text-[9px] font-extrabold tabular-nums text-emerald-800 dark:bg-lime-300/10 dark:text-lime-300" title={t("Estimated file progress", "Tiến độ ước tính của tệp")}>{fileProgressFromStage(log.text)}%</span>
+                <span className="rounded-full bg-emerald-950/[0.06] px-1.5 py-0.5 text-[9px] font-extrabold tabular-nums text-emerald-800 dark:bg-lime-300/10 dark:text-lime-300" title={t("Estimated file progress", "Tiến độ ước tính của tệp")}>{estimateRagFileProgress(log.stage, log.detail ?? log.text)}%</span>
                 <time className="text-slate-400 dark:text-slate-500">{new Date(log.at).toLocaleTimeString(language === "vi" ? "vi-VN" : "en-US", { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time>
               </span>
             </div>

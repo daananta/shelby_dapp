@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import handler from "./embeddings";
+import handler from "../../api/rag/v1/embeddings";
 
 const originalEnv = { ...process.env };
 
@@ -19,11 +19,29 @@ afterEach(() => {
 });
 
 describe("embedding gateway boundary", () => {
+  it("rejects unsupported methods before touching provider configuration", async () => {
+    const { response, result } = responseMock();
+    await handler({ method: "GET", headers: {} }, response);
+    expect(result.statusCode).toBe(405);
+  });
+
   it("rejects a cross-origin browser before consuming provider quota", async () => {
     process.env.APP_ORIGIN = "https://app.example";
     const { response, result } = responseMock();
     await handler({ method: "POST", body: { texts: ["hello"] }, headers: { origin: "https://evil.example" } }, response);
     expect(result.statusCode).toBe(403);
+  });
+
+  it("reports an intentionally unconfigured gateway without crashing", async () => {
+    process.env.APP_ORIGIN = "https://app.example";
+    delete process.env.GEMINI_API_KEY;
+    const { response, result } = responseMock();
+    await handler({
+      method: "POST",
+      body: { texts: [] },
+      headers: { origin: "https://app.example", "x-forwarded-for": "203.0.113.8" },
+    }, response);
+    expect(result.statusCode).toBe(503);
   });
 
   it("rejects mixed-type batches instead of silently filtering them", async () => {

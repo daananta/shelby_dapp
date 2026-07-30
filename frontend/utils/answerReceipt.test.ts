@@ -79,6 +79,52 @@ describe("Answer Receipt grounding", () => {
     expect((await verifyAnswerReceipt(envelope)).valid).toBe(true);
   });
 
+  it("preserves a filtered source id so the receipt stays bound to the answer", async () => {
+    const receipt = await createAnswerReceipt({
+      wallet: "0xABC",
+      question: "Nguồn thứ ba nói gì?",
+      answer: "Câu trả lời chỉ dùng nguồn thứ ba [S3].",
+      sources: [{ ...source("third.txt"), citationId: "S3" }],
+    });
+
+    expect(receipt.sources.map((item) => item.citationId)).toEqual(["S3"]);
+    const envelope = await createAnswerReceiptEnvelope(receipt);
+    expect(await verifyAnswerReceipt(envelope)).toMatchObject({
+      valid: true,
+      checks: { citations: "pass" },
+    });
+  });
+
+  it("verifies compact citations without changing their source ids", async () => {
+    const receipt = await createAnswerReceipt({
+      wallet: "0xABC",
+      question: "Hai nguồn nói gì?",
+      answer: "Câu trả lời kết hợp hai nguồn [S1, S3].",
+      sources: [
+        { ...source("first.txt"), citationId: "S1" },
+        { ...source("third.txt"), citationId: "S3" },
+      ],
+    });
+
+    expect(receipt.sources.map((item) => item.citationId)).toEqual(["S1", "S3"]);
+    expect(await verifyAnswerReceipt(await createAnswerReceiptEnvelope(receipt))).toMatchObject({
+      valid: true,
+      checks: { citations: "pass" },
+    });
+  });
+
+  it("rejects ambiguous preassigned citation ids", async () => {
+    await expect(createAnswerReceipt({
+      wallet: "0xABC",
+      question: "Tệp nói gì?",
+      answer: "Không thể biết nguồn nào [S1].",
+      sources: [
+        { ...source("first.txt"), citationId: "S1" },
+        { ...source("duplicate.txt"), citationId: "S1" },
+      ],
+    })).rejects.toThrow("Duplicate citation id: S1");
+  });
+
   it("canonicalizes objects independently of property insertion order", () => {
     expect(canonicalizeAnswerReceiptValue({ z: 1, a: { y: true, b: "x" } })).toBe(canonicalizeAnswerReceiptValue({ a: { b: "x", y: true }, z: 1 }));
     expect(() => canonicalizeAnswerReceiptValue({ bad: undefined })).toThrow(/undefined/);

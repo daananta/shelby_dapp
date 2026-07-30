@@ -5,7 +5,7 @@ import { LanguageToggle } from "./LanguageToggle";
 import { NETWORK } from "@/constants";
 import { useLanguage } from "@/i18n";
 
-export function Header({ onOpenJudgeMode }: { onOpenJudgeMode?: () => void }) {
+export function Header({ onOpenProductTour }: { onOpenProductTour?: () => void }) {
   const { t } = useLanguage();
   return (
     <header className="mx-auto mt-2.5 w-[calc(100%-16px)] max-w-[1600px] rounded-2xl border border-[#dfe4dc] bg-[#fbfcf8]/95 shadow-[0_1px_2px_rgba(15,23,18,.03),0_10px_35px_rgba(15,23,18,.045)] backdrop-blur-xl dark:border-white/[0.075] dark:bg-[#101713]/95 dark:shadow-black/20 transition-all duration-300">
@@ -23,14 +23,14 @@ export function Header({ onOpenJudgeMode }: { onOpenJudgeMode?: () => void }) {
 
         {/* Right: Theme + Wallet */}
         <div className="flex min-w-0 items-center gap-1.5">
-          {onOpenJudgeMode && (
+          {onOpenProductTour && (
             <button
               type="button"
-              onClick={onOpenJudgeMode}
+              onClick={onOpenProductTour}
               className="hidden h-9 items-center gap-1.5 rounded-xl border border-emerald-200/80 bg-emerald-50/70 px-2.5 text-[10px] font-extrabold text-emerald-800 transition hover:-translate-y-0.5 hover:border-emerald-300 hover:bg-emerald-50 dark:border-lime-300/15 dark:bg-lime-300/[0.06] dark:text-lime-300 min-[360px]:flex"
-              aria-label={t("Open 90-second demo mode", "Mở chế độ demo 90 giây")}
+              aria-label={t("Open product tour", "Mở hướng dẫn sản phẩm")}
             >
-              <Presentation className="h-3.5 w-3.5" /><span className="hidden md:inline">{t("90-second demo", "Demo 90 giây")}</span>
+              <Presentation className="h-3.5 w-3.5" /><span className="hidden md:inline">{t("Product tour", "Hướng dẫn")}</span>
             </button>
           )}
           <LanguageToggle />

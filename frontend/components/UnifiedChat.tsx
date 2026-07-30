@@ -112,12 +112,12 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
   }, []);
 
   useEffect(() => {
-    const fillJudgeQuestion = (event: Event) => {
+    const fillTourQuestion = (event: Event) => {
       const question = (event as CustomEvent<string>).detail;
       if (question) setQuery(question);
     };
-    window.addEventListener("shelby:judge-question", fillJudgeQuestion);
-    return () => window.removeEventListener("shelby:judge-question", fillJudgeQuestion);
+    window.addEventListener("shelby:tour-question", fillTourQuestion);
+    return () => window.removeEventListener("shelby:tour-question", fillTourQuestion);
   }, [setQuery]);
 
   useEffect(() => {
@@ -127,18 +127,18 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       if (receipt) setActiveReceipt(receipt);
       else setStatus(t("Create an Answer Receipt for a sourced answer first.", "Hãy tạo Phiếu kiểm chứng cho một câu trả lời có nguồn trước."));
     };
-    window.addEventListener("shelby:judge-navigate", openLatestReceipt);
-    return () => window.removeEventListener("shelby:judge-navigate", openLatestReceipt);
+    window.addEventListener("shelby:tour-navigate", openLatestReceipt);
+    return () => window.removeEventListener("shelby:tour-navigate", openLatestReceipt);
   }, [messages, setStatus, t]);
 
   useEffect(() => {
-    const publishJudgeReadiness = () => window.dispatchEvent(new CustomEvent("shelby:judge-readiness", { detail: {
+    const publishTourReadiness = () => window.dispatchEvent(new CustomEvent("shelby:tour-readiness", { detail: {
       hasSourcedAnswer: messages.some((message) => message.role === "ai" && Boolean(message.sources?.length)),
       hasAnswerReceipt: messages.some((message) => Boolean(message.receipt)),
     } }));
-    publishJudgeReadiness();
-    window.addEventListener("shelby:judge-readiness-request", publishJudgeReadiness);
-    return () => window.removeEventListener("shelby:judge-readiness-request", publishJudgeReadiness);
+    publishTourReadiness();
+    window.addEventListener("shelby:tour-readiness-request", publishTourReadiness);
+    return () => window.removeEventListener("shelby:tour-readiness-request", publishTourReadiness);
   }, [messages]);
 
   useEffect(() => {
@@ -236,7 +236,10 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       setCloudApiKey(candidate);
       storeCloudApiKey(candidate);
       setCloudKeyState("ready");
-      setStatus(t(`✓ Key …${candidate.slice(-4)} works with ${model}.`, `✓ Key …${candidate.slice(-4)} hoạt động với ${model}.`));
+      setStatus(t(
+        `✓ Key …${candidate.slice(-4)} was accepted; ${model} is available.`,
+        `✓ Key …${candidate.slice(-4)} đã được Gemini chấp nhận; ${model} khả dụng.`,
+      ));
     } catch (error) {
       if (checkGeneration !== keyCheckGenerationRef.current) return;
       const kind = getCloudErrorKind(error);
@@ -283,7 +286,9 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
   const handleAsk = async (presetQuestion?: string) => {
     const userQuery = (presetQuestion ?? query).trim();
     if (!userQuery || loading) return;
-    const geminiApiKey = cloudKeyState === "ready" ? getStoredCloudApiKey() : "";
+    const geminiApiKey = cloudKeyState === "empty" || cloudKeyState === "invalid"
+      ? ""
+      : getStoredCloudApiKey();
     const request = beginRequest();
     const { signal } = request;
     let pendingMessageId: string | undefined;
@@ -798,7 +803,11 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
               <span className={geminiUsage.chat ? "status-chip ok" : "status-chip"} title={geminiUsage.chat ? t("Qwen3.7 Flash is provided by this app", "Ứng dụng cung cấp sẵn Qwen3.7 Flash") : t("AI chat is off in Settings", "Chat AI đang tắt trong Cấu hình")}><span className={`status-dot ${geminiUsage.chat ? "green" : "gray"}`} /> {geminiUsage.chat ? "Qwen 3.7" : t("Chat off", "Chat đã tắt")}</span>
             </div>
             <button className="flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-bold text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-900 dark:hover:bg-white/[0.05] dark:hover:text-white" onClick={() => setShowApiPanel((value) => !value)} title={t("Optional Gemini key for RAG content processing", "Gemini key tùy chọn để xử lý nội dung RAG")}>
-              <KeyRound className="h-3.5 w-3.5" /> {cloudKeyState === "ready" ? t("RAG AI ready", "AI tạo RAG sẵn sàng") : t("RAG AI optional", "AI tạo RAG tùy chọn")}
+              <KeyRound className="h-3.5 w-3.5" /> {cloudKeyState === "ready"
+                ? t("RAG AI ready", "AI tạo RAG sẵn sàng")
+                : cloudKeyState === "limited" || cloudKeyState === "unverified"
+                  ? t("RAG AI saved", "Đã lưu AI tạo RAG")
+                  : t("RAG AI optional", "AI tạo RAG tùy chọn")}
             </button>
             {messages.length > 0 && (
               <button

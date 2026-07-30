@@ -15,4 +15,4 @@ When the user asks to summarize, compile a summary, or create a study guide/outl
    - Include a "Key Concepts & Terms" (Khái niệm & Thuật ngữ chính) section with clear explanations from the text.
    - Provide 3-5 practice/review questions (Câu hỏi ôn tập) at the end based strictly on the text, accompanied by references to the pages where answers can be found.
 
-Keep summaries highly structured and professional, suitable for hackathon review.
+Keep summaries highly structured and professional.

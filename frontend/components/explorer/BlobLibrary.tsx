@@ -4,7 +4,6 @@ import { Input } from "@/components/ui/input";
 import {
   Binary,
   DollarSign,
-  Info,
   Link,
   LockKeyhole,
   Pencil,
@@ -105,10 +104,16 @@ export function BlobLibrary({
     if (policy?.type === "unknown" || policy?.type === "custom") return t("Unverified", "Không xác minh");
     const tag = decision.info.tag;
     if (tag === "time_lock" && decision.info.unlockAtMicros) {
-      if (decision.needsDecryption) return t("Time lock · needs decryption", "Time lock · cần giải mã");
-      return decision.eligible ? t("Time lock · unlocked", "Time lock · mở") : t("Time lock · locked", "Time lock · khóa");
+      if (decision.needsDecryption) return t("Time lock · decryption required", "Khóa thời gian · cần giải mã");
+      return decision.eligible
+        ? t("Time lock · unlocked", "Khóa thời gian · đã mở khóa")
+        : t("Time lock · locked", "Khóa thời gian · đang khóa");
     }
-    return tag === "allowlist" ? "Allowlist" : tag === "purchasable" ? "Purchasable" : "Public";
+    return tag === "allowlist"
+      ? t("Allowlist", "Danh sách cho phép")
+      : tag === "purchasable"
+        ? t("Purchasable", "Có thể mua quyền")
+        : t("Public", "Công khai");
   };
 
   const userFacingRagError = (error?: string) => {
@@ -270,12 +275,6 @@ export function BlobLibrary({
             <KeyRound className="mr-1.5 h-3.5 w-3.5" />{t("Enter API key", "Nhập API key")}
           </Button>
         </div>
-      )}
-
-      {!indexingAll && blobs.length > 0 && (
-        <p className="flex items-center gap-1.5 text-[10px] text-slate-400">
-          <Info className="h-3 w-3" />{t("Public files can be indexed directly. Protected Time lock files also need decryption support after unlocking.", "Tệp Public có thể nạp trực tiếp. Time lock có lớp bảo vệ vẫn cần hỗ trợ giải mã sau khi mở khóa.")}
-        </p>
       )}
 
       <div data-testid="blob-list" className="flex min-h-[16rem] flex-1 flex-col overflow-hidden rounded-xl border border-[#dfe4dc] bg-[#fdfefa] dark:border-white/[0.075] dark:bg-black/10 xl:min-h-0">

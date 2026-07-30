@@ -46,8 +46,9 @@ export interface AgentToolHandlers {
   refreshWalletBlobInventory?: (signal?: AbortSignal) => Promise<Record<string, unknown>>;
 }
 
-const CLOUD_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-lite-latest"];
-const ROUTER_MODELS = ["gemini-flash-lite-latest", "gemini-2.0-flash", "gemini-2.5-flash"];
+const CLOUD_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"];
+const ROUTER_MODELS = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash"];
+const GEMINI_MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000";
 const conversationRouteCache = new Map<string, ConversationRoute>();
 
 export type CloudErrorKind = "rate_limit" | "invalid_key" | "network" | "other";
@@ -82,7 +83,7 @@ export function getCloudErrorKind(error: unknown): CloudErrorKind {
   const raw = error instanceof Error ? error.message : String(error ?? "");
   const message = raw.toLowerCase();
   if (status === 429 || /\b429\b|resource_exhausted|quota|rate.?limit/.test(message)) return "rate_limit";
-  if (status === 401 || status === 403 || /api[_ -]?key.*(?:invalid|not valid)|permission_denied|unauthorized|unauthenticated|access_token_type_unsupported/.test(message)) return "invalid_key";
+  if (status === 401 || /api[_ -]?key.*(?:invalid|not valid)|unauthenticated|access_token_type_unsupported/.test(message)) return "invalid_key";
   if (/failed to fetch|network|load failed|fetch failed/.test(message)) return "network";
   return "other";
 }
@@ -113,26 +114,68 @@ export function normalizeCloudError(error: unknown): Error {
 }
 
 function shouldStopModelFallback(error: unknown): boolean {
-  const kind = getCloudErrorKind(error);
-  return kind === "rate_limit" || kind === "invalid_key";
+  return getCloudErrorKind(error) === "invalid_key";
 }
 
-/** Verifies the key with a minimal generation request before it is marked ready. */
+function geminiHttpError(status: number, body: unknown): Error & { status: number } {
+  const upstreamMessage = body && typeof body === "object"
+    && "error" in body
+    && body.error && typeof body.error === "object"
+    && "message" in body.error
+    && typeof body.error.message === "string"
+    ? body.error.message.slice(0, 500)
+    : "";
+  return Object.assign(
+    new Error(upstreamMessage || `Gemini API request failed (${status}).`),
+    { status },
+  );
+}
+
+/**
+ * Checks authentication and model access without spending a generation request.
+ * A valid key can still hit a model-specific quota later; that must not be
+ * presented as a rejected credential.
+ */
 export async function verifyCloudApiKey(apiKey: string): Promise<string> {
   const normalizedApiKey = normalizeGeminiApiKey(apiKey);
   if (!normalizedApiKey) throw new Error(localize("The API key is empty.", "API key trống."));
-  const client = clientFor(normalizedApiKey);
-  let lastError: unknown;
-  for (const modelName of CLOUD_MODELS) {
-    try {
-      await client.getGenerativeModel({ model: modelName }).generateContent("Reply with: OK");
-      return modelName;
-    } catch (error) {
-      if (shouldStopModelFallback(error)) throw normalizeCloudError(error);
-      lastError = error;
-    }
+  let response: Response;
+  try {
+    response = await fetch(GEMINI_MODELS_ENDPOINT, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "x-goog-api-key": normalizedApiKey,
+      },
+      cache: "no-store",
+    });
+  } catch (error) {
+    throw normalizeCloudError(error);
   }
-  throw normalizeCloudError(lastError ?? new Error(localize("Unable to verify the API key.", "Không thể xác thực API key.")));
+
+  let payload: {
+    error?: { message?: string };
+    models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>;
+  } = {};
+  try {
+    payload = await response.json();
+  } catch {
+    // The status below is still enough to classify authentication/network errors.
+  }
+  if (!response.ok) throw normalizeCloudError(geminiHttpError(response.status, payload));
+
+  const generationModels = new Set(
+    (payload.models ?? [])
+      .filter((model) => model.supportedGenerationMethods?.includes("generateContent"))
+      .map((model) => model.name?.replace(/^models\//, ""))
+      .filter((name): name is string => Boolean(name)),
+  );
+  const selectedModel = CLOUD_MODELS.find((modelName) => generationModels.has(modelName));
+  if (selectedModel) return selectedModel;
+  throw new CloudProviderError("other", localize(
+    "The key is accepted, but none of this app's supported Gemini models are available to its project.",
+    "Key đã được chấp nhận, nhưng project của key chưa có model Gemini nào mà ứng dụng hỗ trợ.",
+  ));
 }
 
 export async function generateCloudAnswer({ prompt, contents, cloudApiKey, systemInstruction }: AiRequest): Promise<string> {
@@ -190,7 +233,7 @@ ${params.question}`;
     try {
       params.signal?.throwIfAborted();
       const result = await client
-        .getGenerativeModel({ model: modelName, generationConfig: { responseMimeType: "application/json", temperature: 0 } } as any)
+        .getGenerativeModel({ model: modelName, generationConfig: { responseMimeType: "application/json" } } as any)
         .generateContent(prompt, { signal: params.signal });
       params.signal?.throwIfAborted();
       const parsed = JSON.parse(result.response.text());

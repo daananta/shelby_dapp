@@ -35,7 +35,7 @@
 ### [2026-07-18] - Đồng bộ tài liệu và loại bỏ local AI mã chết
 
 #### Changed
-- Đồng bộ README, AI handover, hackathon demo và metadata với runtime hiện tại: Gemini Cloud cho chat/vision/semantic embeddings; lexical retrieval và Tesseract OCR vẫn chạy trong browser khi không dùng semantic cloud.
+- Đồng bộ tài liệu và metadata với runtime hiện tại: Gemini Cloud cho chat/vision/semantic embeddings; lexical retrieval và Tesseract OCR vẫn chạy trong browser khi không dùng semantic cloud.
 - `npm run check` nay bao gồm browser E2E, đúng với yêu cầu bàn giao.
 
 #### Removed

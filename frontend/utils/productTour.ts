@@ -1,23 +1,23 @@
-export const JUDGE_MODE_STORAGE_KEY = "shelby-rag-explorer:judge-mode:v1";
+export const PRODUCT_TOUR_STORAGE_KEY = "shelby-rag-explorer:product-tour:v1";
 
-export const JUDGE_MODE_QUESTION_EN =
+export const PRODUCT_TOUR_QUESTION_EN =
   "Summarize the most important information in my data and cite sources so I can verify it.";
 
-export const JUDGE_MODE_QUESTION =
+export const PRODUCT_TOUR_QUESTION =
   "Tóm tắt nội dung quan trọng nhất trong dữ liệu của tôi và dẫn nguồn để tôi kiểm chứng.";
 
-export const JUDGE_MODE_STEPS = [
+export const PRODUCT_TOUR_STEPS = [
   {
     id: "sources",
     titleEn: "Select real data",
     title: "Chọn dữ liệu thật",
-    descriptionEn: "Show the judges the files owned by the connected wallet. Demo mode never adds sample data.",
-    description: "Cho giám khảo thấy các tệp đang thuộc ví hiện tại. Chế độ demo không thêm dữ liệu mẫu.",
+    descriptionEn: "Review the files owned by the connected wallet. The tour never adds sample data.",
+    description: "Xem các tệp thuộc ví hiện tại. Hướng dẫn không thêm dữ liệu mẫu.",
     actionLabelEn: "Open library",
     actionLabel: "Mở thư viện",
     target: "library",
-    timingEn: "0–15 sec",
-    timing: "0–15 giây",
+    captionEn: "Your data",
+    caption: "Dữ liệu",
   },
   {
     id: "knowledge",
@@ -28,8 +28,8 @@ export const JUDGE_MODE_STEPS = [
     actionLabelEn: "Open backups",
     actionLabel: "Mở khu sao lưu",
     target: "backup",
-    timingEn: "15–35 sec",
-    timing: "15–35 giây",
+    captionEn: "Knowledge",
+    caption: "Kho tri thức",
   },
   {
     id: "answer",
@@ -40,8 +40,8 @@ export const JUDGE_MODE_STEPS = [
     actionLabelEn: "Fill sample question",
     actionLabel: "Điền câu hỏi mẫu",
     target: "chat",
-    timingEn: "35–65 sec",
-    timing: "35–65 giây",
+    captionEn: "Ask",
+    caption: "Đặt câu hỏi",
   },
   {
     id: "receipt",
@@ -52,32 +52,32 @@ export const JUDGE_MODE_STEPS = [
     actionLabelEn: "Go to answer",
     actionLabel: "Tới câu trả lời",
     target: "receipt",
-    timingEn: "65–90 sec",
-    timing: "65–90 giây",
+    captionEn: "Verify",
+    caption: "Kiểm chứng",
   },
 ] as const;
 
-export type JudgeModeStepIndex = 0 | 1 | 2 | 3;
-export type JudgeModeTarget = (typeof JUDGE_MODE_STEPS)[number]["target"];
-export type JudgeModeCompletedSteps = [boolean, boolean, boolean, boolean];
+export type ProductTourStepIndex = 0 | 1 | 2 | 3;
+export type ProductTourTarget = (typeof PRODUCT_TOUR_STEPS)[number]["target"];
+export type ProductTourCompletedSteps = [boolean, boolean, boolean, boolean];
 
-export interface JudgeModeState {
+export interface ProductTourState {
   version: 1;
-  currentStep: JudgeModeStepIndex;
-  completedSteps: JudgeModeCompletedSteps;
+  currentStep: ProductTourStepIndex;
+  completedSteps: ProductTourCompletedSteps;
   finished: boolean;
   updatedAt: number;
 }
 
-export type JudgeModeAction =
+export type ProductTourAction =
   | { type: "NEXT"; now?: number }
   | { type: "BACK"; now?: number }
-  | { type: "GO_TO"; step: JudgeModeStepIndex; now?: number }
+  | { type: "GO_TO"; step: ProductTourStepIndex; now?: number }
   | { type: "RESET"; now?: number };
 
-type JudgeModeStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+type ProductTourStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
-export function createJudgeModeState(now = Date.now()): JudgeModeState {
+export function createProductTourState(now = Date.now()): ProductTourState {
   return {
     version: 1,
     currentStep: 0,
@@ -87,19 +87,19 @@ export function createJudgeModeState(now = Date.now()): JudgeModeState {
   };
 }
 
-function nextCompletedSteps(state: JudgeModeState): JudgeModeCompletedSteps {
-  const completed = [...state.completedSteps] as JudgeModeCompletedSteps;
+function nextCompletedSteps(state: ProductTourState): ProductTourCompletedSteps {
+  const completed = [...state.completedSteps] as ProductTourCompletedSteps;
   completed[state.currentStep] = true;
   return completed;
 }
 
-export function reduceJudgeModeState(state: JudgeModeState, action: JudgeModeAction): JudgeModeState {
+export function reduceProductTourState(state: ProductTourState, action: ProductTourAction): ProductTourState {
   const now = action.now ?? Date.now();
-  if (action.type === "RESET") return createJudgeModeState(now);
+  if (action.type === "RESET") return createProductTourState(now);
   if (action.type === "BACK") {
     return {
       ...state,
-      currentStep: Math.max(0, state.currentStep - 1) as JudgeModeStepIndex,
+      currentStep: Math.max(0, state.currentStep - 1) as ProductTourStepIndex,
       finished: false,
       updatedAt: now,
     };
@@ -109,30 +109,30 @@ export function reduceJudgeModeState(state: JudgeModeState, action: JudgeModeAct
   }
 
   const completedSteps = nextCompletedSteps(state);
-  if (state.currentStep === JUDGE_MODE_STEPS.length - 1) {
+  if (state.currentStep === PRODUCT_TOUR_STEPS.length - 1) {
     return { ...state, completedSteps, finished: true, updatedAt: now };
   }
   return {
     ...state,
-    currentStep: (state.currentStep + 1) as JudgeModeStepIndex,
+    currentStep: (state.currentStep + 1) as ProductTourStepIndex,
     completedSteps,
     finished: false,
     updatedAt: now,
   };
 }
 
-export function judgeModeProgress(state: JudgeModeState): number {
+export function productTourProgress(state: ProductTourState): number {
   return Math.round(
-    (state.completedSteps.filter(Boolean).length / JUDGE_MODE_STEPS.length) * 100,
+    (state.completedSteps.filter(Boolean).length / PRODUCT_TOUR_STEPS.length) * 100,
   );
 }
 
-function parseStoredState(value: string | null): JudgeModeState | null {
+function parseStoredState(value: string | null): ProductTourState | null {
   if (!value) return null;
   try {
     const parsed: unknown = JSON.parse(value);
     if (!parsed || typeof parsed !== "object") return null;
-    const candidate = parsed as Partial<JudgeModeState>;
+    const candidate = parsed as Partial<ProductTourState>;
     if (candidate.version !== 1) return null;
     if (![0, 1, 2, 3].includes(candidate.currentStep as number)) return null;
     if (!Array.isArray(candidate.completedSteps) || candidate.completedSteps.length !== 4) return null;
@@ -141,8 +141,8 @@ function parseStoredState(value: string | null): JudgeModeState | null {
     if (typeof candidate.updatedAt !== "number" || !Number.isFinite(candidate.updatedAt)) return null;
     return {
       version: 1,
-      currentStep: candidate.currentStep as JudgeModeStepIndex,
-      completedSteps: [...candidate.completedSteps] as JudgeModeCompletedSteps,
+      currentStep: candidate.currentStep as ProductTourStepIndex,
+      completedSteps: [...candidate.completedSteps] as ProductTourCompletedSteps,
       finished: candidate.finished,
       updatedAt: candidate.updatedAt,
     };
@@ -151,10 +151,10 @@ function parseStoredState(value: string | null): JudgeModeState | null {
   }
 }
 
-export function readJudgeModeState(
-  storage: JudgeModeStorage | null | undefined,
-  key = JUDGE_MODE_STORAGE_KEY,
-): JudgeModeState | null {
+export function readProductTourState(
+  storage: ProductTourStorage | null | undefined,
+  key = PRODUCT_TOUR_STORAGE_KEY,
+): ProductTourState | null {
   if (!storage) return null;
   try {
     return parseStoredState(storage.getItem(key));
@@ -163,10 +163,10 @@ export function readJudgeModeState(
   }
 }
 
-export function writeJudgeModeState(
-  storage: JudgeModeStorage | null | undefined,
-  state: JudgeModeState,
-  key = JUDGE_MODE_STORAGE_KEY,
+export function writeProductTourState(
+  storage: ProductTourStorage | null | undefined,
+  state: ProductTourState,
+  key = PRODUCT_TOUR_STORAGE_KEY,
 ): boolean {
   if (!storage) return false;
   try {
@@ -177,9 +177,9 @@ export function writeJudgeModeState(
   }
 }
 
-export function clearJudgeModeState(
-  storage: JudgeModeStorage | null | undefined,
-  key = JUDGE_MODE_STORAGE_KEY,
+export function clearProductTourState(
+  storage: ProductTourStorage | null | undefined,
+  key = PRODUCT_TOUR_STORAGE_KEY,
 ): boolean {
   if (!storage) return false;
   try {

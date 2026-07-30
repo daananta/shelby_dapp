@@ -4,9 +4,9 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { Header } from "@/components/Header";
 import { WalletSelector } from "@/components/WalletSelector";
 import { isE2EWalletConnected, isMockWorkspace } from "@/utils/devMode";
-import { JudgeMode, type JudgeModeReadiness } from "@/components/JudgeMode";
+import { ProductTour, type ProductTourReadiness } from "@/components/ProductTour";
 import { Button } from "@/components/ui/button";
-import type { JudgeModeTarget } from "@/utils/judgeMode";
+import type { ProductTourTarget } from "@/utils/productTour";
 import { useLanguage } from "@/i18n";
 import {
   unavailableBlobInventoryRefresh,
@@ -29,8 +29,8 @@ function App({ onOpenDemo }: AppProps) {
   const connected = isTestMode ? true : realConnected;
   const readinessOwner = isMockWorkspace() ? "mock-workspace" : isTestMode ? "e2e-remote-error" : account?.address.toString().toLowerCase() ?? "";
   const [mobileView, setMobileView] = useState<"library" | "chat">("library");
-  const [judgeModeOpen, setJudgeModeOpen] = useState(false);
-  const [judgeReadiness, setJudgeReadiness] = useState<JudgeModeReadiness>({ walletConnected: connected });
+  const [productTourOpen, setProductTourOpen] = useState(false);
+  const [tourReadiness, setTourReadiness] = useState<ProductTourReadiness>({ walletConnected: connected });
   const blobInventoryRefreshRef = useRef<{
     token: symbol;
     capability: BlobInventoryRefreshCapability;
@@ -63,35 +63,35 @@ function App({ onOpenDemo }: AppProps) {
     };
   }, []);
 
-  useEffect(() => setJudgeReadiness({ walletConnected: connected }), [connected, readinessOwner]);
+  useEffect(() => setTourReadiness({ walletConnected: connected }), [connected, readinessOwner]);
 
   useEffect(() => {
     const updateReadiness = (event: Event) => {
-      const detail = (event as CustomEvent<JudgeModeReadiness>).detail;
-      if (detail) setJudgeReadiness((current) => ({ ...current, ...detail }));
+      const detail = (event as CustomEvent<ProductTourReadiness>).detail;
+      if (detail) setTourReadiness((current) => ({ ...current, ...detail }));
     };
-    window.addEventListener("shelby:judge-readiness", updateReadiness);
-    return () => window.removeEventListener("shelby:judge-readiness", updateReadiness);
+    window.addEventListener("shelby:tour-readiness", updateReadiness);
+    return () => window.removeEventListener("shelby:tour-readiness", updateReadiness);
   }, []);
 
-  const navigateJudgeMode = (target: JudgeModeTarget) => {
+  const navigateProductTour = (target: ProductTourTarget) => {
     if (target === "library" || target === "backup") {
       setMobileView("library");
-      window.dispatchEvent(new CustomEvent("shelby:judge-navigate", { detail: target }));
+      window.dispatchEvent(new CustomEvent("shelby:tour-navigate", { detail: target }));
       return;
     }
     setMobileView("chat");
-    window.dispatchEvent(new CustomEvent("shelby:judge-navigate", { detail: target }));
+    window.dispatchEvent(new CustomEvent("shelby:tour-navigate", { detail: target }));
   };
 
-  const openJudgeMode = () => {
-    setJudgeModeOpen(true);
-    window.dispatchEvent(new Event("shelby:judge-readiness-request"));
+  const openProductTour = () => {
+    setProductTourOpen(true);
+    window.dispatchEvent(new Event("shelby:tour-readiness-request"));
   };
 
   return (
     <main className="app-canvas relative flex min-h-dvh flex-col overflow-x-hidden text-slate-900 dark:text-slate-200 xl:h-dvh xl:min-h-[680px] xl:overflow-hidden">
-      <Header onOpenJudgeMode={connected ? openJudgeMode : onOpenDemo} />
+      <Header onOpenProductTour={connected ? openProductTour : onOpenDemo} />
 
       <div className="relative z-10 mx-auto flex min-h-[calc(100dvh-4.5rem)] w-full max-w-[1580px] flex-1 flex-col px-2 pb-3 pt-2.5 sm:px-4 sm:pb-4 xl:min-h-0">
         {connected ? (
@@ -136,17 +136,17 @@ function App({ onOpenDemo }: AppProps) {
                   </Button>
                 )}
               </div>
-              {onOpenDemo && <p className="mt-3 text-xs text-slate-400">{t("The simulation uses sample data; the 90-second workspace demo uses real Shelby data.", "Mô phỏng dùng dữ liệu minh hoạ; demo 90 giây trong kho sẽ dùng dữ liệu Shelby thật.")}</p>}
+              {onOpenDemo && <p className="mt-3 text-xs text-slate-400">{t("The simulation uses sample data; the guided workspace tour uses your real Shelby data.", "Mô phỏng dùng dữ liệu minh hoạ; hướng dẫn trong kho dùng dữ liệu Shelby thật của bạn.")}</p>}
             </section>
           </div>
         )}
       </div>
-      <JudgeMode
-        open={judgeModeOpen}
-        onClose={() => setJudgeModeOpen(false)}
-        readiness={judgeReadiness}
-        onNavigate={navigateJudgeMode}
-        onSelectQuestion={(question) => window.dispatchEvent(new CustomEvent("shelby:judge-question", { detail: question }))}
+      <ProductTour
+        open={productTourOpen}
+        onClose={() => setProductTourOpen(false)}
+        readiness={tourReadiness}
+        onNavigate={navigateProductTour}
+        onSelectQuestion={(question) => window.dispatchEvent(new CustomEvent("shelby:tour-question", { detail: question }))}
       />
     </main>
   );

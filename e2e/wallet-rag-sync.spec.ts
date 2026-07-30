@@ -167,8 +167,10 @@ test("keeps a temporarily limited Gemini key locally and accepts it on retry", a
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
-        candidates: [{ index: 0, finishReason: "STOP", content: { role: "model", parts: [{ text: "OK" }] } }],
-        usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+        models: [{
+          name: "models/gemini-3.6-flash",
+          supportedGenerationMethods: ["generateContent"],
+        }],
       }),
     });
   });
@@ -191,7 +193,7 @@ test("keeps a temporarily limited Gemini key locally and accepts it on retry", a
 
   providerState = "ready";
   await page.getByRole("button", { name: "Thử lại", exact: true }).click();
-  await expect(page.getByText("✓ Key …2222 hoạt động với gemini-2.5-flash.", { exact: true })).toBeVisible();
+  await expect(page.getByText("✓ Key …2222 đã được Gemini chấp nhận; gemini-3.6-flash khả dụng.", { exact: true })).toBeVisible();
   expect(observedApiKey).toBe(authorizationKey);
   expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBe(authorizationKey);
 

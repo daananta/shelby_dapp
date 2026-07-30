@@ -226,8 +226,8 @@ export default function DemoWorkspace({ onConnect, onExit }: DemoWorkspaceProps)
             <p className="rounded-xl border border-amber-200 bg-amber-50/80 p-3 text-xs leading-5 text-amber-900 dark:border-amber-300/15 dark:bg-amber-300/[0.06] dark:text-amber-100">
               <ShieldCheck className="mr-1.5 inline h-4 w-4" />
               {t(
-                "This walkthrough runs locally. After you connect a wallet, the 90-second demo uses real Shelby blobs and status.",
-                "Đây là mô phỏng cục bộ. Sau khi kết nối ví, Demo 90 giây sẽ dùng blob và trạng thái Shelby thật.",
+                "This walkthrough runs locally. After you connect a wallet, the product tour uses your real Shelby blobs and status.",
+                "Đây là mô phỏng cục bộ. Sau khi kết nối ví, hướng dẫn sản phẩm sẽ dùng blob và trạng thái Shelby thật của bạn.",
               )}
             </p>
           </CardContent>

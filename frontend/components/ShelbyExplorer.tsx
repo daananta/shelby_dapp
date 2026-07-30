@@ -178,10 +178,10 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
 
   useEffect(() => {
     const availableKnowledgeSources = Math.max(indexedSources.length, remoteSnapshot.status === "ready" ? remoteSnapshot.packageData?.documents.length ?? 0 : 0);
-    const publishJudgeReadiness = () => window.dispatchEvent(new CustomEvent("shelby:judge-readiness", { detail: { blobCount: dataBlobs.length, indexedBlobCount: availableKnowledgeSources } }));
-    publishJudgeReadiness();
-    window.addEventListener("shelby:judge-readiness-request", publishJudgeReadiness);
-    return () => window.removeEventListener("shelby:judge-readiness-request", publishJudgeReadiness);
+    const publishTourReadiness = () => window.dispatchEvent(new CustomEvent("shelby:tour-readiness", { detail: { blobCount: dataBlobs.length, indexedBlobCount: availableKnowledgeSources } }));
+    publishTourReadiness();
+    window.addEventListener("shelby:tour-readiness-request", publishTourReadiness);
+    return () => window.removeEventListener("shelby:tour-readiness-request", publishTourReadiness);
   }, [dataBlobs.length, indexedSources.length, remoteSnapshot.status, remoteSnapshot.packageData?.documents.length]);
 
   useEffect(() => {
@@ -190,8 +190,8 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
       if (target === "library") setActiveTab("library");
       if (target === "backup") setActiveTab("capsule");
     };
-    window.addEventListener("shelby:judge-navigate", navigate);
-    return () => window.removeEventListener("shelby:judge-navigate", navigate);
+    window.addEventListener("shelby:tour-navigate", navigate);
+    return () => window.removeEventListener("shelby:tour-navigate", navigate);
   }, []);
 
   useEffect(() => {

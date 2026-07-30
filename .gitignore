@@ -40,7 +40,7 @@ example-collection/
 fix_explorer.py
 fix_note.py
 fix_ui.js
-make_hackathon_ui.py
+make_*_ui.py
 list_models.js
 test_gemini.js
 test_models.js

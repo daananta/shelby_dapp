@@ -12,19 +12,19 @@ import {
 import { Button } from "@/components/ui/button";
 import { useLanguage } from "@/i18n";
 import {
-  createJudgeModeState,
-  JUDGE_MODE_QUESTION_EN,
-  JUDGE_MODE_QUESTION,
-  JUDGE_MODE_STEPS,
-  JUDGE_MODE_STORAGE_KEY,
-  readJudgeModeState,
-  reduceJudgeModeState,
-  writeJudgeModeState,
-  type JudgeModeState,
-  type JudgeModeTarget,
-} from "@/utils/judgeMode";
+  createProductTourState,
+  PRODUCT_TOUR_QUESTION_EN,
+  PRODUCT_TOUR_QUESTION,
+  PRODUCT_TOUR_STEPS,
+  PRODUCT_TOUR_STORAGE_KEY,
+  readProductTourState,
+  reduceProductTourState,
+  writeProductTourState,
+  type ProductTourState,
+  type ProductTourTarget,
+} from "@/utils/productTour";
 
-export interface JudgeModeReadiness {
+export interface ProductTourReadiness {
   walletConnected?: boolean;
   blobCount?: number;
   indexedBlobCount?: number;
@@ -32,14 +32,14 @@ export interface JudgeModeReadiness {
   hasAnswerReceipt?: boolean;
 }
 
-export interface JudgeModeProps {
+export interface ProductTourProps {
   open: boolean;
   onClose: () => void;
   /** UI navigation only. The panel never uploads, signs or submits a transaction. */
-  onNavigate?: (target: JudgeModeTarget) => void;
+  onNavigate?: (target: ProductTourTarget) => void;
   /** Lets the host fill the composer without sending the question. */
   onSelectQuestion?: (question: string) => void;
-  readiness?: JudgeModeReadiness;
+  readiness?: ProductTourReadiness;
   storageKey?: string;
 }
 
@@ -52,26 +52,26 @@ function safeSessionStorage(): Storage | null {
   }
 }
 
-export function JudgeMode({
+export function ProductTour({
   open,
   onClose,
   onNavigate,
   onSelectQuestion,
   readiness,
-  storageKey = JUDGE_MODE_STORAGE_KEY,
-}: JudgeModeProps) {
+  storageKey = PRODUCT_TOUR_STORAGE_KEY,
+}: ProductTourProps) {
   const { t } = useLanguage();
   const storage = useMemo(safeSessionStorage, []);
   const panelRef = useRef<HTMLElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
-  const [state, setState] = useState<JudgeModeState>(() =>
-    readJudgeModeState(storage, storageKey) ?? createJudgeModeState(),
+  const [state, setState] = useState<ProductTourState>(() =>
+    readProductTourState(storage, storageKey) ?? createProductTourState(),
   );
 
   useEffect(() => {
-    writeJudgeModeState(storage, state, storageKey);
+    writeProductTourState(storage, state, storageKey);
   }, [state, storage, storageKey]);
 
   useEffect(() => {
@@ -102,8 +102,8 @@ export function JudgeMode({
 
   if (!open) return null;
 
-  const step = JUDGE_MODE_STEPS[state.currentStep];
-  const judgeQuestion = t(JUDGE_MODE_QUESTION_EN, JUDGE_MODE_QUESTION);
+  const step = PRODUCT_TOUR_STEPS[state.currentStep];
+  const sampleQuestion = t(PRODUCT_TOUR_QUESTION_EN, PRODUCT_TOUR_QUESTION);
   const readinessSteps = [
     {
       label: readiness?.walletConnected && readiness?.blobCount
@@ -138,11 +138,11 @@ export function JudgeMode({
   ];
   const readyCount = readinessSteps.filter((item) => item.ready).length;
   const progress = Math.round((readyCount / readinessSteps.length) * 100);
-  const move = (action: Parameters<typeof reduceJudgeModeState>[1]) => {
-    setState((current) => reduceJudgeModeState(current, action));
+  const move = (action: Parameters<typeof reduceProductTourState>[1]) => {
+    setState((current) => reduceProductTourState(current, action));
   };
   const runNavigationOnlyAction = () => {
-    if (step.target === "chat") onSelectQuestion?.(judgeQuestion);
+    if (step.target === "chat") onSelectQuestion?.(sampleQuestion);
     onNavigate?.(step.target);
     move({ type: "NEXT" });
     onClose();
@@ -160,23 +160,23 @@ export function JudgeMode({
         ref={panelRef}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="judge-mode-title"
-        data-testid="judge-mode"
+        aria-labelledby="product-tour-title"
+        data-testid="product-tour"
         className="ml-auto flex h-full w-full max-w-[28rem] flex-col overflow-hidden rounded-[1.6rem] border border-white/70 bg-[#fbfcf8]/95 shadow-[0_30px_90px_rgba(15,23,42,.26)] backdrop-blur-xl dark:border-white/10 dark:bg-[#0b120d]/95"
       >
         <header className="border-b border-[#dde6da] px-5 pb-4 pt-5 dark:border-white/[0.08]">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
               <p className="mb-1 flex items-center gap-1.5 text-[10px] font-extrabold uppercase tracking-[0.16em] text-emerald-700 dark:text-lime-300">
-                <Sparkles className="h-3.5 w-3.5" /> {t("90-second walkthrough", "Kịch bản 90 giây")}
+                <Sparkles className="h-3.5 w-3.5" /> {t("Guided product tour", "Hướng dẫn sản phẩm")}
               </p>
-              <h2 id="judge-mode-title" className="text-lg font-black tracking-[-0.03em] text-slate-950 dark:text-white">
-                {t("90-second demo", "Demo 90 giây")}
+              <h2 id="product-tour-title" className="text-lg font-black tracking-[-0.03em] text-slate-950 dark:text-white">
+                {t("Explore verifiable RAG", "Khám phá RAG kiểm chứng được")}
               </h2>
               <p className="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
                 {t(
-                  "A guided demo using real data — it never uploads files or signs transactions for you.",
-                  "Dẫn đường cho demo bằng dữ liệu thật — không tự tải lên hay ký giao dịch.",
+                  "A step-by-step guide using your real data. It never uploads files or signs transactions for you.",
+                  "Hướng dẫn từng bước bằng dữ liệu thật của bạn. Ứng dụng không tự tải lên hay ký giao dịch.",
                 )}
               </p>
             </div>
@@ -186,7 +186,7 @@ export function JudgeMode({
               size="icon"
               className="h-8 w-8 shrink-0 rounded-full"
               onClick={onClose}
-              aria-label={t("Close demo guide", "Đóng hướng dẫn demo")}
+              aria-label={t("Close product tour", "Đóng hướng dẫn sản phẩm")}
             >
               <X className="h-4 w-4" />
             </Button>
@@ -196,7 +196,7 @@ export function JudgeMode({
             <div
               className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10"
               role="progressbar"
-              aria-label={t("Demo readiness", "Mức sẵn sàng cho demo")}
+              aria-label={t("Workspace readiness", "Mức sẵn sàng của kho")}
               aria-valuemin={0}
               aria-valuemax={4}
               aria-valuenow={readyCount}
@@ -210,8 +210,8 @@ export function JudgeMode({
         </header>
 
         <div className="custom-scrollbar min-h-0 flex-1 overflow-y-auto px-5 py-5">
-          <ol className="mb-6 grid grid-cols-4 gap-2" aria-label={t("90-second demo steps", "Các bước demo 90 giây")}>
-            {JUDGE_MODE_STEPS.map((item, index) => {
+          <ol className="mb-6 grid grid-cols-4 gap-2" aria-label={t("Product tour steps", "Các bước hướng dẫn sản phẩm")}>
+            {PRODUCT_TOUR_STEPS.map((item, index) => {
               const completed = readinessSteps[index]?.ready;
               const active = index === state.currentStep;
               const itemTitle = t(item.titleEn, item.title);
@@ -231,7 +231,7 @@ export function JudgeMode({
                     <span className={`flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-black ${completed ? "bg-emerald-600 text-white" : active ? "bg-emerald-700 text-white dark:bg-lime-300 dark:text-slate-950" : "bg-slate-100 dark:bg-white/10"}`}>
                       {completed ? <Check className="h-3 w-3 stroke-[3]" /> : index + 1}
                     </span>
-                    <span className="text-[9px] font-bold">{t(item.timingEn, item.timing)}</span>
+                    <span className="text-[9px] font-bold">{t(item.captionEn, item.caption)}</span>
                   </button>
                 </li>
               );
@@ -243,7 +243,7 @@ export function JudgeMode({
               <span className="rounded-full bg-[#172019] px-2.5 py-1 text-[10px] font-extrabold text-[#c5fb7e] dark:bg-lime-300 dark:text-slate-950">
                 {t("Step", "Bước")} {state.currentStep + 1}/4
               </span>
-              <span className="text-[10px] font-bold text-slate-400">{t(step.timingEn, step.timing)}</span>
+              <span className="text-[10px] font-bold text-slate-400">{t(step.captionEn, step.caption)}</span>
             </div>
             <h3 className="mt-4 text-base font-black tracking-[-0.02em] text-slate-900 dark:text-white">
               {t(step.titleEn, step.title)}
@@ -254,7 +254,7 @@ export function JudgeMode({
 
             {step.target === "chat" && (
               <blockquote className="mt-3 rounded-xl border-l-2 border-emerald-500 bg-emerald-50/70 px-3 py-2.5 text-[11px] leading-5 text-emerald-900 dark:bg-lime-300/[0.07] dark:text-lime-100">
-                “{judgeQuestion}”
+                “{sampleQuestion}”
               </blockquote>
             )}
 
@@ -277,7 +277,7 @@ export function JudgeMode({
           <section className="mt-4 rounded-2xl bg-[#f0f4ed] p-3.5 dark:bg-white/[0.035]">
             <div className="mb-2 flex items-center gap-2 text-[11px] font-extrabold text-slate-700 dark:text-slate-200">
               <ClipboardCheck className="h-4 w-4 text-emerald-600 dark:text-lime-300" />{" "}
-              {t("Quick demo checklist", "Kiểm tra nhanh trước khi demo")}
+              {t("Workspace checklist", "Kiểm tra nhanh kho dữ liệu")}
             </div>
             <ul className="space-y-2">
               {readinessSteps.map((item) => (
@@ -306,7 +306,7 @@ export function JudgeMode({
             size="icon"
             className="h-10 w-10 rounded-xl"
             onClick={() => move({ type: "RESET" })}
-            aria-label={t("Restart demo guide", "Bắt đầu lại hướng dẫn demo")}
+            aria-label={t("Restart product tour", "Bắt đầu lại hướng dẫn sản phẩm")}
           >
             <RotateCcw className="h-4 w-4" />
           </Button>

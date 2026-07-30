@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getCloudErrorKind, isCloudProviderError, normalizeCloudError, resolveCloudImageMimeType, verifyCloudApiKey } from "@/utils/aiProvider";
+import { generateCloudAnswer, getCloudErrorKind, isCloudProviderError, normalizeCloudError, resolveCloudImageMimeType, verifyCloudApiKey } from "@/utils/aiProvider";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -17,6 +17,7 @@ describe("Gemini error messages", () => {
     expect(normalizeCloudError({ status: 401 }).message).toContain("API key is invalid");
     expect(getCloudErrorKind(new Error("UNAUTHENTICATED: API key not valid"))).toBe("invalid_key");
     expect(getCloudErrorKind(new Error("ACCESS_TOKEN_TYPE_UNSUPPORTED"))).toBe("invalid_key");
+    expect(getCloudErrorKind(Object.assign(new Error("PERMISSION_DENIED: service account lacks model access"), { status: 403 }))).toBe("other");
     expect(normalizeCloudError(new Error("Failed to fetch")).message).toContain("Check your network");
   });
 
@@ -26,7 +27,10 @@ describe("Gemini error messages", () => {
       const headers = new Headers(init?.headers);
       expect(headers.get("x-goog-api-key")).toBe(authorizationKey);
       return new Response(JSON.stringify({
-        candidates: [{ content: { parts: [{ text: "OK" }] } }],
+        models: [{
+          name: "models/gemini-3.6-flash",
+          supportedGenerationMethods: ["generateContent"],
+        }],
       }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -34,8 +38,62 @@ describe("Gemini error messages", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(verifyCloudApiKey(`  ${authorizationKey}  `)).resolves.toBe("gemini-2.5-flash");
+    await expect(verifyCloudApiKey(`  ${authorizationKey}  `)).resolves.toBe("gemini-3.6-flash");
     expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "GET" });
+  });
+
+  it("does not misreport a generation quota as an invalid credential", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      error: { message: "RESOURCE_EXHAUSTED: project quota exceeded" },
+    }), {
+      status: 429,
+      headers: { "content-type": "application/json" },
+    })));
+
+    await expect(verifyCloudApiKey("AQ.rate-limited-key")).rejects.toMatchObject({
+      kind: "rate_limit",
+    });
+  });
+
+  it("rejects a key only when Gemini rejects its authentication", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      error: { message: "API key not valid" },
+    }), {
+      status: 403,
+      headers: { "content-type": "application/json" },
+    })));
+
+    await expect(verifyCloudApiKey("AQ.invalid-key")).rejects.toMatchObject({
+      kind: "invalid_key",
+    });
+  });
+
+  it("tries another supported model after a model-specific 429", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("gemini-3.6-flash")) {
+        return new Response(JSON.stringify({
+          error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota unavailable for this model" },
+        }), {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: "fallback answer" }] } }],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(generateCloudAnswer({
+      prompt: "Hello",
+      cloudApiKey: "AQ.model-fallback-key",
+    })).resolves.toBe("fallback answer");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("uses the detected MIME for an extensionless Shelby image", () => {

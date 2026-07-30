@@ -86,6 +86,6 @@ npm run build
 npm run test:e2e
 ```
 
-The deterministic hackathon gate is: all benchmark cases pass, the full local
+The deterministic release gate is: all benchmark cases pass, the full local
 test/build gates pass, and no live-integration claim is made without transaction
 or network evidence.

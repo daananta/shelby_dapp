@@ -1,0 +1,48 @@
+# Aptos related files
+.aptos
+.env
+contract/build
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+build
+dist-ssr
+test-results/
+playwright-report/
+*.local
+pnpm-lock.yaml
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# template related files
+example-collection/
+.vercel
+
+# Local migration and one-off diagnostic helpers
+fix_explorer.py
+fix_note.py
+fix_ui.js
+make_hackathon_ui.py
+list_models.js
+test_gemini.js
+test_models.js
+test_pdf.ts
+test_regex.js

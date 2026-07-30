@@ -56,6 +56,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
     if (kind === "rate_limit") return "Gemini temporarily limited this request (429). The API key was not rejected; wait and try again, or check this model's usage and rate limits.";
     if (kind === "invalid_key") return "The Gemini API key is invalid or cannot access this model.";
     if (kind === "network") return "Unable to reach Gemini. Check your network and try again.";
+    if (kind === "timeout") return "Gemini took too long to respond. The request was stopped after 30 seconds; please try again.";
     return "Gemini did not respond.";
   };
   const { preferences: geminiUsage } = useGeminiUsage();
@@ -446,9 +447,9 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
           systemInstruction: buildAdaptiveAgentSystemInstruction(),
           ...(geminiApiKey ? { cloudApiKey: geminiApiKey } : {}),
         },
-        (chunk) => {
+        (chunk, mode = "append") => {
           if (signal.aborted || !isRequestCurrent(request)) return;
-          streamedText += chunk;
+          streamedText = mode === "replace" ? chunk : streamedText + chunk;
           updateCurrentMessages((previous) => previous.map((message) => message.id === pendingMessageId ? { ...message, text: streamedText } : message));
         },
         {

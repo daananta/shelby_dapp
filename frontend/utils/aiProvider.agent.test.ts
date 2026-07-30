@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const agentSdk = vi.hoisted(() => ({
   sendMessage: vi.fn(),
+  sendFirstMessageStream: vi.fn(),
   sendMessageStream: vi.fn(),
   modelConfig: undefined as any,
   startChatConfig: undefined as any,
@@ -23,9 +24,16 @@ vi.mock("@google/generative-ai", () => ({
       return {
         startChat: (config: unknown) => {
           agentSdk.startChatConfig = config;
+          let firstRequest = true;
           return {
             sendMessage: agentSdk.sendMessage,
-            sendMessageStream: agentSdk.sendMessageStream,
+            sendMessageStream: (...args: unknown[]) => {
+              if (firstRequest) {
+                firstRequest = false;
+                return agentSdk.sendFirstMessageStream(...args);
+              }
+              return agentSdk.sendMessageStream(...args);
+            },
           };
         },
       };
@@ -66,7 +74,15 @@ function streamedResponse(...text: string[]) {
 describe("Gemini agent tool orchestration", () => {
   beforeEach(() => {
     agentSdk.sendMessage.mockReset();
+    agentSdk.sendFirstMessageStream.mockReset();
     agentSdk.sendMessageStream.mockReset();
+    agentSdk.sendFirstMessageStream.mockImplementation(async (...args: unknown[]) => {
+      const first = await agentSdk.sendMessage(...args);
+      return {
+        stream: chunks(first.response.text()),
+        response: Promise.resolve(first.response),
+      };
+    });
     agentSdk.modelConfig = undefined;
     agentSdk.startChatConfig = undefined;
   });
@@ -308,6 +324,39 @@ describe("Gemini agent tool orchestration", () => {
     expect(handlers.searchKnowledge).not.toHaveBeenCalled();
     expect(handlers.getWalletBlobInventory).not.toHaveBeenCalled();
     expect(agentSdk.sendMessageStream).not.toHaveBeenCalled();
+    expect(agentSdk.modelConfig.generationConfig).toEqual({
+      thinkingConfig: { thinkingBudget: 0 },
+    });
+    expect(agentSdk.sendFirstMessageStream.mock.calls[0][1]).toMatchObject({
+      timeout: 30_000,
+    });
+  });
+
+  it("emits direct-answer chunks before the aggregated first response resolves", async () => {
+    let resolveResponse!: (value: ReturnType<typeof firstResponse>["response"]) => void;
+    const response = new Promise<ReturnType<typeof firstResponse>["response"]>((resolve) => {
+      resolveResponse = resolve;
+    });
+    agentSdk.sendFirstMessageStream.mockResolvedValue({
+      stream: chunks("Xin", " chào"),
+      response,
+    });
+    const onChunk = vi.fn();
+
+    const pending = streamCloudAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "Hello" }] }],
+        cloudApiKey: "test-key",
+        systemInstruction: "test",
+      },
+      onChunk,
+      { searchKnowledge: vi.fn(), getWalletBlobInventory: vi.fn() },
+    );
+
+    await vi.waitFor(() => expect(onChunk).toHaveBeenCalledTimes(2));
+    resolveResponse(firstResponse([], "Xin chào").response);
+    await expect(pending).resolves.toBe("Xin chào");
+    expect(onChunk.mock.calls).toEqual([["Xin"], [" chào"]]);
   });
 
   it("emits a safe fallback when the final tool round has no answer text", async () => {

@@ -49,9 +49,10 @@ export interface AgentToolHandlers {
 const CLOUD_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"];
 const ROUTER_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"];
 const GEMINI_MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000";
+const CLOUD_AGENT_TIMEOUT_MS = 30_000;
 const conversationRouteCache = new Map<string, ConversationRoute>();
 
-export type CloudErrorKind = "rate_limit" | "invalid_key" | "network" | "other";
+export type CloudErrorKind = "rate_limit" | "invalid_key" | "network" | "timeout" | "other";
 
 export class CloudProviderError extends Error {
   readonly provider = "gemini";
@@ -84,6 +85,7 @@ export function getCloudErrorKind(error: unknown): CloudErrorKind {
   const message = raw.toLowerCase();
   if (status === 429 || /\b429\b|resource_exhausted|quota|rate.?limit/.test(message)) return "rate_limit";
   if (status === 401 || /api[_ -]?key.*(?:invalid|not valid)|unauthenticated|access_token_type_unsupported/.test(message)) return "invalid_key";
+  if (/timeout|timed out|deadline_exceeded|deadline exceeded|request aborted/.test(message)) return "timeout";
   if (/failed to fetch|network|load failed|fetch failed/.test(message)) return "network";
   return "other";
 }
@@ -104,6 +106,10 @@ export function normalizeCloudError(error: unknown): Error {
     "Unable to reach Gemini. Check your network and try again.",
     "Không thể kết nối Gemini. Hãy kiểm tra mạng rồi thử lại.",
   ), error);
+  if (kind === "timeout") return new CloudProviderError(kind, localize(
+    "Gemini took too long to respond. The request was stopped after 30 seconds; please try again.",
+    "Gemini phản hồi quá lâu. Yêu cầu đã dừng sau 30 giây; hãy thử lại.",
+  ), error);
   return new CloudProviderError(
     kind,
     error instanceof Error && error.message
@@ -114,7 +120,15 @@ export function normalizeCloudError(error: unknown): Error {
 }
 
 function shouldStopModelFallback(error: unknown): boolean {
-  return getCloudErrorKind(error) === "invalid_key";
+  const kind = getCloudErrorKind(error);
+  return kind === "invalid_key" || kind === "timeout";
+}
+
+function agentGenerationConfig(modelName: string) {
+  if (modelName === "gemini-2.5-flash") {
+    return { thinkingConfig: { thinkingBudget: 0 } };
+  }
+  return { thinkingConfig: { thinkingLevel: "low" } };
 }
 
 function geminiHttpError(status: number, body: unknown): Error & { status: number } {
@@ -295,7 +309,7 @@ export async function streamCloudAnswer(
  */
 export async function streamCloudAgentAnswer(
   { contents, cloudApiKey, systemInstruction }: AiRequest,
-  onChunk: (text: string) => void,
+  onChunk: (text: string, mode?: "append" | "replace") => void,
   handlers: AgentToolHandlers,
   signal?: AbortSignal,
 ): Promise<string> {
@@ -396,22 +410,56 @@ export async function streamCloudAgentAnswer(
       const model = clientFor(normalizedApiKey).getGenerativeModel({
         model: modelName,
         systemInstruction,
+        // The legacy SDK forwards unknown generationConfig fields unchanged.
+        // Gemini 2.5 Flash supports thinkingBudget=0; 3.x fallbacks use low.
+        generationConfig: agentGenerationConfig(modelName),
         tools: [agentTools],
         toolConfig: { functionCallingConfig: { mode: FunctionCallingMode.AUTO } },
-      });
+      } as any);
       const chat = model.startChat({ history });
-      const first = await chat.sendMessage(latestParts, { signal });
+      const first = await chat.sendMessageStream(latestParts, {
+        signal,
+        timeout: CLOUD_AGENT_TIMEOUT_MS,
+      });
+      let directAnswer = "";
+      let sawFunctionCall = false;
+      for await (const chunk of first.stream) {
+        signal?.throwIfAborted();
+        const chunkCalls = typeof chunk.functionCalls === "function" ? chunk.functionCalls() ?? [] : [];
+        if (chunkCalls.length) {
+          sawFunctionCall = true;
+          if (directAnswer) {
+            directAnswer = "";
+            emitted = false;
+            onChunk("", "replace");
+          }
+          continue;
+        }
+        const text = chunk.text();
+        if (!text || sawFunctionCall) continue;
+        emitted = true;
+        directAnswer += text;
+        onChunk(text);
+      }
+      const firstResponse = await first.response;
       signal?.throwIfAborted();
-      let calls = (first.response.functionCalls() ?? []) as AgentFunctionCall[];
+      let calls = (firstResponse.functionCalls() ?? []) as AgentFunctionCall[];
 
       if (!calls.length) {
-        const direct = first.response.text().trim();
+        const direct = directAnswer || firstResponse.text().trim();
         if (direct) {
-          emitted = true;
-          onChunk(direct);
+          if (!directAnswer) {
+            emitted = true;
+            onChunk(direct);
+          }
           return direct;
         }
         throw new Error(localize("Gemini did not produce an answer.", "Gemini không tạo được câu trả lời."));
+      }
+      if (directAnswer) {
+        directAnswer = "";
+        emitted = false;
+        onChunk("", "replace");
       }
       harnessStarted = true;
       const harnessState = createAgentHarnessState();
@@ -424,7 +472,10 @@ export async function streamCloudAgentAnswer(
           signal,
         });
         signal?.throwIfAborted();
-        const result = await chat.sendMessageStream(batch.responses, { signal });
+        const result = await chat.sendMessageStream(batch.responses, {
+          signal,
+          timeout: CLOUD_AGENT_TIMEOUT_MS,
+        });
         const bufferedChunks: string[] = [];
         for await (const chunk of result.stream) {
           signal?.throwIfAborted();

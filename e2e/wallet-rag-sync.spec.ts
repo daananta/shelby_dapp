@@ -144,6 +144,7 @@ test("creates an honest Answer Receipt from a cited local result", async ({ page
 test("keeps a temporarily limited Gemini key locally and accepts it on retry", async ({ page }) => {
   let providerState: "limited" | "ready" | "invalid" = "limited";
   let observedApiKey = "";
+  let observedThinkingBudget: number | undefined;
   let qwenRequests = 0;
   const authorizationKey = "AQ.mock-project-key-2222";
   page.on("request", (request) => {
@@ -168,19 +169,21 @@ test("keeps a temporarily limited Gemini key locally and accepts it on retry", a
       return;
     }
     if (route.request().method() !== "GET") {
+      observedThinkingBudget = route.request().postDataJSON()?.generationConfig?.thinkingConfig?.thinkingBudget;
+      const streamedPayload = {
+        candidates: [{
+          content: {
+            role: "model",
+            parts: [{ text: "Gemini 2.5 đang trả lời cuộc trò chuyện này." }],
+          },
+          finishReason: "STOP",
+          index: 0,
+        }],
+      };
       await route.fulfill({
         status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          candidates: [{
-            content: {
-              role: "model",
-              parts: [{ text: "Gemini 2.5 đang trả lời cuộc trò chuyện này." }],
-            },
-            finishReason: "STOP",
-            index: 0,
-          }],
-        }),
+        contentType: "text/event-stream",
+        body: `data: ${JSON.stringify(streamedPayload)}\n\n`,
       });
       return;
     }
@@ -226,6 +229,7 @@ test("keeps a temporarily limited Gemini key locally and accepts it on retry", a
   await chatInput.press("Enter");
   await expect(page.getByText("Gemini 2.5 đang trả lời cuộc trò chuyện này.", { exact: true })).toBeVisible();
   expect(qwenRequests).toBe(0);
+  expect(observedThinkingBudget).toBe(0);
 
   providerState = "invalid";
   await keyInput.fill("AQ.invalid-replacement");

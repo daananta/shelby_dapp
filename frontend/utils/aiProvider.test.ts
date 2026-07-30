@@ -21,6 +21,11 @@ describe("Gemini error messages", () => {
     expect(normalizeCloudError(new Error("Failed to fetch")).message).toContain("Check your network");
   });
 
+  it("reports an SDK request timeout without retrying it as another model", () => {
+    expect(getCloudErrorKind(new Error("Request aborted after timeout"))).toBe("timeout");
+    expect(normalizeCloudError(new Error("DEADLINE_EXCEEDED")).message).toContain("30 seconds");
+  });
+
   it("passes a new AQ authorization key unchanged to Gemini", async () => {
     const authorizationKey = "AQ.mock-authorization-key";
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {

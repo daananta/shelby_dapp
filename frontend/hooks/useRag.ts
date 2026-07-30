@@ -309,7 +309,7 @@ export function useRag(account: any, signMessage: any) {
               let description: string | null = null;
               if (cloudContentKey) {
                 try {
-                  description = await describeImageWithCloud(url, displayName, cloudContentKey, controller.signal);
+                  description = await describeImageWithCloud(url, displayName, cloudContentKey, controller.signal, detected.mimeType);
                   throwIfStale();
                 } catch (visionError) {
                   if (controller.signal.aborted || !isCurrentRun() || (visionError instanceof DOMException && visionError.name === "AbortError")) throw visionError;

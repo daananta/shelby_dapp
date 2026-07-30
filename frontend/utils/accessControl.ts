@@ -10,6 +10,9 @@ export interface AccessPolicyInfo {
   lockedUntilMicros?: number;
   price?: number;
   canAccess?: boolean | null;
+  /** GreenBox metadata needed by an official decryptor after access is granted. */
+  greenBoxScheme?: number;
+  greenBoxBytes?: Uint8Array;
 }
 
 export interface AccessPoliciesSnapshot {
@@ -68,8 +71,8 @@ export function parseAccessPolicyQuery(hex: string): AccessPolicyInfo {
       return { type: "none", canAccess: hasCanAccess ? reader.readBool() : null };
     }
     reader.skipBytes(32); // metadata owner
-    reader.readU8(); // GreenBox scheme
-    reader.readVectorU8(); // GreenBox bytes
+    const greenBoxScheme = reader.readU8();
+    const greenBoxBytes = reader.readVectorU8();
     const policyVariant = reader.readUleb128();
     let policy: AccessPolicyInfo;
     if (policyVariant === 0) {
@@ -89,6 +92,10 @@ export function parseAccessPolicyQuery(hex: string): AccessPolicyInfo {
     }
     const hasCanAccess = reader.readBool();
     policy.canAccess = hasCanAccess ? reader.readBool() : null;
+    if (greenBoxScheme !== 0 || greenBoxBytes.byteLength > 0) {
+      policy.greenBoxScheme = greenBoxScheme;
+      policy.greenBoxBytes = greenBoxBytes;
+    }
     return policy;
   } catch (error) {
     console.warn("Không thể đọc BCS access policy:", error);

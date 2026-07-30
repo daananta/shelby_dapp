@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { downloadBlobForRag, getBlobAccessDecision, isRagSourceEligible, parseTimestampMicros, readBlobAccessInfo } from "@/utils/blobAccess";
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("blob access policy", () => {
   it("normalizes extension tags and allowlists", () => {
@@ -35,6 +37,48 @@ describe("blob access policy", () => {
     expect(decision).toMatchObject({ eligible: true, needsBroker: false });
   });
 
+  it("does not mistake an unlocked GreenBox blob for plaintext", () => {
+    const protectedBlob = {
+      accessPolicy: {
+        type: "timelock",
+        lockedUntilMicros: 1_700_000_000_000_000,
+        canAccess: true,
+        greenBoxScheme: 2,
+        greenBoxBytes: new Uint8Array([1, 2, 3]),
+      },
+    };
+    const decision = getBlobAccessDecision(protectedBlob, "0x1", 1_800_000_000_000_000);
+
+    expect(decision).toMatchObject({
+      eligible: false,
+      needsDecryption: true,
+      info: { requiresDecryption: true, greenBoxScheme: 2, greenBoxByteLength: 3 },
+    });
+    expect(isRagSourceEligible(protectedBlob, "0x1", 1_800_000_000_000_000)).toBe(false);
+  });
+
+  it("rejects protected ciphertext before starting a Shelby download", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(downloadBlobForRag({
+      owner: "0x1",
+      blobName: "protected.pdf",
+      walletAddress: "0x1",
+      signMessage: async () => ({}),
+      blob: {
+        accessPolicy: {
+          type: "timelock",
+          lockedUntilMicros: 1,
+          canAccess: true,
+          greenBoxScheme: 2,
+          greenBoxBytes: new Uint8Array([1]),
+        },
+      },
+    })).rejects.toThrow(/does not yet support decrypting/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("keeps registered-but-unwritten blobs out of the RAG queue", () => {
     expect(isRagSourceEligible({ isWritten: false, accessPolicy: { type: "none", canAccess: null } }, "0x1")).toBe(false);
   });
@@ -49,6 +93,55 @@ describe("blob access policy", () => {
     const shared = { owner: "0x1", blobName: "stale.pdf", walletAddress: "0x1", signMessage: async () => ({}) };
     await expect(downloadBlobForRag({ ...shared, blob: { isDeleted: true, accessPolicy: { type: "none" } } })).rejects.toThrow(/deleted/);
     await expect(downloadBlobForRag({ ...shared, blob: { isWritten: false, accessPolicy: { type: "none" } } })).rejects.toThrow(/not finished uploading/);
+  });
+
+  it("streams an elapsed time-lock blob through the authenticated Shelby reader", async () => {
+    const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+    const fetchMock = vi.fn(async () => new Response(bytes, {
+      status: 200,
+      headers: { "content-length": String(bytes.byteLength) },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const downloaded = await downloadBlobForRag({
+      owner: "0x1",
+      blobName: "unlocked-photo.jpg",
+      walletAddress: "0x1",
+      signMessage: async () => ({}),
+      blob: {
+        size: bytes.byteLength,
+        accessPolicy: {
+          type: "timelock",
+          lockedUntilMicros: 1_700_000_000_000_000,
+          canAccess: null,
+        },
+      },
+    });
+
+    expect(new Uint8Array(await downloaded.content.arrayBuffer())).toEqual(bytes);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    downloaded.dispose();
+  });
+
+  it("forwards cancellation while an unlocked blob request is still pending", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn((_input: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("Stopped", "AbortError")), { once: true });
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = downloadBlobForRag({
+      owner: "0x1",
+      blobName: "unlocked-photo.jpg",
+      walletAddress: "0x1",
+      signMessage: async () => ({}),
+      blob: { accessPolicy: { type: "none", canAccess: null } },
+      signal: controller.signal,
+    });
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("recognizes seconds, milliseconds, microseconds and ISO timestamps", () => {

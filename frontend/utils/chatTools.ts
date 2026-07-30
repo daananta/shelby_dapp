@@ -548,8 +548,8 @@ export async function runChatTool(question: string, address?: string, context: C
     return {
       name: "blob_inventory",
       text: t(
-        "I can use these live data tools:\n- View your wallet address, APT and ShelbyUSD balances, and on-chain account information.\n- List blobs and PDF books in your Shelby Library.\n- Display and describe indexed image blobs.\n- Calculate basic arithmetic.\n- Search and cite PDF or text content in the RAG.\nI can also answer with Gemini Cloud using your own API key.",
-        "Tôi có các công cụ dữ liệu trực tiếp:\n- Xem địa chỉ ví, số dư APT, ShelbyUSD và thông tin account on-chain.\n- Liệt kê blob/sách PDF trong kho Shelby.\n- Hiển thị và mô tả ảnh blob đã index.\n- Tính phép toán cơ bản.\n- Tìm kiếm và trích dẫn PDF/text trong RAG.\nNgoài ra có thể trả lời bằng Gemini Cloud với API key riêng của bạn.",
+        "I can use these live data tools:\n- View your wallet address, APT and ShelbyUSD balances, and on-chain account information.\n- List blobs and PDF books in your Shelby Library.\n- Display and describe indexed image blobs.\n- Calculate basic arithmetic.\n- Search and cite PDF or text content in the RAG.\nGeneral chat uses Qwen3.7 Flash through the app. An optional Gemini key can improve image, video, OCR, and semantic indexing while building RAG.",
+        "Tôi có các công cụ dữ liệu trực tiếp:\n- Xem địa chỉ ví, số dư APT, ShelbyUSD và thông tin account on-chain.\n- Liệt kê blob/sách PDF trong kho Shelby.\n- Hiển thị và mô tả ảnh blob đã index.\n- Tính phép toán cơ bản.\n- Tìm kiếm và trích dẫn PDF/text trong RAG.\nChat thông thường dùng Qwen3.7 Flash của ứng dụng. Gemini key tùy chọn có thể cải thiện việc đọc ảnh, video, OCR và lập chỉ mục ngữ nghĩa khi tạo RAG.",
       ),
     };
   }

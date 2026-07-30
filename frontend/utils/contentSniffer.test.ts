@@ -12,6 +12,14 @@ describe("content-based Shelby blob detection", () => {
     expect(await sniffRagContent(png)).toMatchObject({ kind: "image", mimeType: "image/png" });
   });
 
+  it.each([
+    ["JPEG", [0xff, 0xd8, 0xff, 0xe0], "image/jpeg"],
+    ["GIF", [0x47, 0x49, 0x46, 0x38], "image/gif"],
+    ["WEBP", [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50], "image/webp"],
+  ])("recognizes %s image bytes after a time lock has opened", async (_format, signature, mimeType) => {
+    expect(await sniffRagContent(new Blob([new Uint8Array(signature)]))).toMatchObject({ kind: "image", mimeType });
+  });
+
   it("recognizes portable RAG packages from their payload", async () => {
     const value = JSON.stringify({ format: "shelby-rag-package", version: 1, documents: [] });
     expect(await sniffRagContent(new Blob([value]))).toMatchObject({ kind: "package", format: "SHELBY RAG" });
@@ -30,5 +38,10 @@ describe("content-based Shelby blob detection", () => {
   it("routes MP4 bytes to the video pipeline", async () => {
     const mp4 = new Blob([new Uint8Array([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d])]);
     expect(await sniffRagContent(mp4)).toMatchObject({ kind: "video", mimeType: "video/mp4", format: "MP4 VIDEO" });
+  });
+
+  it("does not misroute an AVIF image container to the MP4 video pipeline", async () => {
+    const avif = new Blob([new Uint8Array([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66])]);
+    expect(await sniffRagContent(avif)).toMatchObject({ kind: "unsupported", mimeType: "image/avif", format: "AVIF/HEIF" });
   });
 });

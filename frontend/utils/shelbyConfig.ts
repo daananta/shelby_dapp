@@ -1,13 +1,12 @@
 import { ShelbyBlobClient, ShelbyRPCClient } from "@shelby-protocol/sdk/browser";
+import { NETWORK } from "@/constants";
+import { SHELBY_CLIENT_API_KEY, SHELBY_CLIENT_KEY_ISSUE } from "@/utils/geomiClientKey";
 
-const rawApiKey = import.meta.env.VITE_APTOS_API_KEY || "";
-const apiKey = rawApiKey.startsWith('"') && rawApiKey.endsWith('"')
-  ? rawApiKey.slice(1, -1)
-  : rawApiKey;
+export { SHELBY_CLIENT_KEY_ISSUE };
 
 export const sdkConfig = {
-  network: (import.meta.env.VITE_APP_NETWORK ?? "testnet") as any,
-  apiKey: apiKey || "",
+  network: NETWORK as any,
+  ...(SHELBY_CLIENT_API_KEY ? { apiKey: SHELBY_CLIENT_API_KEY } : {}),
 };
 
 export const blobClient = new ShelbyBlobClient(sdkConfig);

@@ -60,13 +60,13 @@ test("small mobile screens keep the document list usable without horizontal clip
   await expect(page.getByText("Hướng dẫn Shelby RAG (Public)", { exact: true })).toBeVisible();
 });
 
-test("keeps Gemini quota permissions explicit and previews indexing calls", async ({ page }) => {
+test("keeps Qwen chat and optional Gemini indexing permissions explicit", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
   await expect(page.getByTestId("wallet-runtime")).toBeVisible();
 
   await page.getByRole("tab", { name: "Cấu hình", exact: true }).click();
-  const chatSwitch = page.getByRole("switch", { name: "Dùng Gemini cho trò chuyện", exact: true });
+  const chatSwitch = page.getByRole("switch", { name: "Dùng Qwen3.7 Flash để trò chuyện", exact: true });
   const contentSwitch = page.getByRole("switch", { name: "Dùng Gemini để đọc nội dung khi tạo RAG", exact: true });
   const semanticSwitch = page.getByRole("switch", { name: "Tạo tìm kiếm theo ý nghĩa", exact: true });
   await expect(chatSwitch).toHaveAttribute("aria-checked", "true");
@@ -141,14 +141,25 @@ test("creates an honest Answer Receipt from a cited local result", async ({ page
   await expect(page.getByRole("button", { name: "Tải phiếu", exact: true })).toBeVisible();
 });
 
-test("replaces an exhausted Gemini key instead of retaining it after a 429", async ({ page }) => {
-  let providerState: "limited" | "ready" = "limited";
+test("keeps a temporarily limited Gemini key locally and accepts it on retry", async ({ page }) => {
+  let providerState: "limited" | "ready" | "invalid" = "limited";
+  let observedApiKey = "";
+  const authorizationKey = "AQ.mock-project-key-2222";
   await page.route("https://generativelanguage.googleapis.com/**", async (route) => {
+    observedApiKey = route.request().headers()["x-goog-api-key"] ?? "";
     if (providerState === "limited") {
       await route.fulfill({
         status: 429,
         contentType: "application/json",
         body: JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota exceeded for this project" } }),
+      });
+      return;
+    }
+    if (providerState === "invalid") {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: 403, status: "PERMISSION_DENIED", message: "API key not valid" } }),
       });
       return;
     }
@@ -164,18 +175,51 @@ test("replaces an exhausted Gemini key instead of retaining it after a 429", asy
 
   await page.goto("/");
   await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
-  await page.getByRole("button", { name: "Kết nối AI", exact: true }).click();
-  const keyInput = page.getByPlaceholder("Dán Gemini API key…");
-  await keyInput.fill("test-project-a-key-1111");
+  await page.getByRole("button", { name: "AI tạo RAG tùy chọn", exact: true }).click();
+  const keyInput = page.getByPlaceholder("Dán Gemini API key tùy chọn…");
+  await keyInput.fill(`  ${authorizationKey}  `);
   await page.getByRole("button", { name: "Lưu & kiểm tra", exact: true }).click();
-  await expect(page.getByText(/Key …1111 chưa được kích hoạt.*dùng chung quota/)).toBeVisible();
-  expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBeNull();
+  await expect(page.getByText(/Key …2222 đã được lưu cục bộ.*không bị từ chối.*Thử lại/)).toBeVisible();
+  expect(observedApiKey).toBe(authorizationKey);
+  expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBe(authorizationKey);
+  await expect(page.getByRole("button", { name: "Thử lại", exact: true })).toBeVisible();
+
+  await keyInput.fill("AQ.unsaved-draft-key");
+  expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBe(authorizationKey);
+  await expect(page.getByRole("button", { name: "Lưu & kiểm tra", exact: true })).toBeVisible();
+  await keyInput.fill(authorizationKey);
 
   providerState = "ready";
-  await keyInput.fill("test-project-b-key-2222");
-  await page.getByRole("button", { name: "Lưu & kiểm tra", exact: true }).click();
+  await page.getByRole("button", { name: "Thử lại", exact: true }).click();
   await expect(page.getByText("✓ Key …2222 hoạt động với gemini-2.5-flash.", { exact: true })).toBeVisible();
-  expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBe("test-project-b-key-2222");
+  expect(observedApiKey).toBe(authorizationKey);
+  expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBe(authorizationKey);
+
+  providerState = "invalid";
+  await keyInput.fill("AQ.invalid-replacement");
+  await page.getByRole("button", { name: "Lưu & kiểm tra", exact: true }).click();
+  await expect(page.getByText(/Key trước đó …2222 vẫn hoạt động/)).toBeVisible();
+  expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBe(authorizationKey);
+
+});
+
+test("rejects only a Gemini key that the provider explicitly marks invalid", async ({ page }) => {
+  await page.route("https://generativelanguage.googleapis.com/**", async (route) => {
+    await route.fulfill({
+      status: 403,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { code: 403, status: "PERMISSION_DENIED", message: "API key not valid" } }),
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
+  await page.getByRole("button", { name: "AI tạo RAG tùy chọn", exact: true }).click();
+  await page.getByPlaceholder("Dán Gemini API key tùy chọn…").fill("AQ.invalid-key");
+  await page.getByRole("button", { name: "Lưu & kiểm tra", exact: true }).click();
+
+  await expect(page.getByText(/Không thể dùng key.*không hợp lệ|không có quyền/)).toBeVisible();
+  expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBeNull();
 });
 
 test("confirms the latest blob snapshot without requiring a Gemini key", async ({ page }) => {
@@ -203,90 +247,51 @@ test("lets the agent refresh Shelby live and reread the bounded inventory payloa
   const refreshPayloads: any[] = [];
   const inventoryPayloads: any[] = [];
   let toolTurns = 0;
-  await page.route("https://generativelanguage.googleapis.com/**", async (route) => {
-    const request = route.request();
-    const body = request.postDataJSON() as any;
-    if (request.url().includes(":streamGenerateContent")) {
-      const responses = (body?.contents ?? [])
-        .flatMap((content: any) => content?.parts ?? [])
-        .map((part: any) => part?.functionResponse)
-        .filter(Boolean);
-      const latestResponse = responses.at(-1);
-      if (latestResponse?.name === "refresh_wallet_blob_inventory") {
-        refreshPayloads.push(latestResponse.response);
+  await page.route("**/api/ai/v1/chat", async (route) => {
+    const body = route.request().postDataJSON() as any;
+    const latestTool = [...(body?.messages ?? [])].reverse().find((message: any) => message?.role === "tool");
+    if (latestTool) {
+      const payload = JSON.parse(latestTool.content);
+      const previousCall = [...(body?.messages ?? [])].reverse()
+        .find((message: any) => message?.role === "assistant" && message?.tool_calls)
+        ?.tool_calls?.find((call: any) => call.id === latestTool.tool_call_id);
+      if (previousCall?.function?.name === "refresh_wallet_blob_inventory") {
+        refreshPayloads.push(payload);
         toolTurns += 1;
         await route.fulfill({
           status: 200,
-          contentType: "text/event-stream",
-          body: `data: ${JSON.stringify({
-            candidates: [{
-              index: 0,
-              finishReason: "STOP",
-              content: {
-                role: "model",
-                parts: [{ functionCall: { name: "get_wallet_blob_inventory", args: { detail: "count" } } }],
-              },
-            }],
-          })}\n\n`,
+          contentType: "application/json",
+          body: JSON.stringify({ message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "inventory-call", type: "function", function: { name: "get_wallet_blob_inventory", arguments: "{\"detail\":\"count\"}" } }],
+          } }),
         });
         return;
       }
-      if (latestResponse?.name === "get_wallet_blob_inventory") {
-        inventoryPayloads.push(latestResponse.response);
-        toolTurns += 1;
-        await route.fulfill({
-          status: 200,
-          contentType: "text/event-stream",
-          body: `data: ${JSON.stringify({
-            candidates: [{
-              index: 0,
-              finishReason: "STOP",
-              content: {
-                role: "model",
-                parts: [{ text: "Tôi vừa cập nhật từ Shelby: ví này hiện có 3 blob." }],
-              },
-            }],
-          })}\n\n`,
-        });
-        return;
-      }
-    }
-
-    const declarations = (body?.tools ?? []).flatMap((tool: any) => tool?.functionDeclarations ?? []);
-    if (declarations.some((declaration: any) => declaration.name === "refresh_wallet_blob_inventory")) {
+      inventoryPayloads.push(payload);
+      toolTurns += 1;
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({
-          candidates: [{
-            index: 0,
-            finishReason: "STOP",
-            content: {
-              role: "model",
-              parts: [{ functionCall: { name: "refresh_wallet_blob_inventory", args: {} } }],
-            },
-          }],
-        }),
+        body: JSON.stringify({ message: { role: "assistant", content: "Tôi vừa cập nhật từ Shelby: ví này hiện có 3 blob." } }),
       });
       return;
     }
-
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({
-        candidates: [{ index: 0, finishReason: "STOP", content: { role: "model", parts: [{ text: "OK" }] } }],
-      }),
+      body: JSON.stringify({ message: {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "refresh-call", type: "function", function: { name: "refresh_wallet_blob_inventory", arguments: "{}" } }],
+      } }),
     });
   });
 
   await page.goto("/");
   await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
-  await page.getByRole("button", { name: "Kết nối AI", exact: true }).click();
-  await page.getByPlaceholder("Dán Gemini API key…").fill("live-refresh-test-key-4444");
-  await page.getByRole("button", { name: "Lưu & kiểm tra", exact: true }).click();
-  await expect(page.getByText("✓ Key …4444 hoạt động với gemini-2.5-flash.", { exact: true })).toBeVisible();
-
+  await expect(page.getByText("Hướng dẫn Shelby RAG (Public)", { exact: true })).toBeVisible();
   const chatInput = page.getByLabel("Nhập câu hỏi");
   await chatInput.fill("Kiểm tra số blob hiện tại của ví tôi");
   await chatInput.press("Enter");
@@ -309,87 +314,58 @@ test("keeps an inventory follow-up out of RAG even when the model picks the wron
   const returnedCounts: number[] = [];
   const returnedInventoryPayloads: any[] = [];
   const blockedSearchResponses: any[] = [];
-  await page.route("https://generativelanguage.googleapis.com/**", async (route) => {
-    const request = route.request();
-    const body = request.postDataJSON() as any;
-    if (request.url().includes(":streamGenerateContent")) {
-      const functionResponses = (body?.contents ?? [])
-        .flatMap((content: any) => content?.parts ?? [])
-        .map((part: any) => part?.functionResponse)
-        .filter(Boolean);
-      const inventoryResponse = functionResponses.find((response: any) => response.name === "get_wallet_blob_inventory");
-      if (inventoryResponse?.response) {
-        returnedInventoryPayloads.push(inventoryResponse.response);
-        if (typeof inventoryResponse.response.count === "number") returnedCounts.push(inventoryResponse.response.count);
+  await page.route("**/api/ai/v1/chat", async (route) => {
+    const body = route.request().postDataJSON() as any;
+    const latestTool = [...(body?.messages ?? [])].reverse().find((message: any) => message?.role === "tool");
+    if (latestTool) {
+      const payload = JSON.parse(latestTool.content);
+      const previousCall = [...(body?.messages ?? [])].reverse()
+        .find((message: any) => message?.role === "assistant" && message?.tool_calls)
+        ?.tool_calls?.find((call: any) => call.id === latestTool.tool_call_id);
+      if (previousCall?.function?.name === "get_wallet_blob_inventory") {
+        returnedInventoryPayloads.push(payload);
+        if (typeof payload.count === "number") returnedCounts.push(payload.count);
+      } else {
+        blockedSearchResponses.push(payload);
       }
-      const searchResponse = functionResponses.find((response: any) => response.name === "search_user_knowledge");
-      if (searchResponse?.response) blockedSearchResponses.push(searchResponse.response);
-      const text = inventoryResponse
-        ? "Theo lần làm mới gần nhất, ví này có 2 blob."
-        : "Tôi đã tìm trong RAG nhưng không có bằng chứng.";
-      await route.fulfill({
-        status: 200,
-        contentType: "text/event-stream",
-        body: `data: ${JSON.stringify({
-          candidates: [{ index: 0, finishReason: "STOP", content: { role: "model", parts: [{ text }] } }],
-        })}\n\n`,
-      });
-      return;
-    }
-
-    const declarations = (body?.tools ?? []).flatMap((tool: any) => tool?.functionDeclarations ?? []);
-    if (declarations.some((declaration: any) => declaration.name === "get_wallet_blob_inventory")) {
-      agentTurns += 1;
-      if (agentTurns === 3) {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({
-            candidates: [{
-              index: 0,
-              finishReason: "STOP",
-              content: { role: "model", parts: [{ text: "Chắc chắn rồi, không cần kiểm tra lại." }] },
-            }],
-          }),
-        });
-        return;
-      }
-      const functionCall = agentTurns === 1
-        ? { name: "get_wallet_blob_inventory", args: { detail: "count" } }
-        : { name: "search_user_knowledge", args: { query: "xác nhận số blob" } };
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({
-          candidates: [{
-            index: 0,
-            finishReason: "STOP",
-            content: {
-              role: "model",
-              parts: [{ functionCall }],
-            },
-          }],
-        }),
+        body: JSON.stringify({ message: {
+          role: "assistant",
+          content: previousCall?.function?.name === "get_wallet_blob_inventory"
+            ? "Theo lần làm mới gần nhất, ví này có 2 blob."
+            : "Tôi đã tìm trong RAG nhưng không có bằng chứng.",
+        } }),
       });
       return;
     }
 
+    agentTurns += 1;
+    if (agentTurns === 3) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ message: { role: "assistant", content: "Chắc chắn rồi, không cần kiểm tra lại." } }),
+      });
+      return;
+    }
+    const name = agentTurns === 1 ? "get_wallet_blob_inventory" : "search_user_knowledge";
+    const args = agentTurns === 1 ? { detail: "count" } : { query: "xác nhận số blob" };
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({
-        candidates: [{ index: 0, finishReason: "STOP", content: { role: "model", parts: [{ text: "OK" }] } }],
-      }),
+      body: JSON.stringify({ message: {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: `agent-call-${agentTurns}`, type: "function", function: { name, arguments: JSON.stringify(args) } }],
+      } }),
     });
   });
 
   await page.goto("/");
   await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
-  await page.getByRole("button", { name: "Kết nối AI", exact: true }).click();
-  await page.getByPlaceholder("Dán Gemini API key…").fill("agent-tool-test-key-3333");
-  await page.getByRole("button", { name: "Lưu & kiểm tra", exact: true }).click();
-  await expect(page.getByText("✓ Key …3333 hoạt động với gemini-2.5-flash.", { exact: true })).toBeVisible();
-
+  await expect(page.getByText("Hướng dẫn Shelby RAG (Public)", { exact: true })).toBeVisible();
   const chatInput = page.getByLabel("Nhập câu hỏi");
   await chatInput.fill("Ví này có bao nhiêu blob trên Shelby?");
   await chatInput.press("Enter");

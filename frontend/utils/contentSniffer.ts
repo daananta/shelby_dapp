@@ -56,7 +56,19 @@ export async function sniffRagContent(blob: Blob): Promise<DetectedRagContent> {
     return { kind: "image", mimeType: "image/webp", format: "WEBP", confidence: "high" };
   }
   if (String.fromCharCode(...bytes.slice(4, 8)) === "ftyp") {
-    return { kind: "video", mimeType: "video/mp4", format: "MP4 VIDEO", confidence: "high" };
+    const majorBrand = String.fromCharCode(...bytes.slice(8, 12));
+    if (/^(?:isom|iso[2-9]|mp4[12]|avc1|dash|M4V )$/.test(majorBrand)) {
+      return { kind: "video", mimeType: "video/mp4", format: "MP4 VIDEO", confidence: "high" };
+    }
+    if (/^(?:avif|avis|heic|heix|hevc|hevx|mif1|msf1)$/.test(majorBrand)) {
+      return {
+        kind: "unsupported",
+        mimeType: majorBrand.startsWith("av") ? "image/avif" : "image/heif",
+        format: "AVIF/HEIF",
+        confidence: "high",
+      };
+    }
+    return { kind: "unsupported", mimeType: "application/octet-stream", format: "ISO MEDIA", confidence: "medium" };
   }
   if (startsWith(bytes, [0x50, 0x4b, 0x03, 0x04])) {
     return { kind: "unsupported", mimeType: "application/zip", format: "ZIP/OFFICE", confidence: "high" };

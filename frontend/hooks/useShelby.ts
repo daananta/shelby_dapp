@@ -2,17 +2,24 @@ import { useState, useEffect, useRef } from "react";
 import { useWallet } from "@aptos-labs/wallet-adapter-react";
 import { AccountAddress } from "@aptos-labs/ts-sdk";
 import { BlobNameSchema, ShelbyBlobClient, generateCommitments } from "@shelby-protocol/sdk/browser";
-import { blobClient, rpcClient } from "@/utils/shelbyConfig";
+import { blobClient, rpcClient, SHELBY_CLIENT_KEY_ISSUE } from "@/utils/shelbyConfig";
 import { aptosClient } from "@/utils/aptosClient";
 import { useToast } from "@/components/ui/use-toast";
 import { queryAccessPolicies } from "@/utils/accessControl";
 import { isRagSourceEligible } from "@/utils/blobAccess";
 import { getShelbyBlobInventory, invalidateShelbyBlobInventory, setShelbyBlobInventory, setActiveRagOwner } from "@/utils/ragOrama";
-import { isMockWorkspace } from "@/utils/devMode";
+import { isE2EShelbyConfigurationError, isE2EWalletConnected, isMockWorkspace } from "@/utils/devMode";
 import { bytesToHex } from "@/utils/contentIntegrity";
 import { getErasureProvider } from "@/utils/shelbyErasure";
-import { localize } from "@/i18n";
+import { currentLanguage, localize } from "@/i18n";
 import { unavailableBlobInventoryRefresh, type BlobInventoryRefreshCapability } from "@/utils/agentCapabilities";
+import {
+  classifyShelbyServiceError,
+  getShelbyErrorDiagnostic,
+  getShelbyRefreshErrorCopy,
+  ShelbyClientConfigurationError,
+  type ShelbyServiceErrorKind,
+} from "@/utils/shelbyErrors";
 
 const MOCK_ACCOUNT = { address: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef" };
 const YEAR_IN_MICROSECONDS = 365 * 24 * 60 * 60 * 1_000_000;
@@ -38,7 +45,7 @@ export interface ShelbyUploadProgress {
 export function useShelby() {
   const { account: realAccount, signAndSubmitTransaction, signMessage } = useWallet();
   const mockWorkspace = isMockWorkspace();
-  const account = mockWorkspace
+  const account = isE2EWalletConnected()
     ? MOCK_ACCOUNT
     : realAccount;
   const { toast } = useToast();
@@ -50,6 +57,7 @@ export function useShelby() {
   const [uploadProgress, setUploadProgress] = useState<ShelbyUploadProgress | null>(null);
   const [selectedBlobNames, setSelectedBlobNames] = useState<string[]>([]);
   const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
+  const [loadError, setLoadError] = useState<ShelbyServiceErrorKind | null>(null);
   const fetchGenerationRef = useRef(0);
   const uploadInFlightRef = useRef(false);
   const knownEligibleNamesRef = useRef<{ owner: string; names: Set<string> }>({ owner: "", names: new Set() });
@@ -202,6 +210,7 @@ export function useShelby() {
     };
 
     if (mockWorkspace) {
+      setLoadError(null);
       await setActiveRagOwner(ownerAddress);
       if (!isCurrentRequest()) return [];
       const names = sandboxBlobs.map((blob: any) => getBlobName(blob));
@@ -219,8 +228,13 @@ export function useShelby() {
     let enrichedData: any[] = [];
     try {
       setLoading(true);
+      setLoadError(null);
       await setActiveRagOwner(ownerAddress);
       if (!isCurrentRequest()) return [];
+      const clientKeyIssue = isE2EShelbyConfigurationError() ? "missing" : SHELBY_CLIENT_KEY_ISSUE;
+      if (clientKeyIssue) {
+        throw new ShelbyClientConfigurationError(clientKeyIssue);
+      }
       data = await blobClient.getAccountBlobs({ account: account.address });
       if (!isCurrentRequest()) return [];
       const accessSnapshot = await queryAccessPolicies(ownerAddress, data.map((blob: any) => getBlobName(blob)), signal);
@@ -253,17 +267,20 @@ export function useShelby() {
       return finalData;
     } catch (error) {
       if (!isCurrentRequest()) return [];
-      console.warn("Unable to load blobs from Shelby:", error);
+      const errorKind = classifyShelbyServiceError(error);
+      const errorCopy = getShelbyRefreshErrorCopy(errorKind, currentLanguage());
+      setLoadError(errorKind);
+      console.warn("Unable to load blobs from Shelby", getShelbyErrorDiagnostic(error));
       if (!isSandboxMode) toast({
-        title: localize("Could not refresh Shelby data", "Không thể đồng bộ Shelby"),
-        description: error instanceof Error ? error.message : String(error),
+        title: errorCopy.title,
+        description: errorCopy.description,
         variant: "destructive",
       });
       await invalidateShelbyBlobInventory(ownerAddress);
       if (!isCurrentRequest()) return [];
-      setBlobs(sandboxBlobs);
-      const ragEligibleNames = sandboxBlobs.map(getModifiedBlobForRag).filter((blob: any) => isRagSourceEligible(blob, ownerAddress)).map((blob: any) => getBlobName(blob));
-      reconcileSelection(ragEligibleNames);
+      // Preserve the last good visual snapshot. The searchable inventory was
+      // invalidated above, so chat cannot claim stale data is current.
+      setBlobs((previous) => previous.length ? previous : sandboxBlobs);
       return sandboxBlobs;
     } finally {
       if (isCurrentGeneration()) setLoading(false);
@@ -486,6 +503,7 @@ export function useShelby() {
     setBlobs([]);
     setSelectedBlobNames([]);
     setLastSyncedAt(null);
+    setLoadError(null);
     setLoading(Boolean(ownerKey));
     setUploading(false);
     setUploadProgress(null);
@@ -504,6 +522,7 @@ export function useShelby() {
     selectedBlobNames,
     setSelectedBlobNames,
     lastSyncedAt,
+    loadError,
     mockBalance,
     mockPurchasedBlobNames,
     adjustMockBalance,

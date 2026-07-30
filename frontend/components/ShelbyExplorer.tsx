@@ -30,6 +30,7 @@ import { rpcClient } from "@/utils/shelbyConfig";
 import { getGeminiUsagePreferences } from "@/utils/geminiUsage";
 import { localize, useLanguage } from "@/i18n";
 import type { RegisterBlobInventoryRefresh } from "@/utils/agentCapabilities";
+import { getShelbyRefreshErrorCopy } from "@/utils/shelbyErrors";
 
 const isPortableRagBlobName = (name: string) => /\.shelby-rag\.json$/i.test(name);
 const LOCAL_RAG_RECOMMEND_BYTES = 8 * 1024 * 1024;
@@ -54,7 +55,7 @@ interface ShelbyExplorerProps {
 }
 
 export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerProps) {
-  const { t } = useLanguage();
+  const { language, t } = useLanguage();
   const { toast } = useToast();
   const [activeTab, setActiveTab] = useState<"library" | "upload" | "capsule" | "config">("library");
   const [remoteSnapshot, setRemoteSnapshot] = useState<{ status: "idle" | "loading" | "ready" | "error"; packageData?: PortableRagPackage; hotManifest?: HotRagManifest; hotRuntime?: HotRagRuntime; error?: string }>({ status: "idle" });
@@ -71,6 +72,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
     uploadProgress,
     selectedBlobNames,
     setSelectedBlobNames,
+    loadError,
     mockPurchasedBlobNames,
     getBlobName,
     getModifiedBlobForRag,
@@ -117,6 +119,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
   });
 
   const ragMetrics = summarizeRagSources(ragSources);
+  const loadErrorCopy = loadError ? getShelbyRefreshErrorCopy(loadError, language) : null;
   const indexedSources = ragSources.filter((source) => source.status === "indexed");
   const remoteRagBlobs = blobs.filter((blob) => {
     const name = getBlobName(blob);
@@ -438,8 +441,10 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
     toast({ title: t("On-device RAG removed", "Đã giải phóng RAG trên thiết bị"), description: t("Original blobs and the Shelby RAG backup are unchanged.", "Blob gốc và bản sao RAG trên Shelby vẫn được giữ nguyên.") });
   };
 
-  const lifecycleTitle = remoteSnapshot.status === "loading"
-    ? t("Checking the Shelby knowledge base…", "Đang kiểm tra kho tri thức trên Shelby…")
+  const lifecycleTitle = loadErrorCopy
+    ? loadErrorCopy.title
+    : remoteSnapshot.status === "loading"
+      ? t("Checking the Shelby knowledge base…", "Đang kiểm tra kho tri thức trên Shelby…")
     : !hasLocalRag && hasRemoteRag
       ? remoteSnapshot.status === "ready" && !remoteAssessment.fresh
         ? t("The Shelby knowledge base needs new data", "Kho trên Shelby cần bổ sung dữ liệu mới")
@@ -457,8 +462,10 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
               : t("No knowledge base on this device yet", "Chưa có kho tri thức trên thiết bị");
 
   const pendingPreview = pendingLocalBlobs.slice(0, 3).map((blob) => getBlobName(blob)).join(", ");
-  const lifecycleDescription = remoteSnapshot.status === "error"
-    ? t("The Shelby backup could not be read. Refresh the page or try again later.", "Không đọc được bản sao trên Shelby. Hãy làm mới trang hoặc thử lại sau.")
+  const lifecycleDescription = loadErrorCopy
+    ? loadErrorCopy.description
+    : remoteSnapshot.status === "error"
+      ? t("The Shelby backup could not be read. Refresh the page or try again later.", "Không đọc được bản sao trên Shelby. Hãy làm mới trang hoặc thử lại sau.")
     : !hasLocalRag && hasRemoteRag
       ? remoteSnapshot.status === "ready" && !remoteAssessment.fresh
         ? t(
@@ -506,7 +513,9 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
             <div className="min-w-0">
               <h2 className="truncate text-[15px] font-extrabold tracking-[-0.025em] text-[#101512] dark:text-white">{t("Shelby data library", "Kho dữ liệu Shelby")}</h2>
               <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
-                {t(`${blobs.length} blobs · ${indexedSources.length} on-device documents`, `${blobs.length} blobs · ${indexedSources.length} tài liệu trên máy`)}{hasLocalRag ? ` · ${formatStorage(localRagBytes)}` : ""}
+                {loadErrorCopy
+                  ? t(`Shelby unavailable · ${indexedSources.length} on-device documents`, `Shelby chưa khả dụng · ${indexedSources.length} tài liệu trên máy`)
+                  : t(`${blobs.length} blobs · ${indexedSources.length} on-device documents`, `${blobs.length} blobs · ${indexedSources.length} tài liệu trên máy`)}{hasLocalRag ? ` · ${formatStorage(localRagBytes)}` : ""}
               </p>
             </div>
           </div>
@@ -594,6 +603,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
             refreshRagStatus={refreshRagStatus}
             indexingAll={indexingAll}
             loading={loading}
+            loadError={loadError}
             fetchBlobs={fetchBlobs}
             handleIndexBlobs={handleIndexBlobs}
             pendingBlobNames={pendingBlobNames}

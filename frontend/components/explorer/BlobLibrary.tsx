@@ -15,7 +15,8 @@ import {
   Sparkles,
   Check,
   Gauge,
-  BrainCircuit
+  BrainCircuit,
+  CloudOff
 } from "lucide-react";
 import { getBlobAccessDecision, isRagSourceEligible } from "@/utils/blobAccess";
 import { getShelbyBlobUrl } from "@/utils/shelbyConfig";
@@ -25,6 +26,7 @@ import { useGeminiUsage } from "@/hooks/useGeminiUsage";
 import { estimateRagGeminiCalls } from "@/utils/ragCallEstimate";
 import type { EmbeddingProvider } from "@/utils/embeddingClient";
 import { useLanguage } from "@/i18n";
+import { getShelbyRefreshErrorCopy, type ShelbyServiceErrorKind } from "@/utils/shelbyErrors";
 
 interface BlobLibraryProps {
   account: any;
@@ -35,6 +37,7 @@ interface BlobLibraryProps {
   refreshRagStatus: () => Promise<void>;
   indexingAll: boolean;
   loading: boolean;
+  loadError: ShelbyServiceErrorKind | null;
   fetchBlobs: () => Promise<any[]>;
   handleIndexBlobs: (targets: any[], options?: { force?: boolean }) => Promise<void>;
   pendingBlobNames: Set<string>;
@@ -56,6 +59,7 @@ export function BlobLibrary({
   refreshRagStatus,
   indexingAll,
   loading,
+  loadError,
   fetchBlobs,
   handleIndexBlobs,
   pendingBlobNames,
@@ -67,12 +71,13 @@ export function BlobLibrary({
   ragChunkSize,
   effectiveEmbeddingMode,
 }: BlobLibraryProps) {
-  const { t } = useLanguage();
+  const { language, t } = useLanguage();
   const { preferences: geminiUsage } = useGeminiUsage();
   const [editingSource, setEditingSource] = useState("");
   const [editingTitle, setEditingTitle] = useState("");
   const [editingAliases, setEditingAliases] = useState("");
   const [hasCloudKey, setHasCloudKey] = useState(() => Boolean(getStoredCloudApiKey()));
+  const loadErrorCopy = loadError ? getShelbyRefreshErrorCopy(loadError, language) : null;
 
   useEffect(() => {
     const refreshCloudKey = () => setHasCloudKey(Boolean(getStoredCloudApiKey()));
@@ -100,6 +105,7 @@ export function BlobLibrary({
     if (policy?.type === "unknown" || policy?.type === "custom") return t("Unverified", "Không xác minh");
     const tag = decision.info.tag;
     if (tag === "time_lock" && decision.info.unlockAtMicros) {
+      if (decision.needsDecryption) return t("Time lock · needs decryption", "Time lock · cần giải mã");
       return decision.eligible ? t("Time lock · unlocked", "Time lock · mở") : t("Time lock · locked", "Time lock · khóa");
     }
     return tag === "allowlist" ? "Allowlist" : tag === "purchasable" ? "Purchasable" : "Public";
@@ -129,7 +135,8 @@ export function BlobLibrary({
     await refreshRagStatus();
   };
 
-  const renderRagStatus = (source?: RagSource) => {
+  const renderRagStatus = (source?: RagSource, needsDecryption = false, decryptionReason?: string) => {
+    if (needsDecryption) return <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-500/10 dark:text-amber-300" title={decryptionReason}><span className="h-1.5 w-1.5 rounded-full bg-amber-500" />{t("needs decryption", "cần giải mã")}</span>;
     if (!source) return <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-white/5 dark:text-slate-400"><span className="h-1.5 w-1.5 rounded-full bg-slate-300 dark:bg-slate-500" />{t("not indexed", "chưa nạp")}</span>;
     if (source.status === "indexed") {
       const statusTitle = source.type === "image"
@@ -267,7 +274,7 @@ export function BlobLibrary({
 
       {!indexingAll && blobs.length > 0 && (
         <p className="flex items-center gap-1.5 text-[10px] text-slate-400">
-          <Info className="h-3 w-3" />{t("Only Public files or unlocked Time lock files can be used to build RAG.", "Chỉ tệp công khai (Public) hoặc khóa thời gian đã mở (Time lock) mới đủ điều kiện tạo RAG.")}
+          <Info className="h-3 w-3" />{t("Public files can be indexed directly. Protected Time lock files also need decryption support after unlocking.", "Tệp Public có thể nạp trực tiếp. Time lock có lớp bảo vệ vẫn cần hỗ trợ giải mã sau khi mở khóa.")}
         </p>
       )}
 
@@ -298,6 +305,17 @@ export function BlobLibrary({
         {loading && blobs.length === 0 ? (
           <div className="space-y-3 p-4" role="status" aria-label={t("Loading blob list", "Đang tải danh sách blob")}>
             {[0, 1, 2, 3].map((item) => <div key={item} className="flex items-center gap-3"><span className="h-8 w-8 rounded-lg bg-slate-200/75 dark:bg-white/10" /><span className="h-3 flex-1 rounded bg-slate-200/75 dark:bg-white/10" /><span className="h-3 w-14 rounded bg-slate-100 dark:bg-white/5" /></div>)}
+          </div>
+        ) : loadErrorCopy && blobs.length === 0 ? (
+          <div data-testid="shelby-load-error" className="m-4 flex flex-1 flex-col items-center justify-center rounded-xl border border-amber-200/80 bg-amber-50/45 p-10 text-center dark:border-amber-300/10 dark:bg-amber-300/[0.035]">
+            <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-100 text-amber-700 dark:bg-amber-300/10 dark:text-amber-200">
+              <CloudOff className="h-6 w-6" />
+            </div>
+            <p className="mt-3 text-sm font-semibold text-slate-800 dark:text-slate-100">{loadErrorCopy.title}</p>
+            <p className="mt-1.5 max-w-md text-xs leading-5 text-slate-500 dark:text-slate-400">{loadErrorCopy.description}</p>
+            <Button size="sm" variant="outline" className="mt-5 rounded-xl px-5 font-bold" onClick={() => void fetchBlobs()}>
+              <RefreshCw className="mr-2 h-4 w-4" />{t("Try again", "Thử lại")}
+            </Button>
           </div>
         ) : blobs.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center p-10 text-center drag-drop-zone border border-dashed rounded-xl m-4 bg-[#fdfefa] dark:bg-white/[0.02]">
@@ -400,9 +418,11 @@ export function BlobLibrary({
                             <span>•</span>
                             <span>{getAccessLabel(b)}</span>
                             <span>•</span>
-                            {renderRagStatus(ragSource)}
+                            {renderRagStatus(ragSource, decision.needsDecryption, decision.reason)}
                           </div>
-                          {ragSource?.error && ragSource.status !== "indexed" && <p className="mt-1 line-clamp-1 max-w-[320px] text-[10px] leading-4 text-rose-600/80 dark:text-rose-300/70" title={userFacingRagError(ragSource.error)}>{userFacingRagError(ragSource.error)}</p>}
+                          {decision.needsDecryption
+                            ? <p className="mt-1 line-clamp-1 max-w-[320px] text-[10px] leading-4 text-amber-700/80 dark:text-amber-300/75" title={decision.reason}>{decision.reason}</p>
+                            : ragSource?.error && ragSource.status !== "indexed" && <p className="mt-1 line-clamp-1 max-w-[320px] text-[10px] leading-4 text-rose-600/80 dark:text-rose-300/70" title={userFacingRagError(ragSource.error)}>{userFacingRagError(ragSource.error)}</p>}
                         </div>
                       </div>
 

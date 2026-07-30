@@ -2,7 +2,7 @@
 
 ## Mục tiêu hiện tại
 
-DApp browser-first cho phép ví Aptos sở hữu blob Shelby, chọn tài liệu/ảnh để index RAG cục bộ, rồi hỏi bằng Gemini Cloud với key do người dùng nhập. RAG là **bộ nhớ bổ sung**, không thay thế kiến thức chung hay các tool dữ liệu thật.
+DApp browser-first cho phép ví Aptos sở hữu blob Shelby, chọn tài liệu/ảnh để index RAG cục bộ, rồi hỏi Qwen3.7 Flash qua gateway server-side. RAG là **bộ nhớ bổ sung**, không thay thế kiến thức chung hay các tool dữ liệu thật.
 
 ## Kiến trúc đang chạy (RAG v4)
 
@@ -13,7 +13,7 @@ DApp browser-first cho phép ví Aptos sở hữu blob Shelby, chọn tài liệ
 | Ingestion | `frontend/utils/textExtractor.ts`, `frontend/utils/pdfOcr.ts` | PDF.js dùng parsing worker chính thức; OCR `vie+eng` thích ứng hoặc quét sâu; canvas được giải phóng theo trang. |
 | Retrieval | `frontend/utils/queryRouter.ts`, `frontend/utils/embeddingClient.ts` | Exact/fuzzy page lookup deterministic; lexical + Gemini hoặc gateway embedding cho hybrid RAG. |
 | Chat/tools | `frontend/components/UnifiedChat.tsx`, `frontend/utils/chatTools.ts` | Route tool trước LLM; giữ 20 tin nhắn gần nhất theo ví; preview ảnh. |
-| AI provider | `frontend/utils/aiProvider.ts` | Gemini Cloud cho chat, function calling, vision và OCR cloud; không có local text-generation model. |
+| AI provider | `frontend/utils/openRouterProvider.ts`, `api/ai/v1/chat.ts`, `frontend/utils/aiProvider.ts` | Qwen3.7 Flash mặc định cho chat/tool calling; Gemini key của user chỉ còn tùy chọn cho vision/OCR/embedding khi tạo RAG. |
 | Agent policy | `agent/AGENT.md`, `agent/skills/*/SKILL.md`, `frontend/utils/agentPolicy.ts` | System instruction và skill pack chọn theo intent; hoàn toàn tách khỏi context RAG. |
 
 ## Luồng xử lý
@@ -22,7 +22,7 @@ DApp browser-first cho phép ví Aptos sở hữu blob Shelby, chọn tài liệ
 2. Người dùng chọn **Nạp nhanh** hoặc **Quét sâu**. PDF.js parse PDF trong worker chính thức; text layer được dùng trước, bìa/trang ít chữ được OCR. Gemini chỉ được dùng cho content analysis/OCR khi user bật consent và có key; nếu không, PDF dùng Tesseract trong browser.
 3. Manifest/page/chunk được commit atomically vào IndexedDB. Refresh không phải index lại; nạp lại không nhân đôi.
 4. Chat chạy query router và tool deterministic trước. Exact quote trả trang trực tiếp, không giao cho LLM phủ nhận.
-5. Gemini nhận agent policy + skill scoped trước; RAG evidence chỉ được thêm vào prompt khi intent thuộc dữ liệu người dùng.
+5. Qwen nhận agent policy + skill scoped trước; RAG evidence chỉ được thêm qua tool khi câu hỏi thực sự cần dữ liệu người dùng.
 5. Với câu hỏi về tài liệu, LLM chỉ khẳng định điều có trong RAG và phải citation. Với kiến thức chung, LLM trả lời bình thường, không citation giả.
 
 ## Tool hiện có
@@ -38,7 +38,7 @@ DApp browser-first cho phép ví Aptos sở hữu blob Shelby, chọn tài liệ
 
 ## Các invariant quan trọng
 
-- Không dùng `VITE_GEMINI_API_KEY`. Người dùng nhập key, xác thực rồi key chỉ được lưu trong `sessionStorage` của tab; có nút xoá.
+- Không dùng `VITE_OPENROUTER_API_KEY` hoặc `VITE_GEMINI_API_KEY`. OpenRouter key chỉ ở Vercel server; Gemini key tùy chọn của người dùng chỉ ở `sessionStorage` của tab.
 - RAG và lịch sử chat **tách theo wallet address**. Đổi ví xoá RAG của ví cũ khỏi runtime browser để không lộ dữ liệu chéo.
 - Không đưa toàn bộ ảnh vào mỗi prompt. Ảnh chỉ đính kèm/preview khi liên quan.
 - Retrieval phải lọc modality: câu sách/PDF chỉ nhận text chunks; câu ảnh chỉ nhận image descriptions.

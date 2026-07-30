@@ -6,7 +6,7 @@ const source = (overrides: Partial<RagSource> = {}): RagSource => ({ source: "bo
 
 describe("RAG lifecycle", () => {
   it("builds one shared pipeline revision for ingestion and dashboard freshness", () => {
-    expect(ragPipelineRevision({ fullPdfOcr: true, cloudContentAnalysis: true, embeddingMode: "gemini", ragChunkSize: 1200 })).toBe("v10:quota-controls:quality-ocr-all:cloud-read-on:embedding-gemini:chunk-1200");
+    expect(ragPipelineRevision({ fullPdfOcr: true, cloudContentAnalysis: true, embeddingMode: "gemini", ragChunkSize: 1200 })).toBe("v11:content-sniffer-v2:quota-controls:quality-ocr-all:cloud-read-on:embedding-gemini:chunk-1200");
   });
   it("retries skipped blobs only when the ingestion pipeline changes", () => {
     expect(needsLocalIndex(source(), "100:123:public:pipeline")).toBe(false);
@@ -20,8 +20,28 @@ describe("RAG lifecycle", () => {
       revision: "100:123:public:v10:quota-controls:quality-ocr-smart:cloud-read-on:embedding-gemini:chunk-1200",
       embeddingProvider: "gemini",
     });
-    const safeDefaults = "100:123:public:v10:quota-controls:quality-ocr-smart:cloud-read-off:embedding-off:chunk-1200";
+    const safeDefaults = "100:123:public:v11:content-sniffer-v2:quota-controls:quality-ocr-smart:cloud-read-off:embedding-off:chunk-1200";
     expect(needsLocalIndex(existing, safeDefaults)).toBe(false);
+  });
+
+  it("retries a v10 skipped blob once after the content detector is upgraded", () => {
+    const skipped = source({
+      status: "skipped",
+      revision: "100:123:public:v10:quota-controls:quality-ocr-smart:cloud-read-off:embedding-off:chunk-1200",
+    });
+    const upgraded = "100:123:public:v11:content-sniffer-v2:quota-controls:quality-ocr-smart:cloud-read-off:embedding-off:chunk-1200";
+    expect(needsLocalIndex(skipped, upgraded)).toBe(true);
+    expect(needsLocalIndex({ ...skipped, revision: upgraded }, upgraded)).toBe(false);
+  });
+
+  it("does not retry a known ZIP/Office skip only because the sniffer revision changed", () => {
+    const skipped = source({
+      source: "archive.docx",
+      status: "skipped",
+      revision: "100:123:public:v10:quota-controls:quality-ocr-smart:cloud-read-off:embedding-off:chunk-1200",
+    });
+    const upgraded = "100:123:public:v11:content-sniffer-v2:quota-controls:quality-ocr-smart:cloud-read-off:embedding-off:chunk-1200";
+    expect(needsLocalIndex(skipped, upgraded)).toBe(false);
   });
 
   it("migrates a compatible v9 auto index without forcing a quota-spending rebuild", () => {
@@ -29,13 +49,13 @@ describe("RAG lifecycle", () => {
       revision: "100:123:public:v9:mp4-hot-rag:quality-ocr-smart:embedding-auto:chunk-1200",
       embeddingProvider: "gemini",
     });
-    const safeDefaults = "100:123:public:v10:quota-controls:quality-ocr-smart:cloud-read-off:embedding-off:chunk-1200";
+    const safeDefaults = "100:123:public:v11:content-sniffer-v2:quota-controls:quality-ocr-smart:cloud-read-off:embedding-off:chunk-1200";
     expect(needsLocalIndex(existing, safeDefaults)).toBe(false);
   });
 
   it("does request an update when a previously disabled enrichment is enabled", () => {
     const existing = source({ revision: "100:123:public:v10:quota-controls:quality-ocr-smart:cloud-read-off:embedding-off:chunk-1200", embeddingStatus: "unavailable" });
-    const enriched = "100:123:public:v10:quota-controls:quality-ocr-smart:cloud-read-on:embedding-gemini:chunk-1200";
+    const enriched = "100:123:public:v11:content-sniffer-v2:quota-controls:quality-ocr-smart:cloud-read-on:embedding-gemini:chunk-1200";
     expect(needsLocalIndex(existing, enriched)).toBe(true);
   });
 

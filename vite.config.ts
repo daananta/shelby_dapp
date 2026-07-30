@@ -5,10 +5,14 @@ import { defineConfig, loadEnv } from "vite";
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const forbiddenClientSecrets = Object.keys(env).filter((name) =>
-    name.startsWith("VITE_") && /(PRIVATE_KEY|SECRET|SPONSOR|GEMINI_API_KEY)/i.test(name),
+    name.startsWith("VITE_") && /(PRIVATE_KEY|SECRET|SPONSOR|GEMINI_API_KEY|OPENROUTER_API_KEY)/i.test(name),
   );
   if (forbiddenClientSecrets.length) {
     throw new Error(`Từ chối build: secret không được dùng tiền tố VITE_: ${forbiddenClientSecrets.join(", ")}`);
+  }
+  const shelbyClientKey = env.VITE_SHELBY_CLIENT_API_KEY?.trim().replace(/^["']|["']$/g, "") ?? "";
+  if (shelbyClientKey && !/^AG-\S+$/i.test(shelbyClientKey)) {
+    throw new Error("Từ chối build: VITE_SHELBY_CLIENT_API_KEY chỉ nhận Geomi client key công khai có prefix AG-. Không dùng server key aptoslabs_ trong frontend.");
   }
 
   return ({

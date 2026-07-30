@@ -6,13 +6,14 @@ import { Input } from "@/components/ui/input";
 import { ArrowDown, Bookmark, ChevronDown, Cloud, Database, FileCheck2, Fingerprint, KeyRound, MessageSquare, Send, ShieldCheck, Sparkles, Square, Trash2, X } from "lucide-react";
 import { deactivateActiveRagOwner, getPageRecord, getRagSources, hasRemoteRagProvider, isHotRemoteRagProvider, lookupExactQuote, searchDocuments, setActiveRagOwner } from "@/utils/ragOrama";
 import type { AnswerReceipt, RetrievalResult } from "@/utils/ragTypes";
-import { clearStoredCloudApiKey, getCloudErrorKind, getStoredCloudApiKey, normalizeCloudError, resolveConversationRouteWithCloud, storeCloudApiKey, streamCloudAgentAnswer, verifyCloudApiKey } from "@/utils/aiProvider";
+import { clearStoredCloudApiKey, getCloudErrorKind, getStoredCloudApiKey, isCloudProviderError, normalizeCloudError, resolveConversationRouteWithCloud, storeCloudApiKey, verifyCloudApiKey } from "@/utils/aiProvider";
+import { streamHostedAgentAnswer } from "@/utils/openRouterProvider";
 import { asksForLiveBlobInventoryRefresh, blobInventoryDetailForQuestion, createChatToolObservation, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, runChatTool, type ChatToolResult } from "@/utils/chatTools";
 import { classifyQueryIntent } from "@/utils/queryRouter";
 import { buildAdaptiveAgentSystemInstruction, isInternalGuideSource } from "@/utils/agentPolicy";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { isMockWorkspace } from "@/utils/devMode";
+import { isE2EWalletConnected } from "@/utils/devMode";
 import { buildAdaptiveGeminiHistory } from "@/utils/conversationMemory";
 import { createChatMessage, type ChatMessage, useChatManager } from "@/hooks/useChatManager";
 import { assignCitationIds, createAnswerReceipt, finalizeCitationGrounding } from "@/utils/answerReceipt";
@@ -20,6 +21,7 @@ import { AnswerReceiptPanel } from "@/components/chat/AnswerReceiptPanel";
 import { LiveProofMeter } from "@/components/chat/LiveProofMeter";
 import { useGeminiUsage } from "@/hooks/useGeminiUsage";
 import type { HotRagProofSnapshot } from "@/utils/hotRagProof";
+import { normalizeGeminiApiKey } from "@/utils/geminiApiKey";
 import { useLanguage } from "@/i18n";
 import type { BlobInventoryRefreshCapability } from "@/utils/agentCapabilities";
 const MOCK_ACCOUNT = { address: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef" };
@@ -51,20 +53,20 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
     const normalized = normalizeCloudError(error);
     if (language === "vi") return normalized.message;
     const kind = getCloudErrorKind(error);
-    if (kind === "rate_limit") return "Gemini returned 429: this API key's project is rate-limited or out of quota. Keys in the same Google Cloud project share quota.";
+    if (kind === "rate_limit") return "Gemini temporarily limited this request (429). The API key was not rejected; wait and try again, or check this model's usage and rate limits.";
     if (kind === "invalid_key") return "The Gemini API key is invalid or cannot access this model.";
     if (kind === "network") return "Unable to reach Gemini. Check your network and try again.";
     return "Gemini did not respond.";
   };
   const { preferences: geminiUsage } = useGeminiUsage();
   const { account: realAccount } = useWallet();
-  const account = isMockWorkspace()
+  const account = isE2EWalletConnected()
     ? MOCK_ACCOUNT
     : realAccount;
   const ownerKey = account?.address.toString().toLowerCase() ?? "disconnected";
   const { query, setQuery, messages, setMessages, loading, status, setStatus, beginRequest, isRequestCurrent, finishRequest, abortRequest, clearMessages } = useChatManager(ownerKey);
   const [cloudApiKey, setCloudApiKey] = useState("");
-  const [cloudKeyState, setCloudKeyState] = useState<"empty" | "checking" | "ready" | "limited" | "invalid">("empty");
+  const [cloudKeyState, setCloudKeyState] = useState<"empty" | "checking" | "ready" | "limited" | "unverified" | "invalid">("empty");
   const keyCheckGenerationRef = useRef(0);
   const [activeVisualSource, setActiveVisualSource] = useState<RetrievalResult | null>(null);
   const [activeReceipt, setActiveReceipt] = useState<AnswerReceipt | null>(null);
@@ -221,32 +223,59 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
   }, [account]);
 
   const saveCloudKey = async () => {
-    const candidate = cloudApiKey.trim();
+    const candidate = normalizeGeminiApiKey(cloudApiKey);
     if (!candidate) return;
+    const previousStoredKey = getStoredCloudApiKey();
+    const previousCloudKeyState = cloudKeyState;
     const checkGeneration = ++keyCheckGenerationRef.current;
-    const storedKey = getStoredCloudApiKey();
-    if (storedKey && storedKey !== candidate) clearStoredCloudApiKey();
     try {
       setCloudKeyState("checking");
       setStatus(t(`Checking key …${candidate.slice(-4)} with Gemini…`, `Đang kiểm tra key …${candidate.slice(-4)} với Gemini…`));
       const model = await verifyCloudApiKey(candidate);
       if (checkGeneration !== keyCheckGenerationRef.current) return;
+      setCloudApiKey(candidate);
       storeCloudApiKey(candidate);
       setCloudKeyState("ready");
       setStatus(t(`✓ Key …${candidate.slice(-4)} works with ${model}.`, `✓ Key …${candidate.slice(-4)} hoạt động với ${model}.`));
     } catch (error) {
       if (checkGeneration !== keyCheckGenerationRef.current) return;
-      clearStoredCloudApiKey();
+      const kind = getCloudErrorKind(error);
       const normalizedMessage = cloudErrorMessage(error);
-      if (getCloudErrorKind(error) === "rate_limit") {
+      if (kind === "rate_limit") {
+        setCloudApiKey(candidate);
+        storeCloudApiKey(candidate);
         setCloudKeyState("limited");
         setStatus(t(
-          `⚠ Key …${candidate.slice(-4)} was not activated. ${normalizedMessage} If this is a new key, make sure it belongs to a different project.`,
-          `⚠ Key …${candidate.slice(-4)} chưa được kích hoạt. ${normalizedMessage} Nếu đây là key mới, hãy chắc chắn nó thuộc project khác.`,
+          `⚠ Key …${candidate.slice(-4)} was saved locally. ${normalizedMessage} You do not need to enter it again; wait, then select Try again.`,
+          `⚠ Key …${candidate.slice(-4)} đã được lưu cục bộ. ${normalizedMessage} Bạn không cần nhập lại; hãy chờ rồi chọn Thử lại.`,
         ));
+      } else if (kind === "invalid_key") {
+        if (previousStoredKey && previousStoredKey !== candidate) {
+          setCloudApiKey(previousStoredKey);
+          setCloudKeyState(
+            previousCloudKeyState === "ready"
+              || previousCloudKeyState === "limited"
+              || previousCloudKeyState === "unverified"
+              ? previousCloudKeyState
+              : "unverified",
+          );
+          setStatus(t(
+            `✕ Unable to use key …${candidate.slice(-4)}: ${normalizedMessage} Previous key …${previousStoredKey.slice(-4)} remains active.`,
+            `✕ Không thể dùng key …${candidate.slice(-4)}: ${normalizedMessage} Key trước đó …${previousStoredKey.slice(-4)} vẫn hoạt động.`,
+          ));
+        } else {
+          clearStoredCloudApiKey();
+          setCloudKeyState("invalid");
+          setStatus(t(`✕ Unable to use key …${candidate.slice(-4)}: ${normalizedMessage}`, `✕ Không thể dùng key …${candidate.slice(-4)}: ${normalizedMessage}`));
+        }
       } else {
-        setCloudKeyState("invalid");
-        setStatus(t(`✕ Unable to use key …${candidate.slice(-4)}: ${normalizedMessage}`, `✕ Không thể dùng key …${candidate.slice(-4)}: ${normalizedMessage}`));
+        setCloudApiKey(candidate);
+        storeCloudApiKey(candidate);
+        setCloudKeyState("unverified");
+        setStatus(t(
+          `Key …${candidate.slice(-4)} was saved locally but could not be verified: ${normalizedMessage} Try again when the connection is available.`,
+          `Key …${candidate.slice(-4)} đã được lưu cục bộ nhưng chưa thể kiểm tra: ${normalizedMessage} Hãy thử lại khi kết nối ổn định.`,
+        ));
       }
     }
   };
@@ -254,7 +283,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
   const handleAsk = async (presetQuestion?: string) => {
     const userQuery = (presetQuestion ?? query).trim();
     if (!userQuery || loading) return;
-    const chatApiKey = geminiUsage.chat && cloudKeyState === "ready" ? getStoredCloudApiKey() : "";
+    const geminiApiKey = cloudKeyState === "ready" ? getStoredCloudApiKey() : "";
     const request = beginRequest();
     const { signal } = request;
     let pendingMessageId: string | undefined;
@@ -315,8 +344,8 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       }));
       const availableSources = [...new Set(recentTurns.flatMap((turn) => turn.sources))];
       const hasRecentImage = messages.slice(-3).some((message) => Boolean(message.imageUrls?.length));
-      const cloudRoute = geminiUsage.chat && cloudKeyState === "ready" && routed.intent === "general" && hasRecentImage && availableSources.length
-        ? await resolveConversationRouteWithCloud({ question: userQuery, recentTurns, availableSources, cloudApiKey: chatApiKey, signal })
+      const cloudRoute = geminiUsage.contentAnalysis && geminiApiKey && routed.intent === "general" && hasRecentImage && availableSources.length
+        ? await resolveConversationRouteWithCloud({ question: userQuery, recentTurns, availableSources, cloudApiKey: geminiApiKey, signal })
         : null;
       assertRequestCurrent();
       const resolvedScope = cloudRoute && cloudRoute.confidence >= 0.55 ? cloudRoute.scope : null;
@@ -343,7 +372,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
         )
       );
       const letAgentPhraseInventory = Boolean(
-        chatApiKey
+        geminiUsage.chat
         && toolResult?.name === "blob_inventory"
         && inventoryDetail !== "all"
         && (
@@ -369,7 +398,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
         deferredToolFallback = readBlobInventory(inventoryDetail, { language });
       }
       const localInventoryFallback = deferredToolFallback;
-      if (!chatApiKey && localInventoryFallback) {
+      if (!geminiUsage.chat && localInventoryFallback) {
         updateCurrentMessages((previous) => [...previous, createChatMessage({
           role: "ai",
           text: localInventoryFallback.text,
@@ -381,11 +410,11 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
         })]);
         return;
       }
-      if (!chatApiKey) {
-        updateCurrentMessages((previous) => [...previous, createChatMessage({ role: "ai", text: geminiUsage.chat
-          ? t("Connect a Gemini API key to ask general questions. Wallet and Shelby data tools still work without a key.", "Hãy kết nối Gemini API key để hỏi kiến thức chung. Các công cụ ví và kho Shelby vẫn dùng được khi chưa có key.")
-          : t("AI chat is off to save quota. You can enable it in Settings; wallet and Shelby data tools remain available.", "Trò chuyện với AI đang tắt để tiết kiệm quota. Bạn có thể bật lại trong tab Cấu hình; các công cụ ví và kho Shelby vẫn dùng được.")
-        })]);
+      if (!geminiUsage.chat) {
+        updateCurrentMessages((previous) => [...previous, createChatMessage({ role: "ai", text: t(
+          "AI chat is off. You can enable it in Settings; wallet and Shelby data tools remain available.",
+          "Trò chuyện với AI đang tắt. Bạn có thể bật lại trong Cấu hình; các công cụ ví và kho Shelby vẫn dùng được.",
+        ) })]);
         return;
       }
       let relevantDocs: RetrievalResult[] = [];
@@ -403,8 +432,8 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       let inventoryRefreshSucceeded = false;
       let inventoryReadAfterRefresh = false;
       let agentToolResult: ChatToolResult | null = null;
-      await streamCloudAgentAnswer(
-        { contents, cloudApiKey: chatApiKey, systemInstruction: buildAdaptiveAgentSystemInstruction() },
+      await streamHostedAgentAnswer(
+        { contents, systemInstruction: buildAdaptiveAgentSystemInstruction() },
         (chunk) => {
           if (signal.aborted || !isRequestCurrent(request)) return;
           streamedText += chunk;
@@ -610,14 +639,15 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
           updateCurrentMessages((previous) => [...previous, createChatMessage({ role: "ai", text: t("Request stopped.", "Đã dừng yêu cầu."), interrupted: true })]);
         }
       } else {
-        const cloudErrorKind = getCloudErrorKind(error);
-        if (cloudErrorKind === "rate_limit") {
-          clearStoredCloudApiKey();
+        const cloudProviderError = isCloudProviderError(error);
+        const cloudErrorKind = cloudProviderError ? error.kind : "other";
+        const limitedKeyIsStillActive = Boolean(geminiApiKey) && getStoredCloudApiKey() === geminiApiKey;
+        if (cloudProviderError && cloudErrorKind === "rate_limit" && limitedKeyIsStillActive) {
           setCloudKeyState("limited");
           setShowApiPanel(true);
           setStatus(t(
-            `The project for key …${cloudApiKey.slice(-4)} is rate-limited by Gemini. The key has been paused to avoid more failed requests.`,
-            `Project của key …${cloudApiKey.slice(-4)} đang bị Gemini giới hạn. Key đã tạm ngừng để tránh gửi thêm request thất bại.`,
+            `Gemini temporarily limited the request for key …${geminiApiKey.slice(-4)}. The key remains saved locally; wait, then select Try again.`,
+            `Gemini đang tạm giới hạn yêu cầu của key …${geminiApiKey.slice(-4)}. Key vẫn được lưu cục bộ; hãy chờ rồi chọn Thử lại.`,
           ));
           preserveStatus = true;
         }
@@ -643,7 +673,11 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
           preserveStatus = true;
           return;
         }
-        const errorText = `❌ ${pendingMessageId ? cloudErrorMessage(error) : error instanceof Error ? error.message : String(error)}`;
+        const errorText = `❌ ${pendingMessageId && cloudProviderError
+          ? cloudErrorMessage(error)
+          : error instanceof Error
+            ? error.message
+            : String(error)}`;
         if (pendingMessageId) {
           updateCurrentMessages((previous) => previous.map((message) => message.id === pendingMessageId ? { ...message, typing: false, interrupted: Boolean(message.text), text: message.text || errorText } : message));
         } else {
@@ -761,10 +795,10 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             {/* Inline status chips */}
             <div className="hidden items-center gap-3 sm:flex">
               <span className={ragReady ? "status-chip ok" : "status-chip"} title={ragMode === "hot" ? t("Fetch only relevant parts from Shelby", "Chỉ đọc các phần liên quan từ Shelby") : t("Reference data", "Dữ liệu tham khảo")}><span className={`status-dot ${ragReady ? "green" : "gray"}`} /> {ragMode === "hot" ? t("Reading from Shelby", "Đọc từ Shelby") : ragReady ? t("Data ready", "Đã có dữ liệu") : t("No data yet", "Chưa có dữ liệu")}</span>
-              <span className={geminiUsage.chat ? "status-chip ok" : "status-chip"} title={geminiUsage.chat ? "Gemini AI" : t("AI chat is off in Settings", "Chat AI đang tắt trong Cấu hình")}><span className={`status-dot ${!geminiUsage.chat ? "gray" : cloudKeyState === "ready" ? "green" : "amber"}`} /> {geminiUsage.chat ? "Gemini" : t("Chat off", "Chat đã tắt")}</span>
+              <span className={geminiUsage.chat ? "status-chip ok" : "status-chip"} title={geminiUsage.chat ? t("Qwen3.7 Flash is provided by this app", "Ứng dụng cung cấp sẵn Qwen3.7 Flash") : t("AI chat is off in Settings", "Chat AI đang tắt trong Cấu hình")}><span className={`status-dot ${geminiUsage.chat ? "green" : "gray"}`} /> {geminiUsage.chat ? "Qwen 3.7" : t("Chat off", "Chat đã tắt")}</span>
             </div>
-            <button className="flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-bold text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-900 dark:hover:bg-white/[0.05] dark:hover:text-white" onClick={() => setShowApiPanel((value) => !value)}>
-              <KeyRound className="h-3.5 w-3.5" /> {!geminiUsage.chat ? t("Chat off", "Chat đã tắt") : cloudKeyState === "ready" ? t("Connected", "Đã kết nối") : t("Connect AI", "Kết nối AI")}
+            <button className="flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-bold text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-900 dark:hover:bg-white/[0.05] dark:hover:text-white" onClick={() => setShowApiPanel((value) => !value)} title={t("Optional Gemini key for RAG content processing", "Gemini key tùy chọn để xử lý nội dung RAG")}>
+              <KeyRound className="h-3.5 w-3.5" /> {cloudKeyState === "ready" ? t("RAG AI ready", "AI tạo RAG sẵn sàng") : t("RAG AI optional", "AI tạo RAG tùy chọn")}
             </button>
             {messages.length > 0 && (
               <button
@@ -785,18 +819,16 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             <span className="text-[11px] font-bold text-emerald-700 dark:text-lime-300">{t("Open Settings", "Mở Cấu hình")} →</span>
           </button>
         )}
-        {geminiUsage.chat && cloudKeyState !== "ready" && !showApiPanel && (
-          <button onClick={() => setShowApiPanel(true)} className="mx-4 mt-3 flex items-center justify-between rounded-xl bg-[#f0f2ed] px-3 py-2 text-left transition-colors hover:bg-[#e9ede6] dark:bg-white/[0.035] dark:hover:bg-white/[0.055]">
-            <span className="flex items-center gap-2 text-[12px] font-semibold text-slate-600 dark:text-slate-300"><KeyRound className="h-3.5 w-3.5 text-[#487450] dark:text-lime-300" />{t("Connect Gemini to start chatting", "Kết nối Gemini để bắt đầu trò chuyện")}</span>
-            <span className="text-[11px] font-bold text-[#315f3e] dark:text-lime-300">{t("Set up", "Thiết lập")} →</span>
-          </button>
-        )}
         {showApiPanel ? (
           <div className="mx-4 mt-3 rounded-xl border border-[#dfe4dc] bg-[#f5f6f2] p-3 dark:border-white/[0.06] dark:bg-white/[0.025]">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-[12px] font-semibold text-slate-600 dark:text-slate-400">Gemini API Key</span>
+              <div>
+                <span className="block text-[12px] font-semibold text-slate-700 dark:text-slate-300">{t("Chat uses Qwen3.7 Flash by default", "Chat mặc định dùng Qwen3.7 Flash")}</span>
+                <span className="mt-0.5 block text-[10px] text-slate-500 dark:text-slate-400">{t("No API key is required for chat. Gemini below is optional for OCR, images, video, and semantic indexing.", "Chat không cần API key. Gemini bên dưới chỉ tùy chọn cho OCR, ảnh, video và lập chỉ mục ngữ nghĩa.")}</span>
+              </div>
               <button className="text-[11px] text-slate-400 hover:text-slate-600" onClick={() => setShowApiPanel(false)}>{t("Close", "Đóng")}</button>
             </div>
+            <span className="mb-1.5 block text-[11px] font-semibold text-slate-500 dark:text-slate-400">{t("Optional Gemini API key for building RAG", "Gemini API key tùy chọn để tạo RAG")}</span>
             <div className="flex gap-1.5">
               <Input
                 type="password"
@@ -809,13 +841,17 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
                 onChange={(event) => {
                   const nextKey = event.target.value;
                   keyCheckGenerationRef.current += 1;
-                  if (getStoredCloudApiKey() && getStoredCloudApiKey() !== nextKey.trim()) clearStoredCloudApiKey();
                   setCloudApiKey(nextKey);
-                  setCloudKeyState("empty");
+                  setCloudKeyState((current) => {
+                    if (!getStoredCloudApiKey()) return "empty";
+                    return current === "ready" || current === "limited" || current === "unverified"
+                      ? current
+                      : "unverified";
+                  });
                   setStatus("");
                 }}
                 onKeyDown={(event) => event.key === "Enter" && void saveCloudKey()}
-                placeholder={t("Paste Gemini API key…", "Dán Gemini API key…")}
+                placeholder={t("Paste optional Gemini API key…", "Dán Gemini API key tùy chọn…")}
               />
               <Button
                 size="sm"
@@ -823,17 +859,22 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
                 onClick={() => void saveCloudKey()}
                 disabled={!cloudApiKey || cloudKeyState === "checking"}
               >
-                {cloudKeyState === "checking" ? <><KeyRound className="mr-1.5 h-3.5 w-3.5" />{t("Checking", "Đang kiểm tra")}</> : cloudKeyState === "limited" ? t("Try again", "Thử lại") : t("Save & check", "Lưu & kiểm tra")}
+                {cloudKeyState === "checking"
+                  ? <><KeyRound className="mr-1.5 h-3.5 w-3.5" />{t("Checking", "Đang kiểm tra")}</>
+                  : (cloudKeyState === "limited" || cloudKeyState === "unverified")
+                    && normalizeGeminiApiKey(cloudApiKey) === getStoredCloudApiKey()
+                    ? t("Try again", "Thử lại")
+                    : t("Save & check", "Lưu & kiểm tra")}
               </Button>
-              {cloudKeyState === "ready" && (
+              {(cloudKeyState === "ready" || cloudKeyState === "limited" || cloudKeyState === "unverified") && (
                 <Button size="sm" variant="ghost" className="h-8 text-[11px] text-slate-400" onClick={() => { clearStoredCloudApiKey(); setCloudApiKey(""); setCloudKeyState("empty"); setStatus(t("API key removed.", "Đã xoá API key.")); }}>{t("Remove", "Xoá")}</Button>
               )}
             </div>
             <div className="flex items-center justify-between mt-1.5">
               <p className={`text-[11px] leading-4 ${cloudKeyState === "ready" ? "text-emerald-600 dark:text-emerald-400" : "text-slate-400"}`}>
-                {t("The key is used only for features enabled in Settings. It is never stored in RAG/Shelby and is cleared when the tab closes.", "Key chỉ được dùng cho các mục bạn bật trong Cấu hình, không vào RAG/Shelby và bị xoá khi đóng tab.")}
+                {t("This optional Gemini key stays only in this browser tab. It is never added to RAG or uploaded to Shelby.", "Gemini key tùy chọn chỉ được lưu trong phiên tab này. Key không được đưa vào RAG hay tải lên Shelby.")}
               </p>
-              {cloudApiKey.trim() && <span className="shrink-0 pl-3 font-mono text-[10px] font-bold text-slate-500 dark:text-slate-400">Key …{cloudApiKey.trim().slice(-4)}</span>}
+              {normalizeGeminiApiKey(cloudApiKey) && <span className="shrink-0 pl-3 font-mono text-[10px] font-bold text-slate-500 dark:text-slate-400">Key …{normalizeGeminiApiKey(cloudApiKey).slice(-4)}</span>}
             </div>
           </div>
         ) : null}
@@ -857,7 +898,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
                 </p>
                 <p className="mb-5 max-w-md text-[13px] leading-5 text-slate-500 dark:text-slate-400">
                   {!geminiUsage.chat
-                    ? t("AI chat is off, but you can still inspect the wallet, count blobs, and browse Shelby without using Gemini quota.", "Chat AI đang tắt, nhưng bạn vẫn có thể kiểm tra ví, đếm blob và xem kho Shelby mà không dùng quota Gemini.")
+                    ? t("AI chat is off, but you can still inspect the wallet, count blobs, and browse Shelby.", "Chat AI đang tắt, nhưng bạn vẫn có thể kiểm tra ví, đếm blob và xem kho Shelby.")
                     : ragReady
                       ? t("Ask naturally. AI consults your knowledge base only when needed and attaches sources you can inspect.", "Bạn cứ hỏi tự nhiên. AI chỉ dùng kho dữ liệu khi câu hỏi thật sự cần và sẽ đính kèm nguồn để bạn kiểm tra.")
                       : t("General questions work now; document questions become available after you create a RAG.", "Bạn có thể hỏi kiến thức chung ngay; câu hỏi về tài liệu sẽ khả dụng sau khi tạo RAG.")}

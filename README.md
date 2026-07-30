@@ -63,8 +63,9 @@ Shelby SDK hiện không chuẩn hoá các tag này trong `BlobMetadata`; chúng
 
 ## Cloud AI hiện tại
 
-- **Cloud chat**: người dùng tự nhập Gemini API key rồi nhấn Enter hoặc **Lưu**. App xác thực trực tiếp với Gemini và chỉ giữ key trong `sessionStorage` của tab hiện tại. Key bị xoá khi đóng tab, không nằm trong chat/RAG snapshot và không gửi tới Shelby. Bản cũ từng lưu key dài hạn trong `localStorage` sẽ bị xoá thay vì tự di chuyển.
-- **Không có local text-generation model**: chat hiện dùng Gemini Cloud. PDF OCR vẫn có fallback Tesseract chạy trong browser, còn lexical retrieval và page lookup tiếp tục hoạt động khi không có Gemini key.
+- **Chat mặc định**: dùng `qwen/qwen3.7-flash` qua Vercel function `api/ai/v1/chat.ts`. `OPENROUTER_API_KEY` chỉ tồn tại ở server; trình duyệt không nhận key. Model có thể chọn các tool RAG/blob read-only, nhưng tool vẫn chạy trong browser dưới harness giới hạn số vòng/lượt gọi.
+- **Gemini tùy chọn khi tạo RAG**: người dùng có thể nhập key riêng cho OCR cloud, đọc ảnh/video và semantic embedding. Key chỉ ở `sessionStorage` của tab, không nằm trong chat/RAG snapshot và không gửi tới Shelby.
+- **Fallback local**: PDF OCR có Tesseract trong browser; lexical retrieval và page lookup vẫn hoạt động khi không có Gemini key.
 
 ## Công cụ chat
 
@@ -85,21 +86,22 @@ Những kết quả này được gắn nhãn **công cụ** trong chat để ph
 | Biến | Mặc định | Mục đích |
 | --- | --- | --- |
 | `VITE_APP_NETWORK` | `testnet` | Network Shelby/Aptos SDK |
-| `VITE_APTOS_API_KEY` | trống | API key cho RPC/Shelby khi cần |
+| `VITE_SHELBY_CLIENT_API_KEY` | trống | Geomi **client key** `AG-…` dành cho frontend, dùng với Shelby Indexer/RPC và Aptos RPC |
 | `VITE_SHELBY_BLOB_API_URL` | Shelby testnet blob endpoint | Public endpoint download blob/model |
 | `VITE_ACCESS_CONTROL_MODULE_ADDRESS` | Testnet reference deployment | Module chứa `access_control::query3_bcs` và `purchase` |
 | `VITE_RAG_ACCESS_BROKER_URL` | trống | Gateway tùy chọn cho một schema tag ngoài access-control contract |
 | `VITE_RAG_PIPELINE_API_URL` | trống | Base URL của hosted embedding gateway, ví dụ `/api/rag` |
 | `GEMINI_API_KEY` | trống | **Server-only**, dùng bởi Vercel function `api/rag/v1/embeddings.ts` |
-| `APP_ORIGIN` | bắt buộc ở production | Origin duy nhất được gọi embedding gateway |
+| `OPENROUTER_API_KEY` | trống | **Server-only**, dùng bởi Vercel function `api/ai/v1/chat.ts` |
+| `APP_ORIGIN` | bắt buộc ở production | Origin duy nhất được gọi AI/embedding gateway |
 | `RAG_GATEWAY_ALLOW_SERVER_CALLS` | `false` | Cho phép request không có header Origin (chỉ bật cho server tin cậy) |
 
-Không cấu hình `VITE_GEMINI_API_KEY`, `VITE_*PRIVATE_KEY`, `VITE_*SECRET` hoặc `VITE_*SPONSOR*`. Vite build sẽ chủ động từ chối các tên biến này. Key sinh câu trả lời là dữ liệu riêng của người dùng; secret phía máy chủ chỉ được phép tồn tại ở backend. Sao chép `.env.example` để bắt đầu; không commit `.env`.
+Không cấu hình `VITE_GEMINI_API_KEY`, `VITE_APTOS_API_KEY`, `VITE_*PRIVATE_KEY`, `VITE_*SECRET` hoặc `VITE_*SPONSOR*`. `VITE_SHELBY_CLIENT_API_KEY` chỉ nhận client key công khai có prefix `AG-`; server key `aptoslabs_…` phải nằm ở backend và cần được xoay vòng nếu từng xuất hiện trong bundle trình duyệt. Vite build sẽ từ chối key sai loại trong biến mới. Key sinh câu trả lời là dữ liệu riêng của người dùng; secret phía máy chủ chỉ được phép tồn tại ở backend. Sao chép `.env.example` để bắt đầu; không commit `.env`.
 
 ## Deploy production
 
 1. Deploy repository lên Vercel với root directory là `.`.
-2. Đặt các biến `VITE_*` cần thiết. Nếu dùng gateway, đặt `VITE_RAG_PIPELINE_API_URL=/api/rag` và secret `GEMINI_API_KEY` ở server.
+2. Tạo Geomi client key dành cho frontend với origin/rate limit phù hợp, rồi đặt `VITE_SHELBY_CLIENT_API_KEY=AG-…` cho Preview và Production. Đặt `OPENROUTER_API_KEY` ở server để bật Qwen chat. Nếu dùng embedding gateway, đặt `VITE_RAG_PIPELINE_API_URL=/api/rag` và `GEMINI_API_KEY` ở server.
 3. Chạy `npm run check` trước deploy.
 4. Gateway giới hạn 32 text/request, 4.000 ký tự/text, 64.000 ký tự/request, 30 request/IP/phút trên mỗi instance, kiểm tra origin, timeout upstream 25 giây và không cache response. Với production nhiều instance, đặt thêm rate limit phân tán tại CDN/WAF.
 

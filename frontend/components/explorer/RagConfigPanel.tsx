@@ -51,14 +51,14 @@ export function RagConfigPanel({
         <div className="flex items-start gap-3 border-b border-emerald-200/60 px-4 py-3.5 dark:border-emerald-300/10">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#172019] text-[#c5fb7e] dark:bg-lime-300 dark:text-slate-950"><Gauge className="h-4 w-4" /></div>
           <div>
-            <h4 className="text-sm font-extrabold text-slate-900 dark:text-white">{t("Manage Gemini usage", "Kiểm soát lượt dùng Gemini")}</h4>
-            <p className="mt-1 text-[11px] leading-4 text-slate-600 dark:text-slate-400">{t("Each feature works independently. Turn off content reading and semantic search to save quota for chat.", "Mỗi mục hoạt động độc lập. Tắt đọc nội dung và tìm theo ý nghĩa sẽ dành quota cho trò chuyện.")}</p>
+            <h4 className="text-sm font-extrabold text-slate-900 dark:text-white">{t("Manage AI features", "Quản lý tính năng AI")}</h4>
+            <p className="mt-1 text-[11px] leading-4 text-slate-600 dark:text-slate-400">{t("Chat uses the app's Qwen3.7 Flash. Gemini remains optional for richer RAG content processing.", "Chat dùng Qwen3.7 Flash do ứng dụng cung cấp. Gemini chỉ còn tùy chọn để xử lý nội dung RAG tốt hơn.")}</p>
           </div>
         </div>
         <div className="divide-y divide-emerald-100/80 px-3 dark:divide-white/[0.055]">
           <div className="flex items-center justify-between gap-4 py-3">
-            <div className="flex min-w-0 items-start gap-2.5"><MessageSquareText className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700 dark:text-lime-300" /><div><strong className="block text-xs text-slate-800 dark:text-slate-200">{t("AI chat", "Trò chuyện với AI")}</strong><p className="mt-0.5 text-[11px] leading-4 text-slate-500 dark:text-slate-400">{t("A general question usually uses 1 request; a document lookup may use 2.", "Câu hỏi thường khoảng 1 lượt; câu cần tra tài liệu có thể dùng 2 lượt.")}</p></div></div>
-            {usageSwitch(geminiUsage.chat, t("Use Gemini for chat", "Dùng Gemini cho trò chuyện"), () => setPreference("chat", !geminiUsage.chat))}
+            <div className="flex min-w-0 items-start gap-2.5"><MessageSquareText className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700 dark:text-lime-300" /><div><strong className="block text-xs text-slate-800 dark:text-slate-200">{t("Qwen3.7 Flash chat", "Chat Qwen3.7 Flash")}</strong><p className="mt-0.5 text-[11px] leading-4 text-slate-500 dark:text-slate-400">{t("Ready by default. A general question usually uses 1 request; a document lookup may use 2.", "Dùng được ngay theo mặc định. Câu hỏi thường dùng 1 lượt; câu cần tra tài liệu có thể dùng 2 lượt.")}</p></div></div>
+            {usageSwitch(geminiUsage.chat, t("Use Qwen3.7 Flash for chat", "Dùng Qwen3.7 Flash để trò chuyện"), () => setPreference("chat", !geminiUsage.chat))}
           </div>
           <div className="flex items-center justify-between gap-4 py-3">
             <div className="flex min-w-0 items-start gap-2.5"><ScanText className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700 dark:text-lime-300" /><div><strong className="block text-xs text-slate-800 dark:text-slate-200">{t("Read images, PDFs, and videos", "Đọc ảnh, PDF và video")}</strong><p className="mt-0.5 text-[11px] leading-4 text-slate-500 dark:text-slate-400">{t("Used only while building RAG. When off, PDFs use on-device OCR and videos wait until you enable it again.", "Chỉ dùng khi tạo RAG. Khi tắt, PDF chuyển sang OCR trên máy; video sẽ chờ bạn bật lại.")}</p></div></div>

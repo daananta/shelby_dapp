@@ -30,6 +30,18 @@ describe("access_control query3 BCS", () => {
     expect(parseAccessPolicyQuery(response)).toEqual({ type: "timelock", lockedUntilMicros: 1_800_000_000_000_000, canAccess: true });
   });
 
+  it("preserves GreenBox metadata required for protected blob decryption", () => {
+    // Option<Metadata>=Some; owner; scheme=2; greenbox=aabbcc; TimeLock; canAccess=Some(true)
+    const response = `01${"00".repeat(32)}0203aabbcc01${u64le(1_800_000_000_000_000n)}0101`;
+    expect(parseAccessPolicyQuery(response)).toEqual({
+      type: "timelock",
+      lockedUntilMicros: 1_800_000_000_000_000,
+      canAccess: true,
+      greenBoxScheme: 2,
+      greenBoxBytes: new Uint8Array([0xaa, 0xbb, 0xcc]),
+    });
+  });
+
   it("uses the exact full blob-name encoding required by the contract", () => {
     expect(createAccessControlBlobName("0xabc", "books/a.pdf")).toBe(`@${"abc".padStart(64, "0")}/books/a.pdf`);
   });

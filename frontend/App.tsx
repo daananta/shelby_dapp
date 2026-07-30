@@ -3,7 +3,7 @@ import { BookOpen, MessageSquare, Play } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Header } from "@/components/Header";
 import { WalletSelector } from "@/components/WalletSelector";
-import { isMockWorkspace } from "@/utils/devMode";
+import { isE2EWalletConnected, isMockWorkspace } from "@/utils/devMode";
 import { JudgeMode, type JudgeModeReadiness } from "@/components/JudgeMode";
 import { Button } from "@/components/ui/button";
 import type { JudgeModeTarget } from "@/utils/judgeMode";
@@ -25,9 +25,9 @@ interface AppProps {
 function App({ onOpenDemo }: AppProps) {
   const { t } = useLanguage();
   const { connected: realConnected, account } = useWallet();
-  const isTestMode = isMockWorkspace();
+  const isTestMode = isE2EWalletConnected();
   const connected = isTestMode ? true : realConnected;
-  const readinessOwner = isTestMode ? "mock-workspace" : account?.address.toString().toLowerCase() ?? "";
+  const readinessOwner = isMockWorkspace() ? "mock-workspace" : isTestMode ? "e2e-remote-error" : account?.address.toString().toLowerCase() ?? "";
   const [mobileView, setMobileView] = useState<"library" | "chat">("library");
   const [judgeModeOpen, setJudgeModeOpen] = useState(false);
   const [judgeReadiness, setJudgeReadiness] = useState<JudgeModeReadiness>({ walletConnected: connected });

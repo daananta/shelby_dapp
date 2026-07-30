@@ -1,10 +1,12 @@
+import { normalizeGeminiApiKey } from "@/utils/geminiApiKey";
+
 const CLOUD_API_KEY_STORAGE = "shelby-rag-explorer.gemini-api-key";
 export const CLOUD_API_KEY_EVENT = "shelby:cloud-key";
 let inMemoryCloudApiKey = "";
 
 export function getStoredCloudApiKey(): string {
   try {
-    const sessionKey = sessionStorage.getItem(CLOUD_API_KEY_STORAGE);
+    const sessionKey = normalizeGeminiApiKey(sessionStorage.getItem(CLOUD_API_KEY_STORAGE));
     if (sessionKey) {
       inMemoryCloudApiKey = sessionKey;
       return sessionKey;
@@ -26,7 +28,7 @@ export function getStoredCloudApiKey(): string {
 }
 
 export function storeCloudApiKey(apiKey: string) {
-  inMemoryCloudApiKey = apiKey.trim();
+  inMemoryCloudApiKey = normalizeGeminiApiKey(apiKey);
   try { sessionStorage.setItem(CLOUD_API_KEY_STORAGE, inMemoryCloudApiKey); } catch { /* tab memory remains available */ }
   try { localStorage.removeItem(CLOUD_API_KEY_STORAGE); } catch { /* best-effort legacy cleanup */ }
   window.dispatchEvent(new Event(CLOUD_API_KEY_EVENT));

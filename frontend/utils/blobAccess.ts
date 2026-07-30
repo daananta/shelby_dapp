@@ -1,4 +1,5 @@
 import { getShelbyBlobUrl } from "@/utils/shelbyConfig";
+import { SHELBY_CLIENT_API_KEY } from "@/utils/geomiClientKey";
 import type { AccessPolicyInfo } from "@/utils/accessControl";
 import { localize } from "@/i18n";
 
@@ -11,6 +12,10 @@ export interface BlobAccessInfo {
   allowlist: string[];
   purchasers: string[];
   canAccess?: boolean | null;
+  greenBoxScheme?: number;
+  greenBoxByteLength?: number;
+  /** Access is granted, but the downloaded Shelby bytes still require GreenBox decryption. */
+  requiresDecryption?: boolean;
   /** True when the policy came from access_control::query3_bcs. */
   onChain?: boolean;
   /** Query failed or returned a custom policy the RAG importer cannot evaluate. */
@@ -21,6 +26,7 @@ export interface AccessDecision {
   info: BlobAccessInfo;
   eligible: boolean;
   needsBroker: boolean;
+  needsDecryption?: boolean;
   reason?: string;
 }
 
@@ -81,6 +87,9 @@ export function readBlobAccessInfo(blob: unknown): BlobAccessInfo {
       allowlist: [],
       purchasers: [],
       canAccess: onChainPolicy.canAccess,
+      greenBoxScheme: onChainPolicy.greenBoxScheme,
+      greenBoxByteLength: onChainPolicy.greenBoxBytes?.byteLength,
+      requiresDecryption: Boolean(onChainPolicy.greenBoxBytes?.byteLength),
       onChain: true,
     };
   }
@@ -135,6 +144,16 @@ export function getBlobAccessDecision(blob: unknown, walletAddress?: string, now
       needsBroker: false,
       reason: localize("The time lock does not allow access yet.", "Time lock chưa cho phép truy cập."),
     };
+    if (info.requiresDecryption) return {
+      info,
+      eligible: false,
+      needsBroker: false,
+      needsDecryption: true,
+      reason: localize(
+        "The time lock is open, but this app does not yet support decrypting its protected data.",
+        "Time lock đã mở, nhưng ứng dụng chưa hỗ trợ giải mã lớp bảo vệ của blob này.",
+      ),
+    };
     return { info, eligible: true, needsBroker: false };
   }
   if (info.onChain && info.canAccess === null) return {
@@ -149,9 +168,20 @@ export function getBlobAccessDecision(blob: unknown, walletAddress?: string, now
       : localize("Purchase access before reading this blob.", "Blob này cần mua quyền truy cập trước.");
     return { info, eligible: false, needsBroker: false, reason: message };
   }
+  if (info.requiresDecryption) return {
+    info,
+    eligible: false,
+    needsBroker: false,
+    needsDecryption: true,
+    reason: localize(
+      "Access is granted, but this app does not yet support decrypting this protected blob.",
+      "Đã có quyền truy cập, nhưng ứng dụng chưa hỗ trợ giải mã lớp bảo vệ của blob này.",
+    ),
+  };
   if (info.tag === "public") return { info, eligible: true, needsBroker: false };
-  // Policies verified through query3_bcs mirror the established Shelby project
-  // workflow: canAccess grants this browser read pipeline directly.
+  // An unencrypted on-chain policy can be read directly after canAccess passes.
+  // GreenBox-protected policies are rejected above until an official decryptor
+  // is available; canAccess alone does not turn ciphertext into plaintext.
   if (info.onChain) return { info, eligible: true, needsBroker: false };
   if (!brokerUrl) return {
     info,
@@ -247,16 +277,29 @@ export async function downloadBlobForRag(params: {
   }
   const grant = decision.needsBroker
     ? await signedBrokerGrant(params.owner, params.blobName, params.walletAddress, decision.info.tag, params.signMessage, params.signal)
-    : { url: getShelbyBlobUrl(params.owner, params.blobName), headers: undefined };
+    : {
+        url: getShelbyBlobUrl(params.owner, params.blobName),
+        headers: SHELBY_CLIENT_API_KEY
+          ? { Authorization: `Bearer ${SHELBY_CLIENT_API_KEY}` }
+          : undefined,
+      };
+  // The SDK's current getBlob API cannot receive an AbortSignal. This equivalent
+  // authenticated streaming read keeps Stop/wallet changes cancellable.
   const response = await fetch(grant.url, { headers: grant.headers, signal: params.signal });
   if (!response.ok) throw new Error(localize(`Unable to download the blob (${response.status}).`, `Không thể tải blob (${response.status}).`));
   const declaredBytes = Number(response.headers.get("content-length") ?? 0);
   if (declaredBytes > maxBytes) throw new Error(sizeLimitError());
   const contentType = response.headers.get("content-type") || "application/octet-stream";
+  let readable = response.body;
+  if (!readable) {
+    const fallback = await response.blob();
+    if (fallback.size > maxBytes) throw new Error(sizeLimitError());
+    readable = fallback.stream();
+  }
   const chunks: ArrayBuffer[] = [];
   let receivedBytes = 0;
-  if (response.body) {
-    const reader = response.body.getReader();
+  if (readable) {
+    const reader = readable.getReader();
     const abortReader = () => { void reader.cancel(params.signal?.reason).catch(() => undefined); };
     params.signal?.addEventListener("abort", abortReader, { once: true });
     try {
@@ -276,10 +319,12 @@ export async function downloadBlobForRag(params: {
     } finally {
       params.signal?.removeEventListener("abort", abortReader);
     }
-  } else {
-    const fallback = await response.blob();
-    if (fallback.size > maxBytes) throw new Error(sizeLimitError());
-    chunks.push(await fallback.arrayBuffer());
+  }
+  if (declaredBytes > 0 && receivedBytes !== declaredBytes) {
+    throw new Error(localize(
+      `The Shelby response ended early (${receivedBytes}/${declaredBytes} bytes).`,
+      `Dữ liệu Shelby kết thúc sớm (${receivedBytes}/${declaredBytes} byte).`,
+    ));
   }
   const content = new Blob(chunks, { type: contentType });
   const url = URL.createObjectURL(content);

@@ -1,4 +1,5 @@
 import { getStoredCloudApiKey } from "@/utils/cloudKeyStorage";
+import { normalizeGeminiApiKey } from "@/utils/geminiApiKey";
 import { localize } from "@/i18n";
 
 export type EmbeddingProvider = "gemini" | "gateway";
@@ -20,7 +21,7 @@ async function embedRemote(
 ): Promise<number[][]> {
   const output: number[][] = [];
   const batchSize = provider === "gateway" ? 32 : 20;
-  const key = apiKey?.trim() || getStoredCloudApiKey();
+  const key = normalizeGeminiApiKey(apiKey) || getStoredCloudApiKey();
   if (provider === "gemini" && !key) throw new Error(localize("A Gemini API key is required for semantic search.", "Cần Gemini API key để tạo tìm kiếm theo ý nghĩa."));
   if (provider === "gateway" && !RAG_GATEWAY_URL) throw new Error(localize("The app's semantic search service is not configured.", "Dịch vụ tìm kiếm theo ý nghĩa của ứng dụng chưa được cấu hình."));
 

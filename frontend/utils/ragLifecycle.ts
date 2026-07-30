@@ -2,7 +2,7 @@ import type { RagSource } from "@/utils/ragOrama";
 import type { PortableRagPackage } from "@/utils/ragTypes";
 
 export function ragPipelineRevision(options: { fullPdfOcr: boolean; cloudContentAnalysis: boolean; embeddingMode: string; ragChunkSize: number }) {
-  return `v10:quota-controls:quality-ocr-${options.fullPdfOcr ? "all" : "smart"}:cloud-read-${options.cloudContentAnalysis ? "on" : "off"}:embedding-${options.embeddingMode}:chunk-${options.ragChunkSize}`;
+  return `v11:content-sniffer-v2:quota-controls:quality-ocr-${options.fullPdfOcr ? "all" : "smart"}:cloud-read-${options.cloudContentAnalysis ? "on" : "off"}:embedding-${options.embeddingMode}:chunk-${options.ragChunkSize}`;
 }
 
 export function blobContentIdentity(blob: any, accessTag: string) {
@@ -21,7 +21,24 @@ export function sourceContentIdentity(revision?: string) {
 
 export function needsLocalIndex(source: RagSource | undefined, expectedRevision: string) {
   if (!source) return true;
-  if (source.status === "skipped") return source.revision !== expectedRevision;
+  if (source.status === "skipped") {
+    if (source.revision === expectedRevision) return false;
+    const currentPipeline = source.revision?.split(":").slice(3).join(":") ?? "";
+    const expectedPipeline = expectedRevision.split(":").slice(3).join(":");
+    const upgradedPipeline = currentPipeline.replace(
+      /^v10:quota-controls:/,
+      "v11:content-sniffer-v2:quota-controls:",
+    );
+    const retryableBySaferDetection = /\.(?:pdf|png|jpe?g|gif|webp|mp4|txt|md|markdown|json|jsonl|map|html?|xml|csv|tsv|ya?ml|toml|tsx?|jsx?|css|scss|move)$/i.test(source.source);
+    if (
+      sourceContentIdentity(source.revision) === sourceContentIdentity(expectedRevision)
+      && upgradedPipeline === expectedPipeline
+      && !retryableBySaferDetection
+    ) {
+      return false;
+    }
+    return true;
+  }
   if (source.status !== "indexed") return true;
   if (source.revision === expectedRevision) return false;
   if (sourceContentIdentity(source.revision) !== sourceContentIdentity(expectedRevision)) return true;
@@ -37,6 +54,15 @@ export function needsLocalIndex(source: RagSource | undefined, expectedRevision:
     currentPipeline = currentPipeline
       .replace(/^v9:mp4-hot-rag:/, "v10:quota-controls:")
       .replace(":embedding-", ":cloud-read-off:embedding-");
+  }
+  // v11 only asks previously skipped blobs to pass through the safer content
+  // detector once more. Existing indexed content remains valid and is not
+  // rebuilt solely because the detector changed.
+  if (currentPipeline.startsWith("v10:quota-controls:")) {
+    currentPipeline = currentPipeline.replace(
+      /^v10:quota-controls:/,
+      "v11:content-sniffer-v2:quota-controls:",
+    );
   }
   if (currentPipeline.includes(":embedding-auto:")) {
     const expectedProvider = expectedPipeline.match(/:embedding-(gemini|gateway):/)?.[1];

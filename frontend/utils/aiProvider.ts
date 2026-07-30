@@ -2,6 +2,7 @@ import { FunctionCallingMode, GoogleGenerativeAI, SchemaType } from "@google/gen
 import type { Tool } from "@google/generative-ai";
 import { clearStoredCloudApiKey, getStoredCloudApiKey, storeCloudApiKey } from "@/utils/cloudKeyStorage";
 import { normalizeConversationRoute, type ConversationRoute } from "@/utils/conversationRoute";
+import { normalizeGeminiApiKey } from "@/utils/geminiApiKey";
 import { currentLanguage, localize } from "@/i18n";
 import {
   AgentHarnessLimitError,
@@ -51,6 +52,23 @@ const conversationRouteCache = new Map<string, ConversationRoute>();
 
 export type CloudErrorKind = "rate_limit" | "invalid_key" | "network" | "other";
 
+export class CloudProviderError extends Error {
+  readonly provider = "gemini";
+
+  constructor(
+    readonly kind: CloudErrorKind,
+    message: string,
+    readonly originalError?: unknown,
+  ) {
+    super(message);
+    this.name = "CloudProviderError";
+  }
+}
+
+export function isCloudProviderError(error: unknown): error is CloudProviderError {
+  return error instanceof CloudProviderError && error.provider === "gemini";
+}
+
 function cloudErrorStatus(error: unknown): number | undefined {
   if (!error || typeof error !== "object") return undefined;
   const value = error as { status?: unknown; response?: { status?: unknown } };
@@ -59,31 +77,39 @@ function cloudErrorStatus(error: unknown): number | undefined {
 }
 
 export function getCloudErrorKind(error: unknown): CloudErrorKind {
+  if (isCloudProviderError(error)) return error.kind;
   const status = cloudErrorStatus(error);
   const raw = error instanceof Error ? error.message : String(error ?? "");
   const message = raw.toLowerCase();
   if (status === 429 || /\b429\b|resource_exhausted|quota|rate.?limit/.test(message)) return "rate_limit";
-  if (status === 401 || status === 403 || /api[_ -]?key.*invalid|permission_denied|unauthorized/.test(message)) return "invalid_key";
+  if (status === 401 || status === 403 || /api[_ -]?key.*(?:invalid|not valid)|permission_denied|unauthorized|unauthenticated|access_token_type_unsupported/.test(message)) return "invalid_key";
   if (/failed to fetch|network|load failed|fetch failed/.test(message)) return "network";
   return "other";
 }
 
 export function normalizeCloudError(error: unknown): Error {
   if (error instanceof DOMException && error.name === "AbortError") return error;
+  if (isCloudProviderError(error)) return error;
   const kind = getCloudErrorKind(error);
-  if (kind === "rate_limit") return new Error(localize(
-    "Gemini returned 429: this API key's project is rate-limited or out of quota. Keys in the same Google Cloud project share quota.",
-    "Gemini trả về 429: project của API key đang chạm giới hạn hoặc đã hết quota. Các key trong cùng một Google Cloud project dùng chung quota.",
-  ));
-  if (kind === "invalid_key") return new Error(localize(
+  if (kind === "rate_limit") return new CloudProviderError(kind, localize(
+    "Gemini temporarily limited this request (429). The API key was not rejected; wait and try again, or check this model's usage and rate limits.",
+    "Gemini đang tạm giới hạn yêu cầu này (429). API key không bị từ chối; hãy chờ rồi thử lại hoặc kiểm tra mức sử dụng và giới hạn của model.",
+  ), error);
+  if (kind === "invalid_key") return new CloudProviderError(kind, localize(
     "The Gemini API key is invalid or cannot access this model.",
     "Gemini API key không hợp lệ hoặc không có quyền dùng model này.",
-  ));
-  if (kind === "network") return new Error(localize(
+  ), error);
+  if (kind === "network") return new CloudProviderError(kind, localize(
     "Unable to reach Gemini. Check your network and try again.",
     "Không thể kết nối Gemini. Hãy kiểm tra mạng rồi thử lại.",
-  ));
-  return error instanceof Error && error.message ? error : new Error(localize("Cloud AI did not respond.", "Cloud AI không phản hồi."));
+  ), error);
+  return new CloudProviderError(
+    kind,
+    error instanceof Error && error.message
+      ? error.message
+      : localize("Cloud AI did not respond.", "Cloud AI không phản hồi."),
+    error,
+  );
 }
 
 function shouldStopModelFallback(error: unknown): boolean {
@@ -93,8 +119,9 @@ function shouldStopModelFallback(error: unknown): boolean {
 
 /** Verifies the key with a minimal generation request before it is marked ready. */
 export async function verifyCloudApiKey(apiKey: string): Promise<string> {
-  if (!apiKey.trim()) throw new Error(localize("The API key is empty.", "API key trống."));
-  const client = new GoogleGenerativeAI(apiKey.trim());
+  const normalizedApiKey = normalizeGeminiApiKey(apiKey);
+  if (!normalizedApiKey) throw new Error(localize("The API key is empty.", "API key trống."));
+  const client = clientFor(normalizedApiKey);
   let lastError: unknown;
   for (const modelName of CLOUD_MODELS) {
     try {
@@ -109,8 +136,9 @@ export async function verifyCloudApiKey(apiKey: string): Promise<string> {
 }
 
 export async function generateCloudAnswer({ prompt, contents, cloudApiKey, systemInstruction }: AiRequest): Promise<string> {
-  if (!cloudApiKey?.trim()) throw new Error(localize("Enter your Gemini API key to use Cloud AI.", "Nhập Gemini API key của bạn để dùng Cloud AI."));
-  const client = new GoogleGenerativeAI(cloudApiKey.trim());
+  const normalizedApiKey = normalizeGeminiApiKey(cloudApiKey);
+  if (!normalizedApiKey) throw new Error(localize("Enter your Gemini API key to use Cloud AI.", "Nhập Gemini API key của bạn để dùng Cloud AI."));
+  const client = clientFor(normalizedApiKey);
   let lastError: unknown;
   for (const modelName of CLOUD_MODELS) {
     try {
@@ -135,11 +163,12 @@ export async function resolveConversationRouteWithCloud(params: {
   signal?: AbortSignal;
 }): Promise<ConversationRoute> {
   params.signal?.throwIfAborted();
-  if (!params.cloudApiKey.trim()) return normalizeConversationRoute(null, params.availableSources);
+  const normalizedApiKey = normalizeGeminiApiKey(params.cloudApiKey);
+  if (!normalizedApiKey) return normalizeConversationRoute(null, params.availableSources);
   const cacheKey = JSON.stringify([params.question.trim().toLocaleLowerCase("vi-VN"), params.availableSources, params.recentTurns.slice(-4)]);
   const cached = conversationRouteCache.get(cacheKey);
   if (cached) return cached;
-  const client = new GoogleGenerativeAI(params.cloudApiKey.trim());
+  const client = clientFor(normalizedApiKey);
   const prompt = `Classify only; do not answer the user. Resolve the latest message using conversational meaning, not keyword rules.
 Return JSON with exactly: {"scope":"general|document|image|tool","referencedSources":[],"imageAction":"show|describe|null","confidence":0.0}.
 - general: world knowledge or ordinary conversation that does not require user-owned data.
@@ -184,8 +213,9 @@ export async function streamCloudAnswer(
   onChunk: (text: string) => void,
   signal?: AbortSignal,
 ): Promise<string> {
-  if (!cloudApiKey?.trim()) throw new Error(localize("Enter your Gemini API key to use Cloud AI.", "Nhập Gemini API key của bạn để dùng Cloud AI."));
-  const client = new GoogleGenerativeAI(cloudApiKey.trim());
+  const normalizedApiKey = normalizeGeminiApiKey(cloudApiKey);
+  if (!normalizedApiKey) throw new Error(localize("Enter your Gemini API key to use Cloud AI.", "Nhập Gemini API key của bạn để dùng Cloud AI."));
+  const client = clientFor(normalizedApiKey);
   let lastError: unknown;
   for (const modelName of CLOUD_MODELS) {
     let emitted = false;
@@ -226,7 +256,8 @@ export async function streamCloudAgentAnswer(
   handlers: AgentToolHandlers,
   signal?: AbortSignal,
 ): Promise<string> {
-  if (!cloudApiKey?.trim()) throw new Error(localize("Enter your Gemini API key to use Cloud AI.", "Nhập Gemini API key của bạn để dùng Cloud AI."));
+  const normalizedApiKey = normalizeGeminiApiKey(cloudApiKey);
+  if (!normalizedApiKey) throw new Error(localize("Enter your Gemini API key to use Cloud AI.", "Nhập Gemini API key của bạn để dùng Cloud AI."));
   if (!contents?.length) throw new Error(localize("There is no question to send to Gemini.", "Không có câu hỏi để gửi đến Gemini."));
 
   const latest = contents.at(-1);
@@ -319,7 +350,7 @@ export async function streamCloudAgentAnswer(
     let harnessStarted = false;
     try {
       signal?.throwIfAborted();
-      const model = clientFor(cloudApiKey).getGenerativeModel({
+      const model = clientFor(normalizedApiKey).getGenerativeModel({
         model: modelName,
         systemInstruction,
         tools: [agentTools],
@@ -405,6 +436,7 @@ export async function streamCloudAgentAnswer(
           "AI yêu cầu quá nhiều thao tác ứng dụng trong một phản hồi.",
         ))
         : error;
+      if (error instanceof AgentHarnessLimitError) throw boundedError;
       if (harnessStarted) throw normalizeCloudError(boundedError);
       if (shouldStopModelFallback(error)) throw normalizeCloudError(error);
       lastError = boundedError;
@@ -414,22 +446,34 @@ export async function streamCloudAgentAnswer(
 }
 
 function clientFor(apiKey: string): GoogleGenerativeAI {
-  return new GoogleGenerativeAI(apiKey.trim());
+  return new GoogleGenerativeAI(normalizeGeminiApiKey(apiKey));
 }
 
-export async function describeImageWithCloud(imageUrl: string, fileName: string, cloudApiKey = getStoredCloudApiKey(), signal?: AbortSignal): Promise<string | null> {
-  if (!cloudApiKey) return null;
+export function resolveCloudImageMimeType(blobType: string, fileName: string, detectedMimeType?: string): string {
+  if (detectedMimeType?.startsWith("image/")) return detectedMimeType;
+  if (blobType && blobType !== "application/octet-stream") return blobType;
+  if (/\.png$/i.test(fileName)) return "image/png";
+  if (/\.webp$/i.test(fileName)) return "image/webp";
+  if (/\.gif$/i.test(fileName)) return "image/gif";
+  return "image/jpeg";
+}
+
+export async function describeImageWithCloud(
+  imageUrl: string,
+  fileName: string,
+  cloudApiKey = getStoredCloudApiKey(),
+  signal?: AbortSignal,
+  detectedMimeType?: string,
+): Promise<string | null> {
+  const normalizedApiKey = normalizeGeminiApiKey(cloudApiKey);
+  if (!normalizedApiKey) return null;
   signal?.throwIfAborted();
   const response = await fetch(imageUrl, { signal });
   if (!response.ok) throw new Error(localize(`Unable to download the image (${response.status}).`, `Không thể tải ảnh (${response.status}).`));
   const blob = await response.blob();
   const data = await blobAsBase64(blob, signal);
-  const mimeType = blob.type && blob.type !== "application/octet-stream"
-    ? blob.type
-    : fileName.match(/\.png$/i) ? "image/png"
-      : fileName.match(/\.webp$/i) ? "image/webp"
-        : fileName.match(/\.gif$/i) ? "image/gif" : "image/jpeg";
-  const client = new GoogleGenerativeAI(cloudApiKey);
+  const mimeType = resolveCloudImageMimeType(blob.type, fileName, detectedMimeType);
+  const client = clientFor(normalizedApiKey);
   let lastError: unknown;
   for (const modelName of CLOUD_MODELS) {
     try {
@@ -481,7 +525,8 @@ async function blobAsBase64(blob: Blob, signal?: AbortSignal): Promise<string> {
  * type and returns timeline/transcript text that can safely be chunked.
  */
 export async function describeVideoWithCloud(video: Blob, fileName: string, cloudApiKey = getStoredCloudApiKey(), signal?: AbortSignal): Promise<string> {
-  if (!cloudApiKey) throw new Error(localize(
+  const normalizedApiKey = normalizeGeminiApiKey(cloudApiKey);
+  if (!normalizedApiKey) throw new Error(localize(
     "An active Gemini API key is required to understand MP4 speech, text, and visuals.",
     "Video MP4 cần Gemini API key để nhận dạng lời nói, chữ và hình ảnh. Hãy nhập key rồi thử lại.",
   ));
@@ -492,7 +537,7 @@ export async function describeVideoWithCloud(video: Blob, fileName: string, clou
     ));
   }
   const data = await blobAsBase64(video, signal);
-  const client = new GoogleGenerativeAI(cloudApiKey.trim());
+  const client = clientFor(normalizedApiKey);
   let lastError: unknown;
   for (const modelName of CLOUD_MODELS) {
     try {
@@ -529,9 +574,10 @@ export interface CloudDocumentMetadata {
 
 /** This is called only after the user explicitly enables Cloud document analysis. */
 export async function analyzeDocumentCoverWithCloud(cover: Blob, fileName: string, cloudApiKey = getStoredCloudApiKey(), signal?: AbortSignal): Promise<CloudDocumentMetadata | null> {
-  if (!cloudApiKey) return null;
+  const normalizedApiKey = normalizeGeminiApiKey(cloudApiKey);
+  if (!normalizedApiKey) return null;
   const data = await blobAsBase64(cover, signal);
-  const client = new GoogleGenerativeAI(cloudApiKey);
+  const client = clientFor(normalizedApiKey);
   let lastError: unknown;
   for (const modelName of CLOUD_MODELS) {
     try {
@@ -554,9 +600,10 @@ export async function analyzeDocumentCoverWithCloud(cover: Blob, fileName: strin
 }
 
 export async function ocrPageWithCloud(imageBlob: Blob, cloudApiKey = getStoredCloudApiKey(), signal?: AbortSignal): Promise<string | null> {
-  if (!cloudApiKey) return null;
+  const normalizedApiKey = normalizeGeminiApiKey(cloudApiKey);
+  if (!normalizedApiKey) return null;
   const data = await blobAsBase64(imageBlob, signal);
-  const client = new GoogleGenerativeAI(cloudApiKey);
+  const client = clientFor(normalizedApiKey);
   let lastError: unknown;
   for (const modelName of CLOUD_MODELS) {
     try {

@@ -129,7 +129,8 @@ describe("Gemini agent tool orchestration", () => {
     expect(answer).toBe("Theo snapshot gần nhất, ví có 35 blob.");
     expect(getWalletBlobInventory).toHaveBeenCalledOnce();
     expect(searchKnowledge).not.toHaveBeenCalled();
-    expect(JSON.stringify(agentSdk.startChatConfig.history)).toContain("get_wallet_blob_inventory");
+    expect(JSON.stringify(agentSdk.startChatConfig.history)).toContain("Previous Shelby inventory observation");
+    expect(JSON.stringify(agentSdk.startChatConfig.history)).not.toContain("If the user");
     expect(JSON.stringify(agentSdk.startChatConfig.history)).not.toContain("private-plan.pdf");
     expect(JSON.stringify(agentSdk.startChatConfig.history)).not.toContain("35 blob");
     expect(agentSdk.sendMessageStream.mock.calls[0][0]).toEqual([{

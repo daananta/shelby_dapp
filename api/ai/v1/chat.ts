@@ -404,7 +404,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
           { type: "image_url", image_url: { url: `data:${mimeType};base64,${data}` } },
         ],
       }],
-      temperature: 0.1,
+      temperature: 0,
       reasoning: FAST_REASONING,
       max_tokens: MAX_VISION_OUTPUT_TOKENS,
     };

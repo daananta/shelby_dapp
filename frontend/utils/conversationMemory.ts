@@ -11,6 +11,7 @@ interface MemoryMessage {
     fetchedAt?: number;
   };
   imageUrls?: string[];
+  referencedSources?: string[];
 }
 
 const DOCUMENT_TOOLS = new Set(["document_lookup", "document_inventory", "blob_inventory", "show_images"]);
@@ -45,16 +46,23 @@ export function buildAdaptiveGeminiHistory(messages: MemoryMessage[]) {
     const answer = messages[index + 1];
     if (user.role !== "user" || answer.role !== "ai") continue;
     const documentGrounded = Boolean(answer.sources?.length || answer.tool || answer.imageUrls?.length);
+    const imageSources = answer.imageUrls?.length
+      ? [...new Set((answer.referencedSources ?? []).filter((source) => typeof source === "string" && source.trim()))]
+        .slice(0, 3)
+      : [];
+    const safeImageMemory = imageSources.length
+      ? `Indexed image context: ${imageSources.map((source) => JSON.stringify(source)).join(", ")}\n${answer.text.slice(0, 4_000)}`
+      : null;
     const safeToolMemory = answer.toolObservation?.kind === "blob_inventory"
-      ? "I answered using the connected wallet's cached Shelby inventory snapshot. If the user asks to confirm, recheck, continue, or list that inventory, call get_wallet_blob_inventory again. If it is stale, call refresh_wallet_blob_inventory once and then reread it. Report fetchedAt honestly and never use document search for that follow-up."
+      ? `Previous Shelby inventory observation: status=${answer.toolObservation.status}; observedAt=${answer.toolObservation.observedAt}; fetchedAt=${answer.toolObservation.fetchedAt ?? "unknown"}. Exact inventory facts are not retained in chat memory.`
       : null;
     output.push(
       { role: "user", parts: [{ text: user.text.slice(0, 2_000) }] },
       {
         role: "model",
         parts: [{
-          text: safeToolMemory ?? (documentGrounded
-            ? "I answered this turn with app-provided data. If the user follows up, resolve the subject from their previous question and use the tool to search again; do not rely on the previous answer text."
+          text: safeImageMemory ?? safeToolMemory ?? (documentGrounded
+            ? "The previous response was based on connected workspace data; its exact contents are not retained in chat memory."
             : answer.text.slice(0, 4_000)),
         }],
       },

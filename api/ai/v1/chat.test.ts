@@ -123,6 +123,7 @@ describe("hosted Qwen gateway", () => {
     const upstreamBody = JSON.parse(String(init.body));
     expect(upstreamBody.model).toBe("qwen/qwen3.7-flash");
     expect(upstreamBody.reasoning).toEqual({ effort: "none", exclude: true });
+    expect(upstreamBody.temperature).toBe(0);
     expect(upstreamBody).not.toHaveProperty("tools");
     expect(upstreamBody).not.toHaveProperty("tool_choice");
     expect(upstreamBody.messages[0].content[0]).toMatchObject({

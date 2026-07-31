@@ -460,6 +460,7 @@ test("lets the model choose a free-form blob filename filter", async ({ page }) 
 test("lets Qwen choose runtime vision for a follow-up while RAG image processing stays off", async ({ page }) => {
   const visionPayloads: any[] = [];
   const toolPayloads: any[] = [];
+  const agentPayloads: any[] = [];
   await page.route("**/runtime-vision-anime.gif", async (route) => {
     await route.fulfill({
       status: 200,
@@ -482,6 +483,7 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
     }
 
     const messages = body?.messages ?? [];
+    agentPayloads.push(body);
     const latestTool = [...messages].reverse().find((message: any) => message?.role === "tool");
     if (latestTool) {
       toolPayloads.push(JSON.parse(latestTool.content));
@@ -504,6 +506,19 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
     }
 
     const latestUserText = String([...messages].reverse().find((message: any) => message?.role === "user")?.content ?? "");
+    if (latestUserText.includes("Which visible details support that description?")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          message: {
+            role: "assistant",
+            content: "The blue color, square outline, and plain background support that description.",
+          },
+        }),
+      });
+      return;
+    }
     const describeFollowUp = latestUserText.includes("Describe what is visible");
     await route.fulfill({
       status: 200,
@@ -559,6 +574,13 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
   await chatInput.fill("Describe what is visible in this image.");
   await chatInput.press("Enter");
   await expect(page.getByText("It shows a small blue square on a plain background.", { exact: true })).toBeVisible();
+
+  await chatInput.fill("Which visible details support that description?");
+  await chatInput.press("Enter");
+  await expect(page.getByText(
+    "The blue color, square outline, and plain background support that description.",
+    { exact: true },
+  )).toBeVisible();
   expect(toolPayloads).toEqual([
     expect.objectContaining({ ok: true, kind: "show_images", referencedSources: ["anime2.jpeg"] }),
     expect.objectContaining({ ok: true, kind: "image_analysis", referencedSources: ["anime2.jpeg"] }),
@@ -566,6 +588,15 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
   await expect(page.getByText("AI · Hình ảnh", { exact: true })).toHaveCount(2);
   await expect(page.getByText("Dữ liệu từ ứng dụng", { exact: true })).toHaveCount(0);
   expect(visionPayloads).toHaveLength(1);
+  const supportingDetailsRequest = agentPayloads.find((payload) => (
+    [...(payload.messages ?? [])].reverse()
+      .find((message: any) => message?.role === "user")
+      ?.content === "Which visible details support that description?"
+  ));
+  expect(JSON.stringify(supportingDetailsRequest)).toContain("anime2.jpeg");
+  expect(JSON.stringify(supportingDetailsRequest)).toContain("small blue square");
+  expect(JSON.stringify(supportingDetailsRequest)).not.toContain("app-provided data");
+  expect(JSON.stringify(supportingDetailsRequest)).not.toContain("use the tool to search again");
   expect(visionPayloads[0]).toMatchObject({
     mode: "vision",
     language: "vi",

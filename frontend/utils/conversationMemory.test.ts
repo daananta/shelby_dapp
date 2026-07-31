@@ -28,9 +28,10 @@ describe("scoped conversation memory", () => {
     expect(JSON.stringify(history)).not.toContain("Tài liệu nói về Shelby SDK");
     expect(JSON.stringify(history)).not.toContain('"sources"');
     expect(JSON.stringify(history)).not.toContain('"source"');
+    expect(JSON.stringify(history)).not.toContain("If the user follows up");
   });
 
-  it("keeps only a safe capability marker for blob-inventory follow-ups", () => {
+  it("keeps only bounded declarative metadata for blob-inventory follow-ups", () => {
     const history = buildAdaptiveGeminiHistory([
       { role: "user", text: "Ví này có bao nhiêu blob?" },
       {
@@ -47,11 +48,31 @@ describe("scoped conversation memory", () => {
       },
     ]);
     const serialized = JSON.stringify(history);
-    expect(serialized).toContain("get_wallet_blob_inventory");
-    expect(serialized).toContain("refresh_wallet_blob_inventory");
-    expect(serialized).toContain("never use document search");
+    expect(serialized).toContain("Previous Shelby inventory observation");
+    expect(serialized).toContain("status=verified");
+    expect(serialized).not.toContain("If the user");
+    expect(serialized).not.toContain("call get_wallet_blob_inventory");
     expect(serialized).not.toContain("35 blob");
     expect(serialized).not.toContain("private-plan.pdf");
     expect(serialized).not.toContain("secret-name.txt");
+  });
+
+  it("keeps the prior user-visible image answer and exact source for natural follow-ups", () => {
+    const history = buildAdaptiveGeminiHistory([
+      { role: "user", text: "Describe what is visible in this image." },
+      {
+        role: "ai",
+        text: "The character has silver-white hair, holds a blue mug, and sits beneath a cloudy sky.",
+        tool: "show_images",
+        imageUrls: ["blob:https://example.test/image"],
+        referencedSources: ["anime2.jpeg"],
+      },
+    ]);
+    const serialized = JSON.stringify(history);
+    expect(serialized).toContain("Indexed image context");
+    expect(serialized).toContain("anime2.jpeg");
+    expect(serialized).toContain("silver-white hair");
+    expect(serialized).not.toContain("app-provided data");
+    expect(serialized).not.toContain("use the tool to search again");
   });
 });

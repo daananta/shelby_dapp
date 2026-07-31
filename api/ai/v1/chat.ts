@@ -94,7 +94,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "inspect_application",
-      description: "Use read-only app capabilities for wallet/account facts, indexed image previews and descriptions, document inventory, identity, or deterministic calculations. Do not use for document content or blob names/counts.",
+      description: "Use read-only app capabilities for wallet/account facts, indexed image previews and descriptions, document inventory, identity, or deterministic calculations. For a request to show, open, or describe a named indexed image, call this directly; the UI attaches returned previews. Once it succeeds, answer immediately instead of calling another tool. Do not use for document content or generic blob inventory names/counts.",
       parameters: {
         type: "object",
         properties: {

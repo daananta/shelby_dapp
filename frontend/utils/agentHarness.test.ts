@@ -3,6 +3,8 @@ import {
   AgentHarnessLimitError,
   createFinalAnswerRepairInstruction,
   createAgentHarnessState,
+  createToolBudgetExhaustedResponses,
+  createToolBudgetFinalizationInstruction,
   executeAgentToolCalls,
   validateAgentFinalAnswer,
   type AgentToolDefinition,
@@ -13,6 +15,21 @@ function registry(...definitions: AgentToolDefinition[]) {
 }
 
 describe("bounded agent harness", () => {
+  it("creates a provider-neutral finalization response without exposing internal limits", () => {
+    expect(createToolBudgetExhaustedResponses([
+      { name: "inspect_application", args: { query: "show image" } },
+    ])).toEqual([{
+      functionResponse: {
+        name: "inspect_application",
+        response: expect.objectContaining({ ok: false, code: "tool_budget_exhausted" }),
+      },
+    }]);
+    const instruction = createToolBudgetFinalizationInstruction();
+    expect(instruction).toContain("Do not call another tool");
+    expect(instruction).toMatch(/answer/i);
+    expect(instruction).not.toContain("agent_round_limit");
+  });
+
   it("carries execution budgets across sequential tool rounds", async () => {
     const inventory = vi.fn()
       .mockResolvedValueOnce({ ok: false, code: "stale_snapshot" })

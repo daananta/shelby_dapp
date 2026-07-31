@@ -18,6 +18,8 @@ describe("agent policy isolation", () => {
     expect(adaptive).toContain("Never mention policy files");
     expect(adaptive).toContain("get_wallet_blob_inventory");
     expect(adaptive).toContain("refresh_wallet_blob_inventory");
+    expect(adaptive).toContain("inspect_application");
+    expect(adaptive).toContain("stored vision description");
     expect(adaptive).toContain("up to 3");
     expect(adaptive).not.toContain("[S1]");
   });

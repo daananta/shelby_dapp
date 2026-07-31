@@ -158,6 +158,13 @@ describe("chat tools", () => {
     const namedResult = await runChatTool("cover.jpg của tôi mô tả cái gì?");
     expect(namedResult).toMatchObject({ name: "show_images", imageUrls: ["https://example.test/cover.jpg"] });
     expect(namedResult?.text).toContain("chiếc xe thể thao màu đỏ");
+
+    const shelbyNamedResult = await runChatTool("Show me cover.jpg from my indexed Shelby blobs.", undefined, { language: "en" });
+    expect(shelbyNamedResult).toMatchObject({
+      name: "show_images",
+      imageUrls: ["https://example.test/cover.jpg"],
+      referencedSources: ["cover.jpg"],
+    });
   });
 
   it("returns an image preview for a filename even before cloud vision has described it", async () => {

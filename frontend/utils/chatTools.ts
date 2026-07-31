@@ -423,7 +423,15 @@ export async function runChatTool(question: string, address?: string, context: C
   const asksForBlobInventory = /(?:danh sách|liệt kê)(?:\s+(?:tất cả|toàn bộ))?\s+(?:blob|tệp|file)|(?:bao nhiêu|mấy)\s+(?:blob|tệp|file)|(?:blob|tệp|file).*(?:nào|gì)|(list|show|how many|which|what).*(blobs?|files?)/i.test(normalized)
     || (asksForLiveBlobInventoryRefresh(normalized) && /(?:blob|tệp|files?)/i.test(normalized));
   const asksAboutOwnInventory = /(ví|kho|tài khoản|của\s+(?:tôi|mình)|tôi\s+(?:có|đang)|mình\s+(?:có|đang)|wallet|library|account|\bmy\b|\bi have\b|\bdo i\b)/i.test(normalized);
-  if (asksForBlobInventory && asksAboutOwnInventory && !/(toàn mạng|toàn bộ mạng|shelby\s+(?:có|đang có)|entire network|network-wide|across (?:the )?shelby network|does shelby have)/i.test(normalized)) {
+  const explicitlyOpensNamedImage = /\.(?:avif|gif|jpe?g|png|webp)(?:\s|$|[?!,.)])/i.test(normalized)
+    && /(?:show|display|open|describe|view|preview|xem|hiển thị|mở|mô tả)/i.test(normalized);
+  if (
+    asksForBlobInventory
+    && asksAboutOwnInventory
+    && !context.forceImage
+    && !explicitlyOpensNamedImage
+    && !/(toàn mạng|toàn bộ mạng|shelby\s+(?:có|đang có)|entire network|network-wide|across (?:the )?shelby network|does shelby have)/i.test(normalized)
+  ) {
     return readBlobInventory(blobInventoryDetailForQuestion(question), context);
   }
 

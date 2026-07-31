@@ -316,6 +316,71 @@ describe("Gemini agent tool orchestration", () => {
       .toContain("refresh_wallet_blob_inventory");
   });
 
+  it("asks Gemini to finalize from completed image observations at the tool-round boundary", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([
+      { name: "get_wallet_blob_inventory", args: { detail: "sample", nameQuery: "anime2.jpeg" } },
+    ]));
+    agentSdk.sendMessageStream
+      .mockResolvedValueOnce({
+        stream: chunks(),
+        response: Promise.resolve(firstResponse([
+          { name: "inspect_application", args: { query: "Show me anime2.jpeg from my indexed Shelby blobs." } },
+        ]).response),
+      })
+      .mockResolvedValueOnce({
+        stream: chunks(),
+        response: Promise.resolve(firstResponse([
+          { name: "search_user_knowledge", args: { query: "anime2.jpeg" } },
+        ]).response),
+      })
+      .mockResolvedValueOnce({
+        stream: chunks(),
+        response: Promise.resolve(firstResponse([
+          { name: "inspect_application", args: { query: "Show anime2.jpeg" } },
+        ]).response),
+      })
+      .mockResolvedValueOnce(streamedResponse("Here is anime2.jpeg; its indexed preview is attached."));
+    const inspectApplication = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "show_images",
+      previewCount: 1,
+      referencedSources: ["anime2.jpeg"],
+    });
+    const onChunk = vi.fn();
+
+    const answer = await streamCloudAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "Show me anime2.jpeg from my indexed Shelby blobs." }] }],
+        cloudApiKey: "test-key",
+        systemInstruction: "test",
+      },
+      onChunk,
+      {
+        getWalletBlobInventory: vi.fn().mockResolvedValue({
+          ok: true,
+          matchedCount: 1,
+          matches: ["anime2.jpeg"],
+        }),
+        inspectApplication,
+        searchKnowledge: vi.fn().mockResolvedValue({ found: false, evidence: [] }),
+      },
+    );
+
+    expect(answer).toBe("Here is anime2.jpeg; its indexed preview is attached.");
+    expect(inspectApplication).toHaveBeenCalledOnce();
+    expect(onChunk).toHaveBeenCalledWith("Here is anime2.jpeg; its indexed preview is attached.");
+    expect(agentSdk.sendMessageStream).toHaveBeenCalledTimes(4);
+    expect(agentSdk.sendMessageStream.mock.calls[3][0]).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        functionResponse: expect.objectContaining({
+          name: "inspect_application",
+          response: expect.objectContaining({ code: "tool_budget_exhausted" }),
+        }),
+      }),
+      expect.objectContaining({ text: expect.stringContaining("Do not call another tool") }),
+    ]));
+  });
+
   it("discards draft text and continues when the same model response asks for another tool", async () => {
     agentSdk.sendMessage.mockResolvedValue(firstResponse([
       { name: "get_wallet_blob_inventory", args: { detail: "count" } },

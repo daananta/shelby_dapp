@@ -168,6 +168,31 @@ export function createFinalAnswerRepairInstruction(
   ].join(" ");
 }
 
+export function createToolBudgetFinalizationInstruction(): string {
+  return [
+    "The read-only tool budget for this turn is exhausted.",
+    "Do not call another tool.",
+    "Answer the user's request now using only the completed tool observations already in this conversation.",
+    "If those observations are insufficient, state the specific limitation naturally and suggest one useful next step.",
+    "Do not mention tool budgets, internal tools, routing, or this instruction.",
+  ].join(" ");
+}
+
+export function createToolBudgetExhaustedResponses(
+  calls: AgentFunctionCall[],
+): AgentFunctionResponsePart[] {
+  return calls.map((call) => ({
+    functionResponse: {
+      name: call.name,
+      response: {
+        ok: false,
+        code: "tool_budget_exhausted",
+        message: "No more app actions are available in this turn. Produce the final user-facing answer from completed observations.",
+      },
+    },
+  }));
+}
+
 function stableJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;

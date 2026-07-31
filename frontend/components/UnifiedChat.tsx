@@ -391,7 +391,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             assertRequestCurrent();
             requestSignal?.throwIfAborted();
             const result = readBlobInventory(inventoryRequest.detail, { language });
-            agentToolResult = result;
+            if (!agentToolResult?.imageUrls?.length) agentToolResult = result;
             const payload = readBlobInventoryForAgent(inventoryRequest);
             const status = payload.status;
             if (status === "not_loaded") return { ...payload, ok: false, code: "inventory_unavailable" };
@@ -454,7 +454,11 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       );
       assertRequestCurrent();
       let finalAgentToolResult = agentToolResult as ChatToolResult | null;
-      let grounding = finalizeCitationGrounding(
+      const hasImagePreview = Boolean(finalAgentToolResult?.imageUrls?.length);
+      const shouldGroundKnowledgeAnswer = knowledgeSearchAttempted
+        && !hasImagePreview
+        && (relevantDocs.length > 0 || !finalAgentToolResult);
+      const grounding = finalizeCitationGrounding(
         streamedText,
         relevantDocs,
         t(
@@ -462,19 +466,13 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
           "Tôi tìm thấy các đoạn có thể liên quan, nhưng câu trả lời vừa tạo không trích dẫn chúng đáng tin cậy. Tôi sẽ không trình bày đó là câu trả lời đã kiểm chứng; bạn hãy thử hỏi lại.",
         ),
         {
-          retrievalAttempted: knowledgeSearchAttempted,
+          retrievalAttempted: shouldGroundKnowledgeAnswer,
           noEvidenceMessage: t(
             "I searched your knowledge base but could not find evidence relevant enough to answer. Try naming the file or asking with more specific terms.",
             "Tôi đã tìm trong kho dữ liệu nhưng chưa thấy bằng chứng đủ liên quan để trả lời. Hãy thử nêu tên tệp hoặc hỏi cụ thể hơn.",
           ),
         },
       );
-      if (finalAgentToolResult?.name === "blob_inventory" && knowledgeSearchAttempted) {
-        grounding = {
-          ...grounding,
-          answer: `${finalAgentToolResult.text}\n\n${grounding.answer}`,
-        };
-      }
       const citedSources = grounding.sources;
       const citedLinks = citedSources.flatMap((doc) => doc.link ? [{
         label: t(

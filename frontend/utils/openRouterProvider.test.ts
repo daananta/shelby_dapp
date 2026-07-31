@@ -176,6 +176,58 @@ describe("hosted Qwen agent", () => {
     );
   });
 
+  it("forces a final answer after three image-related tool rounds instead of exposing agent_round_limit", async () => {
+    const toolCall = (id: string, name: string, args: object) => jsonResponse({
+      message: {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id,
+          type: "function",
+          function: { name, arguments: JSON.stringify(args) },
+        }],
+      },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(toolCall("inventory-1", "get_wallet_blob_inventory", { detail: "sample", nameQuery: "anime2.jpeg" }))
+      .mockResolvedValueOnce(toolCall("image-1", "inspect_application", { query: "Show me anime2.jpeg from my indexed Shelby blobs." }))
+      .mockResolvedValueOnce(toolCall("search-1", "search_user_knowledge", { query: "anime2.jpeg" }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "Here is anime2.jpeg; its indexed preview is attached." },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const inspectApplication = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "show_images",
+      previewCount: 1,
+      referencedSources: ["anime2.jpeg"],
+    });
+
+    const answer = await streamHostedAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "Show me anime2.jpeg from my indexed Shelby blobs." }] }],
+        systemInstruction: "Use app observations and answer naturally.",
+      },
+      vi.fn(),
+      {
+        getWalletBlobInventory: vi.fn().mockResolvedValue({
+          ok: true,
+          matchedCount: 1,
+          matches: ["anime2.jpeg"],
+        }),
+        inspectApplication,
+        searchKnowledge: vi.fn().mockResolvedValue({ found: false, evidence: [] }),
+      },
+    );
+
+    expect(answer).toBe("Here is anime2.jpeg; its indexed preview is attached.");
+    expect(inspectApplication).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    const finalBody = JSON.parse(String((fetchMock.mock.calls[3][1] as RequestInit).body));
+    expect(finalBody.toolChoice).toBe("none");
+    expect(answer).not.toContain("agent_round_limit");
+  });
+
   it("lets the harness repair a document answer that omitted its tool citation", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse({

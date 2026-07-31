@@ -8,6 +8,8 @@ import {
   AgentHarnessLimitError,
   DEFAULT_AGENT_HARNESS_BUDGET,
   createFinalAnswerRepairInstruction,
+  createToolBudgetExhaustedResponses,
+  createToolBudgetFinalizationInstruction,
   createAgentHarnessState,
   executeAgentToolCalls,
   type AgentFunctionCall,
@@ -375,7 +377,7 @@ export async function streamCloudAgentAnswer(
       }] : []),
       {
         name: "inspect_application",
-        description: "Use the app's read-only capabilities for wallet/account facts, indexed image previews and descriptions, document inventory, identity, or deterministic calculations. Pass a self-contained version of the user's request. Do not use this instead of search_user_knowledge for document content or get_wallet_blob_inventory for blob names/counts.",
+        description: "Use the app's read-only capabilities for wallet/account facts, indexed image previews and descriptions, document inventory, identity, or deterministic calculations. For a request to show, open, or describe a named indexed image, call this directly; the UI attaches returned previews. Once it succeeds, answer immediately instead of calling another tool. Pass a self-contained request. Do not use this instead of search_user_knowledge for document content or get_wallet_blob_inventory for generic blob inventory names/counts.",
         parameters: {
           type: SchemaType.OBJECT,
           properties: {
@@ -531,6 +533,38 @@ export async function streamCloudAgentAnswer(
         const bufferedAnswer = bufferedChunks.join("");
         if (nextCalls.length) {
           if (round >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
+            const finalizationResult = await chat.sendMessageStream([
+              ...createToolBudgetExhaustedResponses(nextCalls),
+              { text: createToolBudgetFinalizationInstruction() },
+            ], {
+              signal,
+              timeout: CLOUD_AGENT_TIMEOUT_MS,
+            });
+            const finalizationChunks: string[] = [];
+            let requestedAnotherTool = false;
+            for await (const chunk of finalizationResult.stream) {
+              signal?.throwIfAborted();
+              const finalizationCalls = typeof chunk.functionCalls === "function" ? chunk.functionCalls() ?? [] : [];
+              if (finalizationCalls.length) {
+                requestedAnotherTool = true;
+                continue;
+              }
+              const text = chunk.text();
+              if (text) finalizationChunks.push(text);
+            }
+            const finalizationResponse = await finalizationResult.response;
+            signal?.throwIfAborted();
+            const finalizationCalls = (finalizationResponse.functionCalls() ?? []) as AgentFunctionCall[];
+            const finalizationAnswer = finalizationChunks.join("") || finalizationResponse.text().trim();
+            if (!requestedAnotherTool && !finalizationCalls.length && finalizationAnswer) {
+              emitted = true;
+              if (finalizationChunks.length) {
+                for (const chunk of finalizationChunks) onChunk(chunk);
+              } else {
+                onChunk(finalizationAnswer);
+              }
+              return finalizationAnswer;
+            }
             throw new AgentHarnessLimitError("agent_round_limit");
           }
           // Planning text can precede a function call. Keep it private and

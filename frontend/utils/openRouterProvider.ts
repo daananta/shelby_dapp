@@ -2,6 +2,8 @@ import {
   AgentHarnessLimitError,
   DEFAULT_AGENT_HARNESS_BUDGET,
   createFinalAnswerRepairInstruction,
+  createToolBudgetExhaustedResponses,
+  createToolBudgetFinalizationInstruction,
   createAgentHarnessState,
   executeAgentToolCalls,
   type AgentFunctionCall,
@@ -189,7 +191,11 @@ export async function streamHostedAgentAnswer(
   let repairOnly = false;
   while (toolRound <= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
     signal?.throwIfAborted();
-    const response = await requestHostedChat(messages, signal, repairOnly ? "none" : "auto");
+    const response = await requestHostedChat(
+      messages,
+      signal,
+      repairOnly || toolRound >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds ? "none" : "auto",
+    );
     const calls = parseToolCalls(response?.tool_calls);
     if (!calls.length) {
       const answer = typeof response?.content === "string" ? response.content.trim() : "";
@@ -213,7 +219,39 @@ export async function streamHostedAgentAnswer(
       return finalAnswer;
     }
     if (toolRound >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
-      throw new AgentHarnessLimitError("agent_round_limit");
+      messages.push({
+        role: "assistant",
+        content: typeof response?.content === "string" ? response.content : null,
+        ...(Array.isArray(response?.reasoning_details) ? { reasoning_details: response.reasoning_details } : {}),
+        tool_calls: calls.map((call) => ({
+          id: call.id,
+          type: "function",
+          function: { name: call.name, arguments: JSON.stringify(call.args ?? {}) },
+        })),
+      });
+      const exhausted = createToolBudgetExhaustedResponses(calls);
+      exhausted.forEach((part, index) => {
+        messages.push({
+          role: "tool",
+          tool_call_id: calls[index]?.id ?? "",
+          content: JSON.stringify(part.functionResponse.response),
+        });
+      });
+      messages.push({ role: "user", content: createToolBudgetFinalizationInstruction() });
+      const finalResponse = await requestHostedChat(messages, signal, "none");
+      const finalAnswer = typeof finalResponse?.content === "string" ? finalResponse.content.trim() : "";
+      if (!finalAnswer || parseToolCalls(finalResponse?.tool_calls).length) {
+        throw new HostedAiError(
+          "invalid_response",
+          localize(
+            "The AI could not finish this request from the available app data. Please try a more specific request.",
+            "AI chưa thể hoàn tất yêu cầu từ dữ liệu ứng dụng hiện có. Hãy thử nêu yêu cầu cụ thể hơn.",
+          ),
+        );
+      }
+      signal?.throwIfAborted();
+      onChunk(finalAnswer);
+      return finalAnswer;
     }
     toolRound += 1;
 
@@ -227,13 +265,25 @@ export async function streamHostedAgentAnswer(
         function: { name: call.name, arguments: JSON.stringify(call.args ?? {}) },
       })),
     });
-    const batch = await executeAgentToolCalls({
-      calls,
-      registry: toolRegistry,
-      state: harnessState,
-      round: toolRound,
-      signal,
-    });
+    let batch;
+    try {
+      batch = await executeAgentToolCalls({
+        calls,
+        registry: toolRegistry,
+        state: harnessState,
+        round: toolRound,
+        signal,
+      });
+    } catch (error) {
+      if (!(error instanceof AgentHarnessLimitError)) throw error;
+      throw new HostedAiError(
+        "invalid_response",
+        localize(
+          "The AI requested more app data than this turn allows. Please try a more specific request.",
+          "AI yêu cầu nhiều dữ liệu ứng dụng hơn giới hạn của lượt này. Hãy thử nêu yêu cầu cụ thể hơn.",
+        ),
+      );
+    }
     batch.responses.forEach((part, index) => {
       messages.push({
         role: "tool",
@@ -242,5 +292,11 @@ export async function streamHostedAgentAnswer(
       });
     });
   }
-  throw new AgentHarnessLimitError("agent_round_limit");
+  throw new HostedAiError(
+    "invalid_response",
+    localize(
+      "The AI could not finish this request from the available app data. Please try again.",
+      "AI chưa thể hoàn tất yêu cầu từ dữ liệu ứng dụng hiện có. Hãy thử lại.",
+    ),
+  );
 }

@@ -165,6 +165,19 @@ describe("chat tools", () => {
       imageUrls: ["https://example.test/cover.jpg"],
       referencedSources: ["cover.jpg"],
     });
+
+    for (const question of [
+      "Which indexed image blobs are available?",
+      "List indexed image blobs",
+      "Inspect indexed image blobs",
+    ]) {
+      const listResult = await runChatTool(question, undefined, { language: "en" });
+      expect(listResult).toMatchObject({
+        name: "show_images",
+        imageUrls: ["https://example.test/cover.jpg"],
+        referencedSources: ["cover.jpg"],
+      });
+    }
   });
 
   it("returns an image preview for a filename even before cloud vision has described it", async () => {

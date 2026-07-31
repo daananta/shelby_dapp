@@ -551,7 +551,7 @@ export async function runChatTool(question: string, address?: string, context: C
     const names = [image.source, image.displayName].map((value) => value.toLocaleLowerCase("vi-VN"));
     return names.some((name) => name && normalized.includes(name));
   });
-  const asksForImage = requestedImageByName || context.forceImage || /((blob|tệp|file).*(ảnh|hình)|(ảnh|hình).*(blob|tệp|file)|(tôi|mình).*(có).*(ảnh|hình)|(ảnh|hình).*(nào|không|ko)|(xem|hiển thị|mở).*?(ảnh|hình)|(mô tả|nội dung).*(ảnh|hình)|(?:show|display|open|describe).*(?:images?|photos?)|(?:images?|photos?).*(?:which|what|available|do i have)|(?:what is|what's).*(?:in|shown).*(?:image|photo))/i.test(normalized);
+  const asksForImage = requestedImageByName || context.forceImage || /((blob|tệp|file).*(ảnh|hình)|(ảnh|hình).*(blob|tệp|file)|(tôi|mình).*(có).*(ảnh|hình)|(ảnh|hình).*(nào|không|ko)|(?:liệt kê|danh sách|xem|hiển thị|mở).*?(ảnh|hình)|(mô tả|nội dung).*(ảnh|hình)|(?:list|show|display|open|describe|inspect|browse|enumerate).*(?:images?|photos?)|(?:images?|photos?).*(?:which|what|available|do i have)|(?:what is|what's).*(?:in|shown).*(?:image|photo))/i.test(normalized);
   const asksForImageDescription = context.forceImageDescription || /(mô tả|nội dung|trong ảnh|ảnh.*gì|hình.*gì|describe|what.*(?:in|shown).*(?:image|photo)|image.*(?:content|show)|photo.*(?:content|show))/i.test(normalized);
   if (asksForImage) {
     if (!imageDocuments.length) {

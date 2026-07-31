@@ -377,7 +377,7 @@ export async function streamCloudAgentAnswer(
       }] : []),
       {
         name: "inspect_application",
-        description: "Use the app's read-only capabilities for wallet/account facts, indexed image previews and descriptions, document inventory, identity, or deterministic calculations. For a request to show, open, or describe a named indexed image, call this directly; the UI attaches returned previews. Once it succeeds, answer immediately instead of calling another tool. Pass a self-contained request. Do not use this instead of search_user_knowledge for document content or get_wallet_blob_inventory for generic blob inventory names/counts.",
+        description: "Use the app's read-only capabilities for wallet/account facts, indexed image previews and descriptions, document inventory, identity, or deterministic calculations. For a request to list indexed images or show, open, or describe a named indexed image, call this directly; the UI attaches returned previews. Once it succeeds, answer immediately instead of calling another tool. Pass a self-contained request. Do not use this instead of search_user_knowledge for document content or get_wallet_blob_inventory for generic blob inventory names/counts.",
         parameters: {
           type: SchemaType.OBJECT,
           properties: {

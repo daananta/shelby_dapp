@@ -31,6 +31,9 @@ describe("query router", () => {
   it("routes a named image blob to the image pipeline without requiring the word ảnh", () => {
     expect(classifyQueryIntent("moai.webp của tôi mô tả cái gì")).toMatchObject({ intent: "image", documentScoped: true });
     expect(classifyQueryIntent("Show me anime2.jpeg from my indexed Shelby blobs.")).toMatchObject({ intent: "image", documentScoped: true });
+    expect(classifyQueryIntent("Which indexed image blobs are available?")).toMatchObject({ intent: "image", documentScoped: true });
+    expect(classifyQueryIntent("List indexed image blobs")).toMatchObject({ intent: "image", documentScoped: true });
+    expect(classifyQueryIntent("Inspect indexed image blobs")).toMatchObject({ intent: "image", documentScoped: true });
   });
 
   it("does not guess ambiguous references with local pronoun rules", () => {

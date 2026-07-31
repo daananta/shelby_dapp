@@ -29,6 +29,9 @@ export function classifyQueryIntent(question: string): RoutedQuery {
   const quotedText = extractQuotedText(question);
   const ownedDataCue = OWNED_DATA_CUE.test(normalized);
   const documentLocationCue = DOCUMENT_LOCATION_CUE.test(normalized);
+  const asksForImageCollection = /(?:ảnh|hình|images?|photos?)/i.test(normalized)
+    && /(?:đã nạp|đã tải|có sẵn|indexed|available|uploaded|stored|blobs?|\bmy\b|của tôi|của mình)/i.test(normalized)
+    && /(?:liệt kê|danh sách|nào|xem|hiển thị|list|which|what|show|inspect|browse|enumerate|available)/i.test(normalized);
   if (quotedText && /(trang nào|ở trang|nằm.*trang|tìm.*trang|which page|what page|page number|find.*page|where.*page)/i.test(normalized)) {
     return { intent: "page_lookup", quotedText, documentScoped: true };
   }
@@ -47,6 +50,9 @@ export function classifyQueryIntent(question: string): RoutedQuery {
   // A concrete image filename is stronger evidence than generic words such as
   // "blob" or "file" that also appear in inventory questions.
   if (/\.(?:avif|gif|jpe?g|png|webp)(?:\s|$|[?!,.)])/i.test(normalized)) {
+    return { intent: "image", documentScoped: true };
+  }
+  if (asksForImageCollection) {
     return { intent: "image", documentScoped: true };
   }
   if (/(liệt kê|danh sách|bao nhiêu|mấy|list|show|how many|which).*(blob|tệp|files?|documents?)|(?:kiểm tra|làm mới|cập nhật|check|refresh|update).*(?:blob|tệp|files?)|(?:do i have|tôi|mình).*(?:có|những|have).*(sách|pdf|ảnh|hình|books?|images?|photos?)|^(?:my|của tôi|của mình)\s+(?:blobs?|files?|documents?|books?|pdfs?|images?|photos?)\??$/i.test(normalized)) {

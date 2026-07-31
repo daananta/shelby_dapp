@@ -401,13 +401,20 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             assertRequestCurrent();
             const activeSignal = requestSignal ?? signal;
             activeSignal.throwIfAborted();
-            const result = await runChatTool(applicationQuery, account?.address.toString(), {
+            const toolContext = {
               preferredSources: cloudRoute?.referencedSources,
               forceImage: resolvedScope === "image",
               forceImageDescription: resolvedScope === "image" && cloudRoute?.imageAction === "describe",
               allowCloudDescription: geminiUsage.contentAnalysis,
               language,
-            }, activeSignal);
+            };
+            let result = await runChatTool(applicationQuery, account?.address.toString(), toolContext, activeSignal);
+            if (
+              (!result || result.name === "blob_inventory")
+              && applicationQuery.trim() !== userQuery
+            ) {
+              result = await runChatTool(userQuery, account?.address.toString(), toolContext, activeSignal);
+            }
             activeSignal.throwIfAborted();
             assertRequestCurrent();
             if (!result || result.name === "blob_inventory") {

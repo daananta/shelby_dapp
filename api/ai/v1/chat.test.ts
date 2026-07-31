@@ -56,6 +56,11 @@ describe("hosted Qwen gateway", () => {
     const [, init] = upstream.mock.calls[0] as [string, RequestInit];
     const upstreamBody = JSON.parse(String(init.body));
     expect(upstreamBody.model).toBe("qwen/qwen3.7-flash");
+    expect(upstreamBody.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        function: expect.objectContaining({ name: "analyze_indexed_image" }),
+      }),
+    ]));
     expect(new Headers(init.headers).get("authorization")).toBe("Bearer server-only-test-key");
     expect(JSON.stringify(recorder.read().payload)).not.toContain("server-only-test-key");
   });
@@ -80,6 +85,154 @@ describe("hosted Qwen gateway", () => {
 
     const [, init] = upstream.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(String(init.body)).tool_choice).toBe("none");
+  });
+
+  it("forwards a bounded image to Qwen as multimodal content without exposing tools", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    const imageData = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00,
+    ]).toString("base64");
+    const question = "Những chi tiết nào trong ảnh hỗ trợ mô tả này?";
+    const upstream = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{
+        message: { role: "assistant", content: "Một hình vuông nhỏ.", providerDebug: imageData },
+        finish_reason: "stop",
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", upstream);
+    const recorder = responseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.11" },
+      body: {
+        mode: "vision",
+        language: "vi",
+        question,
+        image: { data: imageData, mimeType: "image/png", fileName: "sample.png" },
+      },
+    }, recorder.response);
+
+    expect(recorder.read()).toMatchObject({
+      statusCode: 200,
+      payload: { message: { role: "assistant", content: "Một hình vuông nhỏ." } },
+    });
+    const [, init] = upstream.mock.calls[0] as [string, RequestInit];
+    const upstreamBody = JSON.parse(String(init.body));
+    expect(upstreamBody.model).toBe("qwen/qwen3.7-flash");
+    expect(upstreamBody).not.toHaveProperty("tools");
+    expect(upstreamBody).not.toHaveProperty("tool_choice");
+    expect(upstreamBody.messages[0].content[0]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("tiếng Việt"),
+    });
+    expect(upstreamBody.messages[0].content[0].text).toContain(question);
+    expect(upstreamBody.messages[0].content[1]).toEqual({
+      type: "image_url",
+      image_url: { url: `data:image/png;base64,${imageData}` },
+    });
+    expect(new Headers(init.headers).get("authorization")).toBe("Bearer server-only-test-key");
+    expect(JSON.stringify(recorder.read().payload)).not.toContain(imageData);
+    expect(JSON.stringify(recorder.read().payload)).not.toContain("server-only-test-key");
+  });
+
+  it.each([
+    {
+      label: "an unsupported MIME type",
+      ip: "203.0.113.50",
+      image: {
+        data: Buffer.from("<svg></svg>").toString("base64"),
+        mimeType: "image/svg+xml",
+        fileName: "sample.svg",
+      },
+    },
+    {
+      label: "malformed base64",
+      ip: "203.0.113.51",
+      image: { data: "not%base64", mimeType: "image/png", fileName: "sample.png" },
+    },
+    {
+      label: "bytes that do not match the declared MIME type",
+      ip: "203.0.113.52",
+      image: {
+        data: Buffer.from("GIF89a").toString("base64"),
+        mimeType: "image/png",
+        fileName: "sample.png",
+      },
+    },
+  ])("rejects $label before calling the provider", async ({ image, ip }) => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    const recorder = responseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": ip },
+      body: { mode: "vision", language: "en", question: "What is visible in this image?", image },
+    }, recorder.response);
+
+    expect(recorder.read()).toMatchObject({
+      statusCode: 400,
+      payload: { kind: "invalid_image" },
+    });
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("rejects decoded images larger than two MiB before calling the provider", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    const recorder = responseRecorder();
+    const bytes = Buffer.alloc((2 * 1024 * 1024) + 1);
+    Buffer.from([0xff, 0xd8, 0xff]).copy(bytes);
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.12" },
+      body: {
+        mode: "vision",
+        language: "en",
+        question: "Describe the visible content.",
+        image: { data: bytes.toString("base64"), mimeType: "image/jpeg", fileName: "large.jpg" },
+      },
+    }, recorder.response);
+
+    expect(recorder.read()).toMatchObject({
+      statusCode: 413,
+      payload: { kind: "image_too_large" },
+    });
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("rejects a vision request without the user's visual question", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    const recorder = responseRecorder();
+    const imageData = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00,
+    ]).toString("base64");
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.13" },
+      body: {
+        mode: "vision",
+        language: "en",
+        image: { data: imageData, mimeType: "image/png", fileName: "sample.png" },
+      },
+    }, recorder.response);
+
+    expect(recorder.read()).toMatchObject({
+      statusCode: 400,
+      payload: { kind: "invalid_image" },
+    });
+    expect(upstream).not.toHaveBeenCalled();
   });
 
   it("rejects another origin before calling the provider", async () => {

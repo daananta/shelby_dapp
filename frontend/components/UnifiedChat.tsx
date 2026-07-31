@@ -6,9 +6,9 @@ import { Input } from "@/components/ui/input";
 import { ArrowDown, Bookmark, ChevronDown, Cloud, Database, FileCheck2, Fingerprint, KeyRound, MessageSquare, Send, ShieldCheck, Sparkles, Square, Trash2, X } from "lucide-react";
 import { deactivateActiveRagOwner, getPageRecord, getRagSources, hasRemoteRagProvider, isHotRemoteRagProvider, searchDocuments, setActiveRagOwner } from "@/utils/ragOrama";
 import type { AnswerReceipt, RetrievalResult } from "@/utils/ragTypes";
-import { clearStoredCloudApiKey, getCloudErrorKind, getStoredCloudApiKey, isCloudProviderError, normalizeCloudError, resolveConversationRouteWithCloud, storeCloudApiKey, streamCloudAgentAnswer, verifyCloudApiKey } from "@/utils/aiProvider";
-import { streamHostedAgentAnswer } from "@/utils/openRouterProvider";
-import { createChatToolObservation, readBlobInventory, readBlobInventoryForAgent, runChatTool, type ChatToolResult } from "@/utils/chatTools";
+import { clearStoredCloudApiKey, describeImageWithCloud, getCloudErrorKind, getStoredCloudApiKey, isCloudProviderError, normalizeCloudError, storeCloudApiKey, streamCloudAgentAnswer, verifyCloudApiKey } from "@/utils/aiProvider";
+import { describeImageWithHostedAi, streamHostedAgentAnswer } from "@/utils/openRouterProvider";
+import { analyzeIndexedImage, createChatToolObservation, readBlobInventory, readBlobInventoryForAgent, runChatTool, type ChatToolResult } from "@/utils/chatTools";
 import { buildAdaptiveAgentSystemInstruction, isInternalGuideSource } from "@/utils/agentPolicy";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -318,18 +318,12 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       setStatus("");
       if (account) await setActiveRagOwner(account.address.toString());
       assertRequestCurrent();
-      const recentTurns = messages.slice(-6).map((message) => ({
-        role: message.role,
-        text: message.text.slice(0, 600),
-        sources: [...new Set([...(message.referencedSources ?? []), ...(message.sources?.map((source) => source.source) ?? [])])],
-      }));
-      const availableSources = [...new Set(recentTurns.flatMap((turn) => turn.sources))];
-      const hasRecentImage = messages.slice(-3).some((message) => Boolean(message.imageUrls?.length));
-      const cloudRoute = geminiUsage.contentAnalysis && geminiApiKey && hasRecentImage && availableSources.length
-        ? await resolveConversationRouteWithCloud({ question: userQuery, recentTurns, availableSources, cloudApiKey: geminiApiKey, signal })
-        : null;
-      assertRequestCurrent();
-      const resolvedScope = cloudRoute && cloudRoute.confidence >= 0.55 ? cloudRoute.scope : null;
+      const recentImageMessage = [...messages.slice(-4)].reverse().find((message) => (
+        message.role === "ai"
+        && Boolean(message.imageUrls?.length)
+        && Boolean(message.referencedSources?.length)
+      ));
+      const preferredImageSources = recentImageMessage?.referencedSources ?? [];
       if (!geminiUsage.chat) {
         updateCurrentMessages((previous) => [...previous, createChatMessage({ role: "ai", text: t(
           "AI chat is off. You can enable it in Settings; wallet and Shelby data tools remain available.",
@@ -402,10 +396,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             const activeSignal = requestSignal ?? signal;
             activeSignal.throwIfAborted();
             const toolContext = {
-              preferredSources: cloudRoute?.referencedSources,
-              forceImage: resolvedScope === "image",
-              forceImageDescription: resolvedScope === "image" && cloudRoute?.imageAction === "describe",
-              allowCloudDescription: geminiUsage.contentAnalysis,
+              preferredSources: preferredImageSources,
               language,
             };
             let result = await runChatTool(applicationQuery, account?.address.toString(), toolContext, activeSignal);
@@ -428,6 +419,39 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
               referencedSources: result.referencedSources ?? [],
               previewCount: result.imageUrls?.length ?? 0,
               linkCount: result.links?.length ?? 0,
+            };
+          },
+          analyzeIndexedImage: async ({ source, question }, requestSignal) => {
+            assertRequestCurrent();
+            const activeSignal = requestSignal ?? signal;
+            activeSignal.throwIfAborted();
+            const outcome = await analyzeIndexedImage(source, question, {
+              preferredSources: preferredImageSources,
+              language,
+              provider: geminiApiKey ? "gemini" : "qwen",
+              describeImage: (image, visualQuestion, visionSignal) => geminiApiKey
+                ? describeImageWithCloud(image.url, image.displayName, geminiApiKey, visionSignal ?? activeSignal, undefined, visualQuestion)
+                : describeImageWithHostedAi(image.url, image.displayName, language, visionSignal ?? activeSignal, undefined, visualQuestion),
+            }, activeSignal);
+            activeSignal.throwIfAborted();
+            assertRequestCurrent();
+            if (!outcome.ok) {
+              return {
+                ok: false,
+                code: outcome.code,
+                candidates: outcome.candidates,
+                message: "Choose one indexed image source before visual analysis. Do not infer pixels from its filename.",
+              };
+            }
+            agentToolResult = outcome.result;
+            return {
+              ok: true,
+              kind: "image_analysis",
+              facts: outcome.result.text,
+              cached: outcome.cached,
+              referencedSources: outcome.result.referencedSources ?? [],
+              previewCount: outcome.result.imageUrls?.length ?? 0,
+              linkCount: outcome.result.links?.length ?? 0,
             };
           },
           ...(refreshBlobInventory ? {
@@ -823,6 +847,8 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
                     <><Bookmark className="h-3 w-3 text-emerald-600" /><span>{t("Sourced answer", "Trả lời có nguồn")}</span></>
                   ) : message.tool === "blob_inventory" ? (
                     <><Database className="h-3 w-3 text-emerald-600" /><span>{t("Shelby data", "Dữ liệu Shelby")}</span></>
+                  ) : message.tool === "show_images" ? (
+                    <><Sparkles className="h-3 w-3 text-emerald-600" /><span>{t("AI · Image", "AI · Hình ảnh")}</span></>
                   ) : message.tool ? (
                     <><Database className="h-3 w-3 text-emerald-600" /><span>{t("App data", "Dữ liệu từ ứng dụng")}</span></>
                   ) : (

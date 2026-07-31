@@ -35,6 +35,11 @@ type HostedChatResponse = {
   };
 };
 
+const MAX_HOSTED_IMAGE_BYTES = 2 * 1024 * 1024;
+const MAX_HOSTED_IMAGE_SOURCE_BYTES = 12 * 1024 * 1024;
+const MAX_HOSTED_IMAGE_EDGE = 1_600;
+const SUPPORTED_HOSTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+
 export class HostedAiError extends Error {
   constructor(
     readonly kind: "rate_limit" | "unavailable" | "invalid_response",
@@ -44,6 +49,216 @@ export class HostedAiError extends Error {
     super(message);
     this.name = "HostedAiError";
   }
+}
+
+function hostedImageError(message: string, vietnamese: string, status: number) {
+  return new HostedAiError("unavailable", localize(message, vietnamese), status);
+}
+
+function parseContentLength(value: string | null): number | undefined {
+  if (!value || !/^\d+$/.test(value.trim())) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+function detectHostedImageMimeType(bytes: Uint8Array): string | undefined {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (
+    bytes.length >= 8
+    && bytes[0] === 0x89
+    && bytes[1] === 0x50
+    && bytes[2] === 0x4e
+    && bytes[3] === 0x47
+    && bytes[4] === 0x0d
+    && bytes[5] === 0x0a
+    && bytes[6] === 0x1a
+    && bytes[7] === 0x0a
+  ) return "image/png";
+  if (
+    bytes.length >= 12
+    && String.fromCharCode(...bytes.subarray(0, 4)) === "RIFF"
+    && String.fromCharCode(...bytes.subarray(8, 12)) === "WEBP"
+  ) return "image/webp";
+  if (bytes.length >= 6) {
+    const signature = String.fromCharCode(...bytes.subarray(0, 6));
+    if (signature === "GIF87a" || signature === "GIF89a") return "image/gif";
+  }
+  return undefined;
+}
+
+async function readHostedImageBytes(response: Response, signal?: AbortSignal): Promise<Uint8Array> {
+  const declaredBytes = parseContentLength(response.headers.get("content-length"));
+  if (declaredBytes !== undefined && declaredBytes > MAX_HOSTED_IMAGE_SOURCE_BYTES) {
+    throw hostedImageError(
+      "This image is too large to prepare safely for live analysis.",
+      "Ảnh này quá lớn để chuẩn bị an toàn cho phân tích trực tiếp.",
+      413,
+    );
+  }
+  const declaredType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
+  if (declaredType && declaredType !== "application/octet-stream" && !SUPPORTED_HOSTED_IMAGE_TYPES.has(declaredType)) {
+    throw hostedImageError(
+      "This image format is not supported for live analysis.",
+      "Định dạng ảnh này chưa được hỗ trợ để phân tích trực tiếp.",
+      415,
+    );
+  }
+  if (!response.body) {
+    throw hostedImageError(
+      "The image source could not be read safely.",
+      "Không thể đọc nguồn ảnh một cách an toàn.",
+      502,
+    );
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let receivedBytes = 0;
+  const abortReader = () => { void reader.cancel(signal?.reason).catch(() => undefined); };
+  signal?.addEventListener("abort", abortReader, { once: true });
+  try {
+    let complete = false;
+    while (!complete) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      if (done) {
+        complete = true;
+        continue;
+      }
+      receivedBytes += value.byteLength;
+      if (receivedBytes > MAX_HOSTED_IMAGE_SOURCE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw hostedImageError(
+          "This image is too large to prepare safely for live analysis.",
+          "Ảnh này quá lớn để chuẩn bị an toàn cho phân tích trực tiếp.",
+          413,
+        );
+      }
+      chunks.push(value);
+    }
+  } finally {
+    signal?.removeEventListener("abort", abortReader);
+  }
+  signal?.throwIfAborted();
+
+  const bytes = new Uint8Array(receivedBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+type CanvasLike = {
+  width: number;
+  height: number;
+  getContext: (contextId: "2d") => Pick<CanvasRenderingContext2D, "drawImage"> | null;
+  convertToBlob?: (options?: ImageEncodeOptions) => Promise<Blob>;
+  toBlob?: (callback: BlobCallback, type?: string, quality?: number) => void;
+};
+
+async function canvasAsBlob(
+  canvas: CanvasLike,
+  type: "image/webp" | "image/jpeg",
+  quality: number,
+): Promise<Blob | null> {
+  if (typeof canvas.convertToBlob === "function") {
+    return canvas.convertToBlob({ type, quality });
+  }
+  const toBlob = canvas.toBlob;
+  if (typeof toBlob === "function") {
+    return new Promise((resolve) => toBlob.call(canvas, resolve, type, quality));
+  }
+  return null;
+}
+
+function createHostedCanvas(width: number, height: number): CanvasLike | null {
+  if (typeof OffscreenCanvas !== "undefined") {
+    return new OffscreenCanvas(width, height) as unknown as CanvasLike;
+  }
+  if (typeof document === "undefined") return null;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  return canvas;
+}
+
+async function compressHostedImage(
+  bytes: Uint8Array,
+  mimeType: string,
+  signal?: AbortSignal,
+): Promise<{ bytes: Uint8Array; mimeType: string }> {
+  signal?.throwIfAborted();
+  if (typeof createImageBitmap !== "function") {
+    throw hostedImageError(
+      "This image is larger than 2 MB and this browser cannot reduce it safely.",
+      "Ảnh lớn hơn 2 MB và trình duyệt này không thể giảm kích thước ảnh một cách an toàn.",
+      413,
+    );
+  }
+
+  const bitmap = await createImageBitmap(new Blob([Uint8Array.from(bytes).buffer], { type: mimeType }));
+  try {
+    signal?.throwIfAborted();
+    if (!bitmap.width || !bitmap.height) {
+      throw hostedImageError(
+        "The image dimensions are invalid.",
+        "Kích thước ảnh không hợp lệ.",
+        415,
+      );
+    }
+    const initialScale = Math.min(1, MAX_HOSTED_IMAGE_EDGE / Math.max(bitmap.width, bitmap.height));
+    const attempts = [
+      { scale: initialScale, quality: 0.82 },
+      { scale: initialScale * 0.85, quality: 0.68 },
+      { scale: initialScale * 0.7, quality: 0.54 },
+      { scale: initialScale * 0.55, quality: 0.42 },
+    ];
+    for (const attempt of attempts) {
+      signal?.throwIfAborted();
+      const width = Math.max(1, Math.round(bitmap.width * attempt.scale));
+      const height = Math.max(1, Math.round(bitmap.height * attempt.scale));
+      const canvas = createHostedCanvas(width, height);
+      const context = canvas?.getContext("2d");
+      if (!canvas || !context) break;
+      context.drawImage(bitmap, 0, 0, width, height);
+      const output = await canvasAsBlob(canvas, "image/webp", attempt.quality)
+        ?? await canvasAsBlob(canvas, "image/jpeg", attempt.quality);
+      signal?.throwIfAborted();
+      if (!output || output.size > MAX_HOSTED_IMAGE_BYTES) continue;
+      const outputBytes = new Uint8Array(await output.arrayBuffer());
+      signal?.throwIfAborted();
+      const outputMimeType = detectHostedImageMimeType(outputBytes);
+      if (outputMimeType && outputMimeType !== "image/gif") {
+        return { bytes: outputBytes, mimeType: outputMimeType };
+      }
+    }
+  } finally {
+    bitmap.close();
+  }
+  throw hostedImageError(
+    "This image could not be reduced below the safe 2 MB limit.",
+    "Không thể giảm ảnh xuống dưới giới hạn an toàn 2 MB.",
+    413,
+  );
+}
+
+function bytesAsBase64(bytes: Uint8Array, signal?: AbortSignal): string {
+  signal?.throwIfAborted();
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    signal?.throwIfAborted();
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function isAllowedHostedImageUrl(url: URL): boolean {
+  if (url.protocol === "https:" || url.protocol === "blob:") return true;
+  if (url.protocol !== "http:" || typeof window === "undefined") return false;
+  const isLoopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  return isLoopback && url.origin === window.location.origin;
 }
 
 function contentText(value: unknown): string {
@@ -120,6 +335,93 @@ async function requestHostedChat(
 }
 
 /**
+ * Sends one already-authorized indexed image through the same-origin gateway.
+ * The provider credential stays server-side and image bytes are never returned
+ * to the agent tool transcript or persisted in chat history.
+ */
+export async function describeImageWithHostedAi(
+  imageUrl: string,
+  fileName: string,
+  language: "en" | "vi",
+  signal?: AbortSignal,
+  _detectedMimeType?: string,
+  question = language === "vi" ? "Mô tả chính xác nội dung ảnh." : "Describe the image accurately.",
+): Promise<string | null> {
+  signal?.throwIfAborted();
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(imageUrl);
+  } catch {
+    throw hostedImageError("The image source is invalid.", "Nguồn ảnh không hợp lệ.", 400);
+  }
+  if (!isAllowedHostedImageUrl(parsedUrl)) {
+    throw hostedImageError("The image source is not allowed.", "Nguồn ảnh không được phép.", 400);
+  }
+  const imageResponse = await fetch(imageUrl, {
+    signal,
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+  });
+  if (!imageResponse.ok) {
+    throw new HostedAiError(
+      "unavailable",
+      localize(`Unable to download the image (${imageResponse.status}).`, `Không thể tải ảnh (${imageResponse.status}).`),
+      imageResponse.status,
+    );
+  }
+  let imageBytes = await readHostedImageBytes(imageResponse, signal);
+  let mimeType = detectHostedImageMimeType(imageBytes);
+  if (!mimeType) {
+    throw hostedImageError(
+      "The downloaded bytes are not a supported image.",
+      "Dữ liệu đã tải không phải định dạng ảnh được hỗ trợ.",
+      415,
+    );
+  }
+  if (imageBytes.byteLength > MAX_HOSTED_IMAGE_BYTES) {
+    const compressed = await compressHostedImage(imageBytes, mimeType, signal);
+    imageBytes = compressed.bytes;
+    mimeType = compressed.mimeType;
+  }
+  const data = bytesAsBase64(imageBytes, signal);
+  signal?.throwIfAborted();
+  const response = await fetch("/api/ai/v1/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      mode: "vision",
+      image: { data, mimeType, fileName: fileName.slice(0, 200) },
+      language,
+      question: question.trim().slice(0, 1_000),
+    }),
+    signal,
+  });
+  const payload = await response.json().catch(() => ({})) as HostedChatResponse & { error?: string; kind?: string };
+  if (!response.ok) {
+    if (response.status === 429 || payload.kind === "rate_limit") {
+      throw new HostedAiError(
+        "rate_limit",
+        localize("Qwen vision is receiving too many requests. Please wait a moment and try again.", "Qwen Vision đang nhận quá nhiều yêu cầu. Hãy chờ một chút rồi thử lại."),
+        response.status,
+      );
+    }
+    throw new HostedAiError(
+      "unavailable",
+      localize("Qwen could not inspect this image right now.", "Qwen chưa thể phân tích ảnh này lúc này."),
+      response.status,
+    );
+  }
+  const description = typeof payload.message?.content === "string" ? payload.message.content.trim() : "";
+  if (!description) {
+    throw new HostedAiError(
+      "invalid_response",
+      localize("Qwen returned an incomplete image analysis.", "Qwen trả về phân tích ảnh chưa hoàn chỉnh."),
+    );
+  }
+  return description;
+}
+
+/**
  * Runs Qwen through the server-side OpenRouter gateway while app tools remain
  * local, read-only, abortable, and bounded by the same harness as Gemini.
  */
@@ -182,6 +484,22 @@ export async function streamHostedAgentAnswer(
         return handlers.inspectApplication
           ? handlers.inspectApplication({ query }, requestSignal)
           : { ok: false, code: "application_inspection_unavailable" };
+      },
+    }],
+    ["analyze_indexed_image", {
+      name: "analyze_indexed_image",
+      maxExecutions: 1,
+      unavailableCode: "image_analysis_unavailable",
+      execute: async (args, requestSignal) => {
+        const source = typeof args.source === "string" && args.source.trim()
+          ? args.source.trim().slice(0, 200)
+          : undefined;
+        const question = typeof args.question === "string" && args.question.trim()
+          ? args.question.trim().slice(0, 1_000)
+          : latestText;
+        return handlers.analyzeIndexedImage
+          ? handlers.analyzeIndexedImage({ source, question }, requestSignal)
+          : { ok: false, code: "image_analysis_unavailable" };
       },
     }],
   ]);

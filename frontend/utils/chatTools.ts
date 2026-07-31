@@ -1,6 +1,5 @@
 import { aptosClient } from "@/utils/aptosClient";
-import { getImageDocuments, getRagSources, getShelbyBlobInventory, getVectorDB, updateImageDescription } from "@/utils/ragOrama";
-import { describeImageWithCloud, getStoredCloudApiKey } from "@/utils/aiProvider";
+import { getImageDocuments, getRagSources, getShelbyBlobInventory, getVectorDB, type ImageDocument } from "@/utils/ragOrama";
 import { SHELBYUSD_FA_METADATA_ADDRESS } from "@shelby-protocol/sdk/browser";
 
 export interface ChatToolResult {
@@ -15,12 +14,24 @@ export interface ChatToolResult {
 
 export interface ChatToolContext {
   preferredSources?: string[];
-  forceImage?: boolean;
-  forceImageDescription?: boolean;
-  allowCloudDescription?: boolean;
   /** Defaults to Vietnamese to preserve existing callers and deterministic tests. */
   language?: "en" | "vi";
 }
+
+export interface IndexedImageAnalysisContext {
+  preferredSources?: string[];
+  language?: "en" | "vi";
+  provider: "gemini" | "qwen";
+  describeImage: (image: ImageDocument, question: string, signal?: AbortSignal) => Promise<string | null>;
+}
+
+export type IndexedImageAnalysisOutcome =
+  | { ok: true; cached: boolean; result: ChatToolResult }
+  | {
+    ok: false;
+    code: "no_indexed_images" | "image_not_found" | "image_source_required" | "image_analysis_empty";
+    candidates: string[];
+  };
 
 export interface BlobInventoryToolData {
   kind: "blob_inventory";
@@ -47,8 +58,95 @@ const OCTAS_PER_APT = 100_000_000n;
 const BLOB_EXAMPLE_LIMIT = 3;
 const BLOB_LIST_LIMIT = 100;
 const RECENT_INVENTORY_MS = 5 * 60_000;
+const RUNTIME_VISION_CACHE_MS = 5 * 60_000;
+const RUNTIME_VISION_CACHE_LIMIT = 24;
+const runtimeVisionCache = new Map<string, { description: string; createdAt: number }>();
 
 export type BlobInventoryDetail = "count" | "sample" | "all";
+
+/**
+ * Executes structured runtime vision after the model chooses the vision tool.
+ * It deliberately does not parse conversational phrases; source resolution is
+ * restricted to the tool argument or the most recently shown image context.
+ */
+export async function analyzeIndexedImage(
+  source: string | undefined,
+  question: string,
+  context: IndexedImageAnalysisContext,
+  signal?: AbortSignal,
+): Promise<IndexedImageAnalysisOutcome> {
+  signal?.throwIfAborted();
+  const images = await getImageDocuments();
+  signal?.throwIfAborted();
+  if (!images.length) return { ok: false, code: "no_indexed_images", candidates: [] };
+
+  const normalizedSource = source?.trim().toLocaleLowerCase("en-US");
+  const explicitlySelected = normalizedSource
+    ? images.filter((image) => (
+      image.source.toLocaleLowerCase("en-US") === normalizedSource
+      || image.displayName.toLocaleLowerCase("en-US") === normalizedSource
+    ))
+    : [];
+  if (normalizedSource && explicitlySelected.length !== 1) {
+    return {
+      ok: false,
+      code: "image_not_found",
+      candidates: images.slice(0, 8).map((image) => image.source),
+    };
+  }
+
+  const preferred = !normalizedSource && context.preferredSources?.length
+    ? images.filter((image) => context.preferredSources!.includes(image.source))
+    : [];
+  const selected = explicitlySelected[0]
+    ?? (preferred.length === 1 ? preferred[0] : undefined)
+    ?? (!normalizedSource && !preferred.length && images.length === 1 ? images[0] : undefined);
+  if (!selected) {
+    return {
+      ok: false,
+      code: "image_source_required",
+      candidates: (preferred.length ? preferred : images).slice(0, 8).map((image) => image.source),
+    };
+  }
+
+  const normalizedQuestion = question.trim().replace(/\s+/g, " ").toLocaleLowerCase(context.language === "vi" ? "vi-VN" : "en-US").slice(0, 1_000);
+  if (!normalizedQuestion) {
+    return { ok: false, code: "image_analysis_empty", candidates: [selected.source] };
+  }
+  const cacheKey = `${selected.owner}\u0000${selected.source}\u0000${selected.revision}\u0000${context.provider}\u0000${context.language ?? "en"}\u0000${normalizedQuestion}`;
+  const cachedEntry = runtimeVisionCache.get(cacheKey);
+  if (cachedEntry && Date.now() - cachedEntry.createdAt > RUNTIME_VISION_CACHE_MS) {
+    runtimeVisionCache.delete(cacheKey);
+  }
+  let description = runtimeVisionCache.get(cacheKey)?.description;
+  const cached = Boolean(description);
+  if (!description) {
+    description = (await context.describeImage(selected, question.trim().slice(0, 1_000), signal))?.trim();
+    signal?.throwIfAborted();
+    if (!description) {
+      return { ok: false, code: "image_analysis_empty", candidates: [selected.source] };
+    }
+    runtimeVisionCache.set(cacheKey, { description, createdAt: Date.now() });
+    while (runtimeVisionCache.size > RUNTIME_VISION_CACHE_LIMIT) {
+      runtimeVisionCache.delete(runtimeVisionCache.keys().next().value!);
+    }
+  }
+  const t = (english: string, vietnamese: string) => context.language === "vi" ? vietnamese : english;
+  return {
+    ok: true,
+    cached,
+    result: {
+      name: "show_images",
+      text: t(
+        `Visual analysis of ${selected.displayName}:\n\n${description}`,
+        `Phân tích hình ảnh ${selected.displayName}:\n\n${description}`,
+      ),
+      imageUrls: [selected.url],
+      links: [{ label: t("Open original image", "Mở ảnh gốc"), url: selected.url }],
+      referencedSources: [selected.source],
+    },
+  };
+}
 
 export function asksForCompleteBlobList(question: string): boolean {
   return /(?:liệt kê|danh sách|hiển thị).*(?:tất cả|toàn bộ)|(?:tất cả|toàn bộ).*(?:blob|tệp|file)|(?:list|show).*(?:all|every).*(?:blobs?|files?)|(?:full|complete)\s+list/i.test(question);
@@ -428,7 +526,6 @@ export async function runChatTool(question: string, address?: string, context: C
   if (
     asksForBlobInventory
     && asksAboutOwnInventory
-    && !context.forceImage
     && !explicitlyOpensNamedImage
     && !/(toàn mạng|toàn bộ mạng|shelby\s+(?:có|đang có)|entire network|network-wide|across (?:the )?shelby network|does shelby have)/i.test(normalized)
   ) {
@@ -438,8 +535,7 @@ export async function runChatTool(question: string, address?: string, context: C
   // General questions, wallet RPC and blob inventory never need to open the
   // local RAG database. Hydrate only when document/image tools may use it.
   const mayUseLocalData = Boolean(
-    context.forceImage
-    || context.preferredSources?.length
+    context.preferredSources?.length
     || /(?:blob|tệp|files?|trang|pages?|sách|books?|pdf|tài liệu|documents?|kho dữ liệu|knowledge base|ảnh|hình|photos?|images?|câu chuyện|truyện|stor(?:y|ies)|\.(?:avif|gif|jpe?g|png|webp))/i.test(normalized)
   );
   if (!mayUseLocalData) return null;
@@ -551,8 +647,8 @@ export async function runChatTool(question: string, address?: string, context: C
     const names = [image.source, image.displayName].map((value) => value.toLocaleLowerCase("vi-VN"));
     return names.some((name) => name && normalized.includes(name));
   });
-  const asksForImage = requestedImageByName || context.forceImage || /((blob|tệp|file).*(ảnh|hình)|(ảnh|hình).*(blob|tệp|file)|(tôi|mình).*(có).*(ảnh|hình)|(ảnh|hình).*(nào|không|ko)|(?:liệt kê|danh sách|xem|hiển thị|mở).*?(ảnh|hình)|(mô tả|nội dung).*(ảnh|hình)|(?:list|show|display|open|describe|inspect|browse|enumerate).*(?:images?|photos?)|(?:images?|photos?).*(?:which|what|available|do i have)|(?:what is|what's).*(?:in|shown).*(?:image|photo))/i.test(normalized);
-  const asksForImageDescription = context.forceImageDescription || /(mô tả|nội dung|trong ảnh|ảnh.*gì|hình.*gì|describe|what.*(?:in|shown).*(?:image|photo)|image.*(?:content|show)|photo.*(?:content|show))/i.test(normalized);
+  const asksForImage = requestedImageByName || /((blob|tệp|file).*(ảnh|hình)|(ảnh|hình).*(blob|tệp|file)|(tôi|mình).*(có).*(ảnh|hình)|(ảnh|hình).*(nào|không|ko)|(?:liệt kê|danh sách|xem|hiển thị|mở).*?(ảnh|hình)|(mô tả|nội dung).*(ảnh|hình)|(?:list|show|display|open|describe|inspect|browse|enumerate).*(?:images?|photos?)|(?:images?|photos?).*(?:which|what|available|do i have)|(?:what is|what's).*(?:in|shown).*(?:image|photo))/i.test(normalized);
+  const asksForImageDescription = /(mô tả|nội dung|trong ảnh|ảnh.*gì|hình.*gì|describe|what.*(?:in|shown).*(?:image|photo)|image.*(?:content|show)|photo.*(?:content|show))/i.test(normalized);
   if (asksForImage) {
     if (!imageDocuments.length) {
       return {
@@ -574,14 +670,7 @@ export async function runChatTool(question: string, address?: string, context: C
       };
     }
     const image = selected[0];
-    const apiKey = getStoredCloudApiKey();
-    let description = image.description;
-    if (apiKey && context.allowCloudDescription !== false) {
-      description = (await describeImageWithCloud(image.url, image.displayName, apiKey, signal)) ?? undefined;
-      signal?.throwIfAborted();
-      if (description) await updateImageDescription(image.source, description);
-      signal?.throwIfAborted();
-    }
+    const description = image.description;
     if (description) {
       return {
         name: "show_images",
@@ -594,8 +683,8 @@ export async function runChatTool(question: string, address?: string, context: C
     return {
       name: "show_images",
       text: t(
-        `This is ${image.displayName}. No reliable description is available yet. Enable AI Chat and save a Gemini API key if you want AI to inspect the original image.`,
-        `Đây là ảnh ${image.displayName}. Chưa có mô tả đáng tin cậy; hãy bật Chat AI và lưu Gemini API key nếu bạn muốn AI phân tích trực tiếp ảnh gốc.`,
+        `This is ${image.displayName}. Its preview is available, but the original pixels have not been analyzed yet.`,
+        `Đây là ảnh ${image.displayName}. Preview đã sẵn sàng, nhưng pixel ảnh gốc chưa được phân tích.`,
       ),
       imageUrls: [image.url],
       links: [{ label: t("Open original image", "Mở ảnh gốc"), url: image.url }],

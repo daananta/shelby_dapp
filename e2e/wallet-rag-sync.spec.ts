@@ -99,6 +99,7 @@ test("keeps AI chat and optional Gemini indexing permissions explicit", async ({
   await expect(chatSwitch).toHaveAttribute("aria-checked", "true");
   await expect(contentSwitch).toHaveAttribute("aria-checked", "false");
   await expect(semanticSwitch).toHaveAttribute("aria-checked", "false");
+  await expect(page.getByText("Khi chat, AI vẫn có thể xem ảnh đã index nếu bạn yêu cầu.", { exact: false })).toBeVisible();
 
   await contentSwitch.click();
   await semanticSwitch.click();
@@ -454,4 +455,125 @@ test("lets the model choose a free-form blob filename filter", async ({ page }) 
       matches: [],
     }),
   ]);
+});
+
+test("lets Qwen choose runtime vision for a follow-up while RAG image processing stays off", async ({ page }) => {
+  const visionPayloads: any[] = [];
+  const toolPayloads: any[] = [];
+  await page.route("**/runtime-vision-anime.gif", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "image/gif",
+      body: Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64"),
+    });
+  });
+  await page.route("**/api/ai/v1/chat", async (route) => {
+    const body = route.request().postDataJSON() as any;
+    if (body?.mode === "vision") {
+      visionPayloads.push(body);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          message: { role: "assistant", content: "The image shows a small blue square on a plain background." },
+        }),
+      });
+      return;
+    }
+
+    const messages = body?.messages ?? [];
+    const latestTool = [...messages].reverse().find((message: any) => message?.role === "tool");
+    if (latestTool) {
+      toolPayloads.push(JSON.parse(latestTool.content));
+      const previousCall = [...messages].reverse()
+        .find((message: any) => message?.role === "assistant" && message?.tool_calls)
+        ?.tool_calls?.find((call: any) => call.id === latestTool.tool_call_id);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          message: {
+            role: "assistant",
+            content: previousCall?.function?.name === "analyze_indexed_image"
+              ? "It shows a small blue square on a plain background."
+              : "Here is anime2.jpeg from your indexed images.",
+          },
+        }),
+      });
+      return;
+    }
+
+    const latestUserText = String([...messages].reverse().find((message: any) => message?.role === "user")?.content ?? "");
+    const describeFollowUp = latestUserText.includes("Describe what is visible");
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: describeFollowUp ? "vision-call" : "preview-call",
+            type: "function",
+            function: describeFollowUp
+              ? {
+                name: "analyze_indexed_image",
+                arguments: JSON.stringify({ question: "Describe what is visible in this image." }),
+              }
+              : { name: "inspect_application", arguments: JSON.stringify({ query: "Show anime2.jpeg" }) },
+          }],
+        },
+      }),
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
+  await expect(page.getByTestId("wallet-runtime")).toBeVisible();
+  const indexedImages = await page.evaluate(async () => {
+    // @ts-expect-error Vite serves this browser-only module during E2E.
+    const rag = await import("/frontend/utils/ragOrama.ts");
+    const owner = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    const source = "anime2.jpeg";
+    const documentId = `${owner}:${source}`;
+    const imageUrl = `${window.location.origin}/runtime-vision-anime.gif`;
+    await rag.setActiveRagOwner(owner);
+    await rag.setShelbyBlobInventory(owner, [source], [source]);
+    await rag.replaceDocument({
+      manifest: { id: documentId, owner, source, displayName: source, revision: "vision-e2e", blobUrl: imageUrl, mimeType: "image/gif", type: "image", aliases: [], authors: [], pageCount: 0, chunkCount: 1, ocrCoverage: 0, embeddingStatus: "unavailable", status: "indexed", indexedAt: Date.now() },
+      pages: [],
+      chunks: [{ id: `${documentId}:chunk:0`, owner, documentId, source, displayName: source, type: "image", text: `[Image]\nFile name: ${source}`, normalizedText: source, pageNumber: 0, totalPages: 0, imageUrl }],
+      stories: [],
+    });
+    return rag.getImageDocuments();
+  });
+  expect(indexedImages).toEqual([
+    expect.objectContaining({ source: "anime2.jpeg", url: expect.stringContaining("/runtime-vision-anime.gif") }),
+  ]);
+
+  const chatInput = page.getByLabel("Nhập câu hỏi");
+  await chatInput.fill("Show me anime2.jpeg from my indexed Shelby blobs.");
+  await chatInput.press("Enter");
+  await expect(page.getByText("Here is anime2.jpeg from your indexed images.", { exact: true })).toBeVisible();
+
+  await chatInput.fill("Describe what is visible in this image.");
+  await chatInput.press("Enter");
+  await expect(page.getByText("It shows a small blue square on a plain background.", { exact: true })).toBeVisible();
+  expect(toolPayloads).toEqual([
+    expect.objectContaining({ ok: true, kind: "show_images", referencedSources: ["anime2.jpeg"] }),
+    expect.objectContaining({ ok: true, kind: "image_analysis", referencedSources: ["anime2.jpeg"] }),
+  ]);
+  await expect(page.getByText("AI · Hình ảnh", { exact: true })).toHaveCount(2);
+  await expect(page.getByText("Dữ liệu từ ứng dụng", { exact: true })).toHaveCount(0);
+  expect(visionPayloads).toHaveLength(1);
+  expect(visionPayloads[0]).toMatchObject({
+    mode: "vision",
+    language: "vi",
+    question: "Describe what is visible in this image.",
+    image: {
+      mimeType: "image/gif",
+      fileName: "anime2.jpeg",
+      data: expect.any(String),
+    },
+  });
 });

@@ -1017,9 +1017,11 @@ export function getImageUrls(): { source: string; url: string }[] {
 }
 
 export interface ImageDocument {
+  owner: string;
   source: string;
   displayName: string;
   url: string;
+  revision: string;
   description?: string;
 }
 
@@ -1034,7 +1036,7 @@ export async function getImageDocuments(): Promise<ImageDocument[]> {
       const url = (manifest.accessTag === "public" && activeOwner)
         ? getShelbyBlobUrl(activeOwner, manifest.source)
         : manifest.blobUrl;
-      return { source: manifest.source, displayName: manifest.displayName, url: url || "", description };
+      return { owner: manifest.owner, source: manifest.source, displayName: manifest.displayName, url: url || "", revision: manifest.revision, description };
     })
     .filter((item) => Boolean(item.url));
 }

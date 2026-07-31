@@ -180,6 +180,48 @@ describe("Gemini agent tool orchestration", () => {
     }]);
   });
 
+  it("lets Gemini decide to inspect an indexed image through the dedicated vision tool", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([
+      {
+        name: "analyze_indexed_image",
+        args: {
+          source: "anime2.jpeg",
+          question: "Describe what is visible in this image.",
+        },
+      },
+    ]));
+    agentSdk.sendMessageStream.mockResolvedValue(streamedResponse("The image shows a blue-haired anime character."));
+    const analyzeIndexedImage = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "image_analysis",
+      facts: "A blue-haired anime character.",
+      referencedSources: ["anime2.jpeg"],
+      previewCount: 1,
+    });
+
+    const answer = await streamCloudAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "Describe what is visible in this image." }] }],
+        cloudApiKey: "test-key",
+        systemInstruction: "Use vision only when required.",
+      },
+      vi.fn(),
+      {
+        searchKnowledge: vi.fn(),
+        getWalletBlobInventory: vi.fn(),
+        analyzeIndexedImage,
+      },
+    );
+
+    expect(answer).toContain("blue-haired anime character");
+    expect(analyzeIndexedImage).toHaveBeenCalledWith({
+      source: "anime2.jpeg",
+      question: "Describe what is visible in this image.",
+    }, undefined);
+    expect(agentSdk.modelConfig.tools[0].functionDeclarations.map((tool: { name: string }) => tool.name))
+      .toEqual(["search_user_knowledge", "get_wallet_blob_inventory", "inspect_application", "analyze_indexed_image"]);
+  });
+
   it("keeps document retrieval on the knowledge tool", async () => {
     agentSdk.sendMessage.mockResolvedValue(firstResponse([
       { name: "search_user_knowledge", args: { query: "quy trình đọc blob trong tài liệu" } },

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { HostedAiError, streamHostedAgentAnswer } from "@/utils/openRouterProvider";
+import { describeImageWithHostedAi, HostedAiError, streamHostedAgentAnswer } from "@/utils/openRouterProvider";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -11,6 +11,108 @@ function jsonResponse(value: unknown, status = 200) {
 }
 
 describe("hosted Qwen agent", () => {
+  it("sends one fetched indexed image to the same-origin vision gateway without a browser provider key", async () => {
+    const imageBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(imageBytes, {
+        status: 200,
+        headers: { "content-type": "image/jpeg" },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "A blue-haired anime character is sitting outdoors." },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(describeImageWithHostedAi(
+      "https://example.test/anime2.jpeg",
+      "anime2.jpeg",
+      "en",
+      undefined,
+      undefined,
+      "Which visible details support the description?",
+    )).resolves.toContain("blue-haired");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [gatewayUrl, gatewayInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(String(gatewayInit.body));
+    expect(gatewayUrl).toBe("/api/ai/v1/chat");
+    expect(body).toMatchObject({
+      mode: "vision",
+      language: "en",
+      question: "Which visible details support the description?",
+      image: {
+        mimeType: "image/jpeg",
+        fileName: "anime2.jpeg",
+        data: expect.any(String),
+      },
+    });
+    expect(new Headers(gatewayInit.headers).has("authorization")).toBe(false);
+    expect(String(gatewayInit.body)).not.toContain("sk-or-");
+  });
+
+  it("reduces a large indexed image before sending it to the vision gateway", async () => {
+    const largeImage = new Uint8Array((2 * 1024 * 1024) + 1);
+    largeImage.set([0xff, 0xd8, 0xff]);
+    const reducedImage = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+    const close = vi.fn();
+    vi.stubGlobal("createImageBitmap", vi.fn().mockResolvedValue({ width: 3_000, height: 2_000, close }));
+    vi.stubGlobal("OffscreenCanvas", class {
+      width: number;
+      height: number;
+      constructor(width: number, height: number) {
+        this.width = width;
+        this.height = height;
+      }
+      getContext() {
+        return { drawImage: vi.fn() };
+      }
+      async convertToBlob() {
+        return new Blob([reducedImage], { type: "image/jpeg" });
+      }
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(largeImage, {
+        status: 200,
+        headers: { "content-type": "image/jpeg" },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "Reduced image inspected." },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(describeImageWithHostedAi(
+      "https://example.test/large.jpeg",
+      "large.jpeg",
+      "en",
+      undefined,
+      undefined,
+      "Describe the main subject.",
+    )).resolves.toBe("Reduced image inspected.");
+
+    const gatewayBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(gatewayBody.image.mimeType).toBe("image/jpeg");
+    expect(atob(gatewayBody.image.data)).toHaveLength(reducedImage.byteLength);
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("stops before buffering an image source above the safe preparation limit", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new Uint8Array([0xff, 0xd8, 0xff]), {
+      status: 200,
+      headers: {
+        "content-type": "image/jpeg",
+        "content-length": String((12 * 1024 * 1024) + 1),
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(describeImageWithHostedAi(
+      "https://example.test/oversized.jpeg",
+      "oversized.jpeg",
+      "en",
+    )).rejects.toMatchObject({ status: 413 });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("answers general questions without exposing a provider key to the browser request", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
       message: { role: "assistant", content: "Shelby is hot storage.", tool_calls: [] },
@@ -174,6 +276,58 @@ describe("hosted Qwen agent", () => {
       { query: "Show my indexed anime images" },
       undefined,
     );
+  });
+
+  it("lets Qwen decide to inspect image pixels through the dedicated vision tool", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "vision-1",
+            type: "function",
+            function: {
+              name: "analyze_indexed_image",
+              arguments: "{\"source\":\"anime2.jpeg\",\"question\":\"Describe what is visible in this image.\"}",
+            },
+          }],
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: "The image shows a blue-haired anime character beneath a cloudy sky.",
+        },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const analyzeIndexedImage = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "image_analysis",
+      facts: "A blue-haired anime character beneath a cloudy sky.",
+      referencedSources: ["anime2.jpeg"],
+      previewCount: 1,
+    });
+
+    const answer = await streamHostedAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "Describe what is visible in this image." }] }],
+        systemInstruction: "Use vision only when visual evidence is required.",
+      },
+      vi.fn(),
+      {
+        searchKnowledge: vi.fn(),
+        getWalletBlobInventory: vi.fn(),
+        analyzeIndexedImage,
+      },
+    );
+
+    expect(answer).toContain("blue-haired anime character");
+    expect(analyzeIndexedImage).toHaveBeenCalledWith({
+      source: "anime2.jpeg",
+      question: "Describe what is visible in this image.",
+    }, undefined);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("forces a final answer after three image-related tool rounds instead of exposing agent_round_limit", async () => {

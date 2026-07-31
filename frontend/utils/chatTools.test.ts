@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
 import { invalidateShelbyBlobInventory, replaceDocument, setActiveRagOwner, setShelbyBlobInventory } from "@/utils/ragOrama";
-import { asksForLiveBlobInventoryRefresh, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, readBlobInventoryForAgent, runChatTool } from "@/utils/chatTools";
+import { analyzeIndexedImage, asksForLiveBlobInventoryRefresh, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, readBlobInventoryForAgent, runChatTool } from "@/utils/chatTools";
 
 describe("chat tools", () => {
   it("recognizes only narrow inventory confirmation follow-ups", () => {
@@ -192,26 +192,118 @@ describe("chat tools", () => {
     });
     const result = await runChatTool("moai.webp của tôi mô tả cái gì?");
     expect(result).toMatchObject({ name: "show_images", imageUrls: ["https://example.test/moai.webp"] });
-    expect(result?.text).toContain("Chưa có mô tả đáng tin cậy");
+    expect(result?.text).toContain("pixel ảnh gốc chưa được phân tích");
   });
 
-  it("uses a Cloud-resolved source without local pronoun parsing", async () => {
-    const owner = "0ximage-follow-up-test";
+  it("analyzes the model-selected indexed image once and reuses the cached description", async () => {
+    const owner = "0xruntime-vision-test";
     const documentId = `${owner}:anime2.jpeg`;
     await setActiveRagOwner(owner);
     await replaceDocument({
       manifest: { id: documentId, owner, source: "anime2.jpeg", displayName: "anime2.jpeg", revision: "test", blobUrl: "https://example.test/anime2.jpeg", mimeType: "image/jpeg", type: "image", aliases: [], authors: [], pageCount: 0, chunkCount: 1, ocrCoverage: 0, embeddingStatus: "unavailable", status: "indexed", indexedAt: 1 },
       pages: [],
-      chunks: [{ id: `${documentId}:chunk:0`, owner, documentId, source: "anime2.jpeg", displayName: "anime2.jpeg", type: "image", text: "[Hình ảnh] Tên file: anime2.jpeg\n\nMô tả AI: Một nhân vật anime đứng dưới bầu trời đêm.", normalizedText: "anime", pageNumber: 0, totalPages: 0, imageUrl: "https://example.test/anime2.jpeg" }],
+      chunks: [{ id: `${documentId}:chunk:0`, owner, documentId, source: "anime2.jpeg", displayName: "anime2.jpeg", type: "image", text: "[Image]\nFile name: anime2.jpeg", normalizedText: "anime2 jpeg", pageNumber: 0, totalPages: 0, imageUrl: "https://example.test/anime2.jpeg" }],
       stories: [],
     });
+    const describeImage = vi.fn().mockResolvedValue("A blue-haired anime character sits beneath a cloudy sky.");
 
-    const first = await runChatTool("blob anime2.jpeg là gì");
-    expect(first?.referencedSources).toEqual(["anime2.jpeg"]);
-    const followUp = await runChatTool("hãy phân tích đối tượng vừa được đề cập", undefined, { preferredSources: first?.referencedSources, forceImage: true, forceImageDescription: true });
-    expect(followUp).toMatchObject({ name: "show_images", referencedSources: ["anime2.jpeg"] });
-    expect(followUp?.text).toContain("nhân vật anime");
-    expect(followUp?.text).not.toContain("AGENTS.md");
+    const visualQuestion = "Describe what is visible in this image.";
+    const first = await analyzeIndexedImage(undefined, visualQuestion, {
+      preferredSources: ["anime2.jpeg"],
+      language: "en",
+      provider: "qwen",
+      describeImage,
+    });
+    expect(first).toMatchObject({
+      ok: true,
+      cached: false,
+      result: {
+        name: "show_images",
+        referencedSources: ["anime2.jpeg"],
+        imageUrls: ["https://example.test/anime2.jpeg"],
+      },
+    });
+    if (first.ok) expect(first.result.text).toContain("blue-haired anime character");
+
+    const second = await analyzeIndexedImage("anime2.jpeg", visualQuestion, {
+      language: "en",
+      provider: "qwen",
+      describeImage,
+    });
+    expect(second).toMatchObject({ ok: true, cached: true });
+    expect(describeImage).toHaveBeenCalledTimes(1);
+    expect(describeImage).toHaveBeenCalledWith(
+      expect.objectContaining({ source: "anime2.jpeg", owner }),
+      visualQuestion,
+      undefined,
+    );
+
+    const differentQuestion = await analyzeIndexedImage("anime2.jpeg", "Read every visible word.", {
+      language: "en",
+      provider: "qwen",
+      describeImage,
+    });
+    const differentProvider = await analyzeIndexedImage("anime2.jpeg", visualQuestion, {
+      language: "en",
+      provider: "gemini",
+      describeImage,
+    });
+    expect(differentQuestion).toMatchObject({ ok: true, cached: false });
+    expect(differentProvider).toMatchObject({ ok: true, cached: false });
+    expect(describeImage).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not reuse a runtime vision answer across wallet owners", async () => {
+    const source = "shared-name.jpeg";
+    const visualQuestion = "What is visible?";
+    const describeImage = vi.fn()
+      .mockResolvedValueOnce("Wallet A image.")
+      .mockResolvedValueOnce("Wallet B image.");
+    for (const owner of ["0xvision-owner-a", "0xvision-owner-b"]) {
+      const documentId = `${owner}:${source}`;
+      await setActiveRagOwner(owner);
+      await replaceDocument({
+        manifest: { id: documentId, owner, source, displayName: source, revision: "same-revision", blobUrl: `https://example.test/${owner}.jpeg`, mimeType: "image/jpeg", type: "image", aliases: [], authors: [], pageCount: 0, chunkCount: 1, ocrCoverage: 0, embeddingStatus: "unavailable", status: "indexed", indexedAt: 1 },
+        pages: [],
+        chunks: [{ id: `${documentId}:chunk:0`, owner, documentId, source, displayName: source, type: "image", text: `[Image]\nFile name: ${source}`, normalizedText: source, pageNumber: 0, totalPages: 0, imageUrl: `https://example.test/${owner}.jpeg` }],
+        stories: [],
+      });
+      const outcome = await analyzeIndexedImage(source, visualQuestion, {
+        language: "en",
+        provider: "qwen",
+        describeImage,
+      });
+      expect(outcome).toMatchObject({ ok: true, cached: false });
+    }
+    expect(describeImage).toHaveBeenCalledTimes(2);
+  });
+
+  it("asks the model to choose a source when several images are equally plausible", async () => {
+    const owner = "0xruntime-vision-ambiguous";
+    await setActiveRagOwner(owner);
+    for (const source of ["one.jpg", "two.jpg"]) {
+      const documentId = `${owner}:${source}`;
+      await replaceDocument({
+        manifest: { id: documentId, owner, source, displayName: source, revision: "test", blobUrl: `https://example.test/${source}`, mimeType: "image/jpeg", type: "image", aliases: [], authors: [], pageCount: 0, chunkCount: 1, ocrCoverage: 0, embeddingStatus: "unavailable", status: "indexed", indexedAt: 1 },
+        pages: [],
+        chunks: [{ id: `${documentId}:chunk:0`, owner, documentId, source, displayName: source, type: "image", text: `[Image]\nFile name: ${source}`, normalizedText: source, pageNumber: 0, totalPages: 0, imageUrl: `https://example.test/${source}` }],
+        stories: [],
+      });
+    }
+    const describeImage = vi.fn();
+
+    const outcome = await analyzeIndexedImage(undefined, "Read the visible text.", {
+      language: "en",
+      provider: "qwen",
+      describeImage,
+    });
+
+    expect(outcome).toMatchObject({
+      ok: false,
+      code: "image_source_required",
+      candidates: ["one.jpg", "two.jpg"],
+    });
+    expect(describeImage).not.toHaveBeenCalled();
   });
 
   it("does not let book inventory swallow a numbered-story request", async () => {

@@ -33,6 +33,7 @@ const MAX_MESSAGES = 32;
 const MAX_TOTAL_CONTENT = 120_000;
 const MAX_OUTPUT_TOKENS = 1_200;
 const MAX_VISION_OUTPUT_TOKENS = 700;
+const FAST_REASONING = { effort: "none", exclude: true } as const;
 const RATE_WINDOW_MS = 60_000;
 const RATE_LIMIT = 15;
 const VISION_RATE_LIMIT = 5;
@@ -404,6 +405,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
         ],
       }],
       temperature: 0.1,
+      reasoning: FAST_REASONING,
       max_tokens: MAX_VISION_OUTPUT_TOKENS,
     };
   } else {
@@ -419,6 +421,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
       tools: TOOLS,
       tool_choice: toolChoice,
       temperature: 0.2,
+      reasoning: FAST_REASONING,
       max_tokens: MAX_OUTPUT_TOKENS,
     };
   }

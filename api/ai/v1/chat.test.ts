@@ -56,6 +56,7 @@ describe("hosted Qwen gateway", () => {
     const [, init] = upstream.mock.calls[0] as [string, RequestInit];
     const upstreamBody = JSON.parse(String(init.body));
     expect(upstreamBody.model).toBe("qwen/qwen3.7-flash");
+    expect(upstreamBody.reasoning).toEqual({ effort: "none", exclude: true });
     expect(upstreamBody.tools).toEqual(expect.arrayContaining([
       expect.objectContaining({
         function: expect.objectContaining({ name: "analyze_indexed_image" }),
@@ -121,6 +122,7 @@ describe("hosted Qwen gateway", () => {
     const [, init] = upstream.mock.calls[0] as [string, RequestInit];
     const upstreamBody = JSON.parse(String(init.body));
     expect(upstreamBody.model).toBe("qwen/qwen3.7-flash");
+    expect(upstreamBody.reasoning).toEqual({ effort: "none", exclude: true });
     expect(upstreamBody).not.toHaveProperty("tools");
     expect(upstreamBody).not.toHaveProperty("tool_choice");
     expect(upstreamBody.messages[0].content[0]).toMatchObject({

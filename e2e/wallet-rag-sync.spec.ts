@@ -472,11 +472,17 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
     const body = route.request().postDataJSON() as any;
     if (body?.mode === "vision") {
       visionPayloads.push(body);
+      const asksForSupportingDetails = String(body.question).includes("small blue square");
       await route.fulfill({
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({
-          message: { role: "assistant", content: "The image shows a small blue square on a plain background." },
+          message: {
+            role: "assistant",
+            content: asksForSupportingDetails
+              ? "The blue color, square outline, and plain background support that description."
+              : "The image shows a small blue square on a plain background.",
+          },
         }),
       });
       return;
@@ -484,6 +490,7 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
 
     const messages = body?.messages ?? [];
     agentPayloads.push(body);
+    const latestUserText = String([...messages].reverse().find((message: any) => message?.role === "user")?.content ?? "");
     const latestTool = [...messages].reverse().find((message: any) => message?.role === "tool");
     if (latestTool) {
       toolPayloads.push(JSON.parse(latestTool.content));
@@ -497,7 +504,9 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
           message: {
             role: "assistant",
             content: previousCall?.function?.name === "analyze_indexed_image"
-              ? "It shows a small blue square on a plain background."
+              ? latestUserText.includes("Which visible details support that description?")
+                ? "The blue color, square outline, and plain background support that description."
+                : "It shows a small blue square on a plain background."
               : "Here is anime2.jpeg from your indexed images.",
           },
         }),
@@ -505,21 +514,8 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
       return;
     }
 
-    const latestUserText = String([...messages].reverse().find((message: any) => message?.role === "user")?.content ?? "");
-    if (latestUserText.includes("Which visible details support that description?")) {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          message: {
-            role: "assistant",
-            content: "The blue color, square outline, and plain background support that description.",
-          },
-        }),
-      });
-      return;
-    }
-    const describeFollowUp = latestUserText.includes("Describe what is visible");
+    const supportingDetailsFollowUp = latestUserText.includes("Which visible details support that description?");
+    const describeFollowUp = latestUserText.includes("Describe what is visible") || supportingDetailsFollowUp;
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -528,12 +524,17 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
           role: "assistant",
           content: null,
           tool_calls: [{
-            id: describeFollowUp ? "vision-call" : "preview-call",
+            id: supportingDetailsFollowUp ? "vision-evidence-call" : describeFollowUp ? "vision-call" : "preview-call",
             type: "function",
             function: describeFollowUp
               ? {
                 name: "analyze_indexed_image",
-                arguments: JSON.stringify({ question: "Describe what is visible in this image." }),
+                arguments: JSON.stringify(supportingDetailsFollowUp
+                  ? {
+                    source: "anime2.jpeg",
+                    question: "Which visible details support that this image shows a small blue square on a plain background?",
+                  }
+                  : { question: "Describe what is visible in this image." }),
               }
               : { name: "inspect_application", arguments: JSON.stringify({ query: "Show anime2.jpeg" }) },
           }],
@@ -584,10 +585,11 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
   expect(toolPayloads).toEqual([
     expect.objectContaining({ ok: true, kind: "show_images", referencedSources: ["anime2.jpeg"] }),
     expect.objectContaining({ ok: true, kind: "image_analysis", referencedSources: ["anime2.jpeg"] }),
+    expect.objectContaining({ ok: true, kind: "image_analysis", referencedSources: ["anime2.jpeg"] }),
   ]);
-  await expect(page.getByText("AI · Hình ảnh", { exact: true })).toHaveCount(2);
+  await expect(page.getByText("AI · Hình ảnh", { exact: true })).toHaveCount(3);
   await expect(page.getByText("Dữ liệu từ ứng dụng", { exact: true })).toHaveCount(0);
-  expect(visionPayloads).toHaveLength(1);
+  expect(visionPayloads).toHaveLength(2);
   const supportingDetailsRequest = agentPayloads.find((payload) => (
     [...(payload.messages ?? [])].reverse()
       .find((message: any) => message?.role === "user")
@@ -601,6 +603,16 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
     mode: "vision",
     language: "vi",
     question: "Describe what is visible in this image.",
+    image: {
+      mimeType: "image/gif",
+      fileName: "anime2.jpeg",
+      data: expect.any(String),
+    },
+  });
+  expect(visionPayloads[1]).toMatchObject({
+    mode: "vision",
+    language: "vi",
+    question: expect.stringContaining("small blue square"),
     image: {
       mimeType: "image/gif",
       fileName: "anime2.jpeg",

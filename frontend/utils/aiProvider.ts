@@ -7,6 +7,7 @@ import { currentLanguage, localize } from "@/i18n";
 import {
   AgentHarnessLimitError,
   DEFAULT_AGENT_HARNESS_BUDGET,
+  createFinalAnswerRepairInstruction,
   createAgentHarnessState,
   executeAgentToolCalls,
   type AgentFunctionCall,
@@ -38,12 +39,18 @@ export interface KnowledgeSearchResponse {
 
 export interface BlobInventoryAgentRequest {
   detail: "count" | "sample" | "all";
+  nameQuery?: string;
+}
+
+export interface ApplicationInspectionRequest {
+  query: string;
 }
 
 export interface AgentToolHandlers {
   searchKnowledge: (request: KnowledgeSearchRequest, signal?: AbortSignal) => Promise<KnowledgeSearchResponse>;
   getWalletBlobInventory: (request: BlobInventoryAgentRequest, signal?: AbortSignal) => Promise<Record<string, unknown>>;
   refreshWalletBlobInventory?: (signal?: AbortSignal) => Promise<Record<string, unknown>>;
+  inspectApplication?: (request: ApplicationInspectionRequest, signal?: AbortSignal) => Promise<Record<string, unknown>>;
 }
 
 const CLOUD_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"];
@@ -350,6 +357,10 @@ export async function streamCloudAgentAnswer(
               enum: ["count", "sample", "all"],
               description: "Use count for totals or confirmation, sample only when examples are requested, and all only when every name is explicitly requested.",
             },
+            nameQuery: {
+              type: SchemaType.STRING,
+              description: "Optional filename substring supplied by the user, for example anime, pdf, or invoice. Use it when the user asks which blobs match a name or type.",
+            },
           },
           required: ["detail"],
         },
@@ -362,6 +373,20 @@ export async function streamCloudAgentAnswer(
           properties: {},
         },
       }] : []),
+      {
+        name: "inspect_application",
+        description: "Use the app's read-only capabilities for wallet/account facts, indexed image previews and descriptions, document inventory, identity, or deterministic calculations. Pass a self-contained version of the user's request. Do not use this instead of search_user_knowledge for document content or get_wallet_blob_inventory for blob names/counts.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            query: {
+              type: SchemaType.STRING,
+              description: "The self-contained read-only app request to inspect.",
+            },
+          },
+          required: ["query"],
+        },
+      },
     ],
   };
 
@@ -388,7 +413,10 @@ export async function streamCloudAgentAnswer(
         const detail = args.detail === "all" || args.detail === "sample"
           ? args.detail
           : "count";
-        return handlers.getWalletBlobInventory({ detail }, requestSignal);
+        const nameQuery = typeof args.nameQuery === "string" && args.nameQuery.trim()
+          ? args.nameQuery.trim().slice(0, 200)
+          : undefined;
+        return handlers.getWalletBlobInventory({ detail, nameQuery }, requestSignal);
       },
     }],
     ["refresh_wallet_blob_inventory", {
@@ -398,6 +426,19 @@ export async function streamCloudAgentAnswer(
       execute: async (_args, requestSignal) => handlers.refreshWalletBlobInventory
         ? handlers.refreshWalletBlobInventory(requestSignal)
         : { ok: false, code: "blob_inventory_refresh_unavailable" },
+    }],
+    ["inspect_application", {
+      name: "inspect_application",
+      maxExecutions: 1,
+      unavailableCode: "application_inspection_unavailable",
+      execute: async (args, requestSignal) => {
+        const query = typeof args.query === "string" && args.query.trim()
+          ? args.query.trim().slice(0, 1_000)
+          : latestText;
+        return handlers.inspectApplication
+          ? handlers.inspectApplication({ query }, requestSignal)
+          : { ok: false, code: "application_inspection_unavailable" };
+      },
     }],
   ]);
 
@@ -497,11 +538,41 @@ export async function streamCloudAgentAnswer(
           calls = nextCalls;
           continue;
         }
-        const answer = bufferedAnswer || finalResponse.text().trim();
+        let answer = bufferedAnswer || finalResponse.text().trim();
+        let answerChunks = bufferedChunks;
+        const repairInstruction = createFinalAnswerRepairInstruction(harnessState, answer);
+        if (repairInstruction) {
+          const repairResult = await chat.sendMessageStream([{ text: repairInstruction }], {
+            signal,
+            timeout: CLOUD_AGENT_TIMEOUT_MS,
+          });
+          const repairedChunks: string[] = [];
+          let repairRequestedTool = false;
+          for await (const chunk of repairResult.stream) {
+            signal?.throwIfAborted();
+            const repairCalls = typeof chunk.functionCalls === "function" ? chunk.functionCalls() ?? [] : [];
+            if (repairCalls.length) {
+              repairRequestedTool = true;
+              continue;
+            }
+            const text = chunk.text();
+            if (text) repairedChunks.push(text);
+          }
+          const repairResponse = await repairResult.response;
+          signal?.throwIfAborted();
+          const repairCalls = (repairResponse.functionCalls() ?? []) as AgentFunctionCall[];
+          if (!repairRequestedTool && !repairCalls.length) {
+            const repairedAnswer = repairedChunks.join("") || repairResponse.text().trim();
+            if (repairedAnswer) {
+              answer = repairedAnswer;
+              answerChunks = repairedChunks;
+            }
+          }
+        }
         if (answer) {
           emitted = true;
-          if (bufferedChunks.length) {
-            for (const chunk of bufferedChunks) {
+          if (answerChunks.length) {
+            for (const chunk of answerChunks) {
               signal?.throwIfAborted();
               onChunk(chunk);
             }

@@ -139,7 +139,45 @@ describe("Gemini agent tool orchestration", () => {
       },
     }]);
     expect(agentSdk.modelConfig.tools[0].functionDeclarations.map((tool: { name: string }) => tool.name))
-      .toEqual(["search_user_knowledge", "get_wallet_blob_inventory"]);
+      .toEqual(["search_user_knowledge", "get_wallet_blob_inventory", "inspect_application"]);
+  });
+
+  it("lets Gemini phrase a deterministic application observation", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([
+      { name: "inspect_application", args: { query: "What is my wallet address?" } },
+    ]));
+    agentSdk.sendMessageStream.mockResolvedValue(streamedResponse("Your connected wallet is 0x1234."));
+    const inspectApplication = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "wallet_address",
+      facts: "0x1234",
+    });
+
+    const answer = await streamCloudAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "What is my wallet address?" }] }],
+        cloudApiKey: "test-key",
+        systemInstruction: "Answer naturally.",
+      },
+      vi.fn(),
+      {
+        searchKnowledge: vi.fn(),
+        getWalletBlobInventory: vi.fn(),
+        inspectApplication,
+      },
+    );
+
+    expect(answer).toBe("Your connected wallet is 0x1234.");
+    expect(inspectApplication).toHaveBeenCalledWith(
+      { query: "What is my wallet address?" },
+      undefined,
+    );
+    expect(agentSdk.sendMessageStream.mock.calls[0][0]).toEqual([{
+      functionResponse: {
+        name: "inspect_application",
+        response: expect.objectContaining({ ok: true, kind: "wallet_address", facts: "0x1234" }),
+      },
+    }]);
   });
 
   it("keeps document retrieval on the knowledge tool", async () => {
@@ -165,6 +203,40 @@ describe("Gemini agent tool orchestration", () => {
 
     expect(searchKnowledge).toHaveBeenCalledWith({ query: "quy trình đọc blob trong tài liệu" }, undefined);
     expect(getWalletBlobInventory).not.toHaveBeenCalled();
+  });
+
+  it("lets the shared harness repair a Gemini document answer with missing citations", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([
+      { name: "search_user_knowledge", args: { query: "package.json libraries" } },
+    ]));
+    agentSdk.sendMessageStream
+      .mockResolvedValueOnce(streamedResponse("The project uses Shelby and Aptos libraries."))
+      .mockResolvedValueOnce(streamedResponse("The project uses Shelby storage and Aptos integration libraries [S1]."));
+    const onChunk = vi.fn();
+
+    const answer = await streamCloudAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "Which libraries does package.json use?" }] }],
+        cloudApiKey: "test-key",
+        systemInstruction: "Use citations.",
+      },
+      onChunk,
+      {
+        searchKnowledge: vi.fn().mockResolvedValue({
+          found: true,
+          evidence: [{ citation: "S1", excerpt: "Dependencies include Shelby and Aptos SDK packages." }],
+        }),
+        getWalletBlobInventory: vi.fn(),
+      },
+    );
+
+    expect(answer).toContain("[S1]");
+    expect(agentSdk.sendMessageStream).toHaveBeenCalledTimes(2);
+    expect(agentSdk.sendMessageStream.mock.calls[1][0]).toEqual([{
+      text: expect.stringContaining("allowed set: [S1]"),
+    }]);
+    expect(onChunk).toHaveBeenCalledTimes(1);
+    expect(onChunk).toHaveBeenCalledWith("The project uses Shelby storage and Aptos integration libraries [S1].");
   });
 
   it("executes at most one knowledge search per user turn", async () => {

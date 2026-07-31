@@ -60,6 +60,28 @@ describe("hosted Qwen gateway", () => {
     expect(JSON.stringify(recorder.read().payload)).not.toContain("server-only-test-key");
   });
 
+  it("disables tools for a bounded final-answer repair request", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    const upstream = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", content: "Corrected [S1]." }, finish_reason: "stop" }],
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", upstream);
+    const recorder = responseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.10" },
+      body: {
+        messages: [{ role: "user", content: "Repair the final answer." }],
+        toolChoice: "none",
+      },
+    }, recorder.response);
+
+    const [, init] = upstream.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).tool_choice).toBe("none");
+  });
+
   it("rejects another origin before calling the provider", async () => {
     process.env.APP_ORIGIN = "https://example.test";
     process.env.OPENROUTER_API_KEY = "server-only-test-key";

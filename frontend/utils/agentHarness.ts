@@ -23,6 +23,7 @@ export interface AgentHarnessBudget {
   maxCallsPerRound: number;
   maxTotalCalls: number;
   maxTotalResponseBytes: number;
+  maxFinalAnswerRepairs: number;
 }
 
 export interface AgentToolTrace {
@@ -35,9 +36,19 @@ export interface AgentToolTrace {
 export interface AgentHarnessState {
   totalCalls: number;
   totalResponseBytes: number;
+  finalAnswerRepairs: number;
+  evidenceCitationIds: Set<string>;
   seenCalls: Set<string>;
   executionsByTool: Map<string, number>;
   trace: AgentToolTrace[];
+}
+
+export interface AgentFinalAnswerValidation {
+  valid: boolean;
+  requiresCitations: boolean;
+  reason?: "missing_citation" | "unknown_citation";
+  allowedCitationIds: string[];
+  citedCitationIds: string[];
 }
 
 export class AgentHarnessLimitError extends Error {
@@ -52,6 +63,7 @@ export const DEFAULT_AGENT_HARNESS_BUDGET: AgentHarnessBudget = {
   maxCallsPerRound: 3,
   maxTotalCalls: 6,
   maxTotalResponseBytes: 96 * 1024,
+  maxFinalAnswerRepairs: 1,
 };
 const MAX_TOOL_RESPONSE_JSON_BYTES = 64 * 1024;
 
@@ -59,6 +71,8 @@ export function createAgentHarnessState(): AgentHarnessState {
   return {
     totalCalls: 0,
     totalResponseBytes: 0,
+    finalAnswerRepairs: 0,
+    evidenceCitationIds: new Set(),
     seenCalls: new Set(),
     executionsByTool: new Map(),
     trace: [],
@@ -67,6 +81,91 @@ export function createAgentHarnessState(): AgentHarnessState {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeCitationId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = /^S([1-9]\d*)$/i.exec(value.trim());
+  return match ? `S${BigInt(match[1]).toString()}` : undefined;
+}
+
+function extractAnswerCitationIds(answer: string): Set<string> {
+  const ids = new Set<string>();
+  for (const group of answer.matchAll(/\[([^\]]+)\]/g)) {
+    for (const citation of group[1].matchAll(/\bS(\d+)\b/gi)) {
+      if (BigInt(citation[1]) > 0n) ids.add(`S${BigInt(citation[1]).toString()}`);
+    }
+  }
+  return ids;
+}
+
+function recordEvidenceCitationIds(state: AgentHarnessState, response: Record<string, unknown>) {
+  if (!Array.isArray(response.evidence)) return;
+  for (const item of response.evidence) {
+    if (!isRecord(item)) continue;
+    const citationId = normalizeCitationId(item.citation);
+    if (citationId) state.evidenceCitationIds.add(citationId);
+  }
+}
+
+export function validateAgentFinalAnswer(
+  state: AgentHarnessState,
+  answer: string,
+): AgentFinalAnswerValidation {
+  const allowedCitationIds = [...state.evidenceCitationIds];
+  if (!allowedCitationIds.length) {
+    return {
+      valid: true,
+      requiresCitations: false,
+      allowedCitationIds,
+      citedCitationIds: [],
+    };
+  }
+  const citedCitationIds = [...extractAnswerCitationIds(answer)];
+  if (!citedCitationIds.length) {
+    return {
+      valid: false,
+      requiresCitations: true,
+      reason: "missing_citation",
+      allowedCitationIds,
+      citedCitationIds,
+    };
+  }
+  const allowed = state.evidenceCitationIds;
+  if (citedCitationIds.some((citationId) => !allowed.has(citationId))) {
+    return {
+      valid: false,
+      requiresCitations: true,
+      reason: "unknown_citation",
+      allowedCitationIds,
+      citedCitationIds,
+    };
+  }
+  return {
+    valid: true,
+    requiresCitations: true,
+    allowedCitationIds,
+    citedCitationIds,
+  };
+}
+
+export function createFinalAnswerRepairInstruction(
+  state: AgentHarnessState,
+  answer: string,
+  budget: AgentHarnessBudget = DEFAULT_AGENT_HARNESS_BUDGET,
+): string | undefined {
+  const validation = validateAgentFinalAnswer(state, answer);
+  if (validation.valid || state.finalAnswerRepairs >= budget.maxFinalAnswerRepairs) return undefined;
+  state.finalAnswerRepairs += 1;
+  const allowed = validation.allowedCitationIds.map((id) => `[${id}]`).join(", ");
+  return [
+    "Your previous draft failed the machine-checked evidence contract.",
+    "Rewrite the final answer using only evidence already returned by the tools in this conversation.",
+    `Use at least one exact citation from this allowed set: ${allowed}.`,
+    "Put citations in square brackets after the claims they support.",
+    "Do not invent citation IDs, call another tool, mention this repair step, or add unsupported claims.",
+    "Return only the corrected user-facing answer in the user's language.",
+  ].join(" ");
 }
 
 function stableJson(value: unknown): string {
@@ -200,6 +299,7 @@ export async function executeAgentToolCalls(params: {
     }
 
     params.state.totalResponseBytes += new TextEncoder().encode(JSON.stringify(response)).byteLength;
+    if (status === "executed") recordEvidenceCitationIds(params.state, response);
     params.state.trace.push({
       round: params.round,
       name: call.name,

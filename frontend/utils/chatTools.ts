@@ -174,6 +174,57 @@ export function readBlobInventory(
   };
 }
 
+/**
+ * Returns facts rather than presentation copy so an AI provider can phrase the
+ * answer naturally. Filename filtering is model-selected through tool args;
+ * this function does not classify the user's sentence.
+ */
+export function readBlobInventoryForAgent(
+  request: { detail: BlobInventoryDetail; nameQuery?: string },
+): Record<string, unknown> {
+  const inventory = getShelbyBlobInventory();
+  const observedAt = Date.now();
+  if (!inventory) {
+    return {
+      ok: false,
+      status: "not_loaded",
+      freshness: "unavailable",
+      observedAt,
+      refreshRequired: true,
+    };
+  }
+
+  const ageMs = inventory.fetchedAt > 0 ? Math.max(0, observedAt - inventory.fetchedAt) : Number.POSITIVE_INFINITY;
+  const recent = inventory.verified && ageMs <= RECENT_INVENTORY_MS;
+  const nameQuery = request.nameQuery?.trim().slice(0, 200);
+  const normalizedQuery = nameQuery?.toLocaleLowerCase("en-US");
+  const matchingNames = normalizedQuery
+    ? inventory.names.filter((name) => name.toLocaleLowerCase("en-US").includes(normalizedQuery)).slice(0, BLOB_LIST_LIMIT)
+    : [];
+
+  return {
+    ok: true,
+    status: recent ? "verified" : "stale",
+    freshness: recent ? "recent_cache" : "stale_cache",
+    count: inventory.names.length,
+    ...(nameQuery ? {
+      nameQuery,
+      matchedCount: matchingNames.length,
+      matches: matchingNames,
+    } : request.detail === "all" ? {
+      names: inventory.names.slice(0, BLOB_LIST_LIMIT),
+      truncated: inventory.names.length > BLOB_LIST_LIMIT,
+    } : request.detail === "sample" ? {
+      examples: inventory.names.slice(0, BLOB_EXAMPLE_LIMIT),
+    } : {}),
+    fetchedAt: inventory.fetchedAt,
+    observedAt,
+    ...(Number.isFinite(ageMs) ? { ageMs } : {}),
+    refreshRequired: !recent,
+    lastRefreshSucceeded: inventory.verified,
+  };
+}
+
 /** Rejects model phrasing that changes an app-verified inventory fact. */
 export function isBlobInventoryAnswerConsistent(result: ChatToolResult, answer: string): boolean {
   const data = result.data;

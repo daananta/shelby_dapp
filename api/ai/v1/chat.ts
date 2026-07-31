@@ -36,6 +36,7 @@ const ALLOWED_TOOL_NAMES = new Set([
   "search_user_knowledge",
   "get_wallet_blob_inventory",
   "refresh_wallet_blob_inventory",
+  "inspect_application",
 ]);
 const rateBuckets = new Map<string, { count: number; resetsAt: number }>();
 
@@ -67,6 +68,10 @@ const TOOLS = [
         type: "object",
         properties: {
           detail: { type: "string", enum: ["count", "sample", "all"] },
+          nameQuery: {
+            type: "string",
+            description: "Optional filename substring when the user asks which blobs match a name or type.",
+          },
         },
         required: ["detail"],
         additionalProperties: false,
@@ -81,6 +86,24 @@ const TOOLS = [
       parameters: {
         type: "object",
         properties: {},
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "inspect_application",
+      description: "Use read-only app capabilities for wallet/account facts, indexed image previews and descriptions, document inventory, identity, or deterministic calculations. Do not use for document content or blob names/counts.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "A self-contained version of the user's read-only app request.",
+          },
+        },
+        required: ["query"],
         additionalProperties: false,
       },
     },
@@ -220,6 +243,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
   }
   const body = isRecord(request.body) ? request.body : {};
   const messages = bodyBytes <= MAX_BODY_BYTES ? sanitizeMessages(body.messages) : null;
+  const toolChoice = body.toolChoice === "none" ? "none" : "auto";
   if (!messages) {
     response.status(400).json({ error: "Invalid chat request" });
     return;
@@ -238,7 +262,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
         model: MODEL,
         messages,
         tools: TOOLS,
-        tool_choice: "auto",
+        tool_choice: toolChoice,
         temperature: 0.2,
         max_tokens: MAX_OUTPUT_TOKENS,
       }),

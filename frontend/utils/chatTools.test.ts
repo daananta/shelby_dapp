@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
 import { invalidateShelbyBlobInventory, replaceDocument, setActiveRagOwner, setShelbyBlobInventory } from "@/utils/ragOrama";
-import { asksForLiveBlobInventoryRefresh, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, runChatTool } from "@/utils/chatTools";
+import { asksForLiveBlobInventoryRefresh, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, readBlobInventoryForAgent, runChatTool } from "@/utils/chatTools";
 
 describe("chat tools", () => {
   it("recognizes only narrow inventory confirmation follow-ups", () => {
@@ -74,6 +74,28 @@ describe("chat tools", () => {
     const full = await runChatTool("Liệt kê tất cả blob của tôi");
     expect(full?.data?.names).toEqual(names);
     expect(full?.text).toContain("five.zip");
+  });
+
+  it("returns structured filename matches for AI phrasing without hardcoded answer copy", async () => {
+    const owner = "0xinventory-agent-filter";
+    await setActiveRagOwner(owner);
+    await setShelbyBlobInventory(owner, [
+      "anime2.jpeg",
+      "Hinh-anh-avatar-anime-nu-cute-2.jpg",
+      "invoice.pdf",
+    ]);
+
+    const payload = readBlobInventoryForAgent({ detail: "sample", nameQuery: "anime" });
+
+    expect(payload).toMatchObject({
+      ok: true,
+      count: 3,
+      nameQuery: "anime",
+      matchedCount: 2,
+      matches: ["anime2.jpeg", "Hinh-anh-avatar-anime-nu-cute-2.jpg"],
+    });
+    expect(JSON.stringify(payload)).not.toContain("Snapshot Shelby");
+    expect(JSON.stringify(payload)).not.toContain("select Refresh");
   });
 
   it("rejects model phrasing that changes a verified inventory count or examples", async () => {

@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 test.beforeEach(async ({ page }) => {
   // Keep the existing functional assertions in Vietnamese while smoke.spec.ts
@@ -8,6 +8,33 @@ test.beforeEach(async ({ page }) => {
     (window as any).__SHELBY_E2E__ = true;
   });
 });
+
+async function mockQwenDocumentAnswer(page: Page, answer: string) {
+  await page.route("**/api/ai/v1/chat", async (route) => {
+    const body = route.request().postDataJSON() as any;
+    const latestTool = [...(body?.messages ?? [])].reverse().find((message: any) => message?.role === "tool");
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        message: latestTool
+          ? { role: "assistant", content: answer }
+          : {
+              role: "assistant",
+              content: null,
+              tool_calls: [{
+                id: "knowledge-call",
+                type: "function",
+                function: {
+                  name: "search_user_knowledge",
+                  arguments: JSON.stringify({ query: "Hệ thống kết nối mạng lưu trữ phi tập trung Shelby" }),
+                },
+              }],
+            },
+      }),
+    });
+  });
+}
 
 test("mocks wallet connection and verifies RAG sync dashboard renders", async ({ page }) => {
   await page.goto("/");
@@ -89,6 +116,7 @@ test("keeps AI chat and optional Gemini indexing permissions explicit", async ({
 });
 
 test("mock workspace saves and reads back a knowledge backup without Clay WASM", async ({ page }) => {
+  await mockQwenDocumentAnswer(page, "Câu này nằm ở trang 1/1 của tài liệu [S1].");
   await page.goto("/");
   await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Tạo RAG local (1)", exact: true })).toBeVisible();
@@ -119,10 +147,11 @@ test("mock workspace saves and reads back a knowledge backup without Clay WASM",
   const chatInput = page.getByPlaceholder("Hỏi về dữ liệu đã nạp…");
   await chatInput.fill('Câu "Hệ thống này kết nối mạng lưu trữ phi tập trung Shelby" nằm ở trang nào?');
   await chatInput.press("Enter");
-  await expect(page.getByText("Tìm thấy câu này ở trang 1/1", { exact: false })).toBeVisible();
+  await expect(page.getByText("Câu này nằm ở trang 1/1 của tài liệu", { exact: false })).toBeVisible();
 });
 
 test("creates an honest Answer Receipt from a cited local result", async ({ page }) => {
+  await mockQwenDocumentAnswer(page, "Câu này nằm ở trang 1/1 của tài liệu [S1].");
   await page.goto("/");
   await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
   await page.getByRole("button", { name: "Tạo RAG local (1)", exact: true }).click();
@@ -258,10 +287,33 @@ test("rejects only a Gemini key that the provider explicitly marks invalid", asy
   expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBeNull();
 });
 
-test("confirms the latest blob snapshot without requiring a Gemini key", async ({ page }) => {
+test("lets hosted AI phrase inventory observations without requiring a Gemini key", async ({ page }) => {
   let geminiRequests = 0;
+  let hostedTurns = 0;
   page.on("request", (request) => {
     if (request.url().includes("generativelanguage.googleapis.com")) geminiRequests += 1;
+  });
+  await page.route("**/api/ai/v1/chat", async (route) => {
+    const body = route.request().postDataJSON() as any;
+    const latestTool = [...(body?.messages ?? [])].reverse().find((message: any) => message?.role === "tool");
+    hostedTurns += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        message: latestTool
+          ? { role: "assistant", content: "Theo dữ liệu ứng dụng vừa cung cấp, ví này có 2 blob." }
+          : {
+              role: "assistant",
+              content: null,
+              tool_calls: [{
+                id: `inventory-${hostedTurns}`,
+                type: "function",
+                function: { name: "get_wallet_blob_inventory", arguments: "{\"detail\":\"count\"}" },
+              }],
+            },
+      }),
+    });
   });
   await page.goto("/");
   await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
@@ -270,13 +322,14 @@ test("confirms the latest blob snapshot without requiring a Gemini key", async (
   const chatInput = page.getByLabel("Nhập câu hỏi");
   await chatInput.fill("Ví này có bao nhiêu blob trên Shelby?");
   await chatInput.press("Enter");
-  await expect(page.getByText(/Snapshot Shelby được làm mới lúc .* có 2 blob\./)).toHaveCount(1);
+  await expect(page.getByText("Theo dữ liệu ứng dụng vừa cung cấp, ví này có 2 blob.", { exact: true })).toHaveCount(1);
 
   await chatInput.fill("chắc chưa?");
   await chatInput.press("Enter");
-  await expect(page.getByText(/Snapshot Shelby được làm mới lúc .* có 2 blob\./)).toHaveCount(2);
+  await expect(page.getByText("Theo dữ liệu ứng dụng vừa cung cấp, ví này có 2 blob.", { exact: true })).toHaveCount(2);
   await expect(page.getByText("Hãy kết nối Gemini API key", { exact: false })).toHaveCount(0);
   expect(geminiRequests).toBe(0);
+  expect(hostedTurns).toBe(4);
 });
 
 test("lets the agent refresh Shelby live and reread the bounded inventory payload", async ({ page }) => {
@@ -310,7 +363,7 @@ test("lets the agent refresh Shelby live and reread the bounded inventory payloa
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({ message: { role: "assistant", content: "Tôi vừa cập nhật từ Shelby: ví này hiện có 3 blob." } }),
+        body: JSON.stringify({ message: { role: "assistant", content: "Tôi vừa cập nhật từ Shelby: ví này hiện có 2 blob." } }),
       });
       return;
     }
@@ -332,70 +385,56 @@ test("lets the agent refresh Shelby live and reread the bounded inventory payloa
   await chatInput.fill("Kiểm tra số blob hiện tại của ví tôi");
   await chatInput.press("Enter");
 
-  await expect(page.getByText(/Snapshot Shelby được làm mới lúc .* có 2 blob\./)).toBeVisible();
-  await expect(page.getByText("Tôi vừa cập nhật từ Shelby: ví này hiện có 3 blob.", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Tôi vừa cập nhật từ Shelby: ví này hiện có 2 blob.", { exact: true })).toBeVisible();
   expect(toolTurns).toBe(2);
   expect(refreshPayloads).toEqual([
     expect.objectContaining({ ok: true, source: "demo" }),
   ]);
   expect(refreshPayloads.every((payload) => !("count" in payload) && !("names" in payload) && !("examples" in payload))).toBe(true);
   expect(inventoryPayloads).toEqual([
-    expect.objectContaining({ ok: true, count: 2, verified: true }),
+    expect.objectContaining({ ok: true, count: 2, status: "verified" }),
   ]);
   expect(inventoryPayloads.every((payload) => !("names" in payload) && !("examples" in payload))).toBe(true);
 });
 
-test("keeps an inventory follow-up out of RAG even when the model picks the wrong tool", async ({ page }) => {
-  let agentTurns = 0;
-  const returnedCounts: number[] = [];
-  const returnedInventoryPayloads: any[] = [];
-  const blockedSearchResponses: any[] = [];
+test("lets the model choose a free-form blob filename filter", async ({ page }) => {
+  const inventoryPayloads: any[] = [];
   await page.route("**/api/ai/v1/chat", async (route) => {
     const body = route.request().postDataJSON() as any;
     const latestTool = [...(body?.messages ?? [])].reverse().find((message: any) => message?.role === "tool");
     if (latestTool) {
       const payload = JSON.parse(latestTool.content);
-      const previousCall = [...(body?.messages ?? [])].reverse()
-        .find((message: any) => message?.role === "assistant" && message?.tool_calls)
-        ?.tool_calls?.find((call: any) => call.id === latestTool.tool_call_id);
-      if (previousCall?.function?.name === "get_wallet_blob_inventory") {
-        returnedInventoryPayloads.push(payload);
-        if (typeof payload.count === "number") returnedCounts.push(payload.count);
-      } else {
-        blockedSearchResponses.push(payload);
-      }
+      inventoryPayloads.push(payload);
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({ message: {
-          role: "assistant",
-          content: previousCall?.function?.name === "get_wallet_blob_inventory"
-            ? "Theo lần làm mới gần nhất, ví này có 2 blob."
-            : "Tôi đã tìm trong RAG nhưng không có bằng chứng.",
-        } }),
+        body: JSON.stringify({
+          message: {
+            role: "assistant",
+            content: "Theo danh sách ví vừa cung cấp, hiện không có blob nào có tên chứa “anime”.",
+          },
+        }),
       });
       return;
     }
 
-    agentTurns += 1;
-    if (agentTurns === 3) {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ message: { role: "assistant", content: "Chắc chắn rồi, không cần kiểm tra lại." } }),
-      });
-      return;
-    }
-    const name = agentTurns === 1 ? "get_wallet_blob_inventory" : "search_user_knowledge";
-    const args = agentTurns === 1 ? { detail: "count" } : { query: "xác nhận số blob" };
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ message: {
-        role: "assistant",
-        content: null,
-        tool_calls: [{ id: `agent-call-${agentTurns}`, type: "function", function: { name, arguments: JSON.stringify(args) } }],
-      } }),
+      body: JSON.stringify({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "anime-inventory",
+            type: "function",
+            function: {
+              name: "get_wallet_blob_inventory",
+              arguments: JSON.stringify({ detail: "sample", nameQuery: "anime" }),
+            },
+          }],
+        },
+      }),
     });
   });
 
@@ -403,27 +442,16 @@ test("keeps an inventory follow-up out of RAG even when the model picks the wron
   await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
   await expect(page.getByText("Hướng dẫn Shelby RAG (Public)", { exact: true })).toBeVisible();
   const chatInput = page.getByLabel("Nhập câu hỏi");
-  await chatInput.fill("Ví này có bao nhiêu blob trên Shelby?");
+  await chatInput.fill("Tôi có blob anime nào?");
   await chatInput.press("Enter");
-  await expect(page.getByText("Theo lần làm mới gần nhất, ví này có 2 blob.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Theo danh sách ví vừa cung cấp, hiện không có blob nào có tên chứa “anime”.", { exact: true })).toBeVisible();
   await expect(page.getByText("Dữ liệu Shelby", { exact: true })).toBeVisible();
-
-  await chatInput.fill("chắc chưa?");
-  await chatInput.press("Enter");
-  await expect(page.getByText(/Snapshot Shelby được làm mới lúc .* có 2 blob\./)).toBeVisible();
-  await expect(page.getByText("Tôi đã tìm trong kho dữ liệu", { exact: false })).toHaveCount(0);
-  await expect(page.getByText("Tôi đã tìm trong RAG", { exact: false })).toHaveCount(0);
-  expect(agentTurns).toBe(2);
-  expect(returnedCounts).toEqual([2]);
-  expect(returnedInventoryPayloads).toHaveLength(1);
-  expect(returnedInventoryPayloads.every((payload) => !("names" in payload) && !("examples" in payload))).toBe(true);
-  expect(blockedSearchResponses).toEqual([
-    expect.objectContaining({ found: false, evidence: [] }),
+  expect(inventoryPayloads).toEqual([
+    expect.objectContaining({
+      ok: true,
+      nameQuery: "anime",
+      matchedCount: 0,
+      matches: [],
+    }),
   ]);
-
-  await chatInput.fill("xác nhận lại đi");
-  await chatInput.press("Enter");
-  await expect(page.getByText(/Snapshot Shelby được làm mới lúc .* có 2 blob\./)).toHaveCount(2);
-  await expect(page.getByText("Chắc chắn rồi, không cần kiểm tra lại.", { exact: true })).toHaveCount(0);
-  expect(agentTurns).toBe(3);
 });

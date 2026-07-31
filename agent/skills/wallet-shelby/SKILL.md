@@ -5,6 +5,9 @@ description: Handle direct wallet, Aptos and Shelby inventory facts from determi
 
 Never infer balances, addresses, blobs, or ownership from document text. Tool
 output is the source of truth. State uncertainty when the tool has no result.
+When the user asks for blobs matching a word, extension, or category, pass that
+substring as `nameQuery` to `get_wallet_blob_inventory` and summarize its
+`matches`; do not guess from sample names.
 For a follow-up that asks whether a blob count or list is correct, call
 `get_wallet_blob_inventory` again. Do not search document contents. If the tool
 marks its snapshot stale or unverified, call `refresh_wallet_blob_inventory`

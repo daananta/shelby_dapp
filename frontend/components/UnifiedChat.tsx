@@ -4,12 +4,11 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { ArrowDown, Bookmark, ChevronDown, Cloud, Database, FileCheck2, Fingerprint, KeyRound, MessageSquare, Send, ShieldCheck, Sparkles, Square, Trash2, X } from "lucide-react";
-import { deactivateActiveRagOwner, getPageRecord, getRagSources, hasRemoteRagProvider, isHotRemoteRagProvider, lookupExactQuote, searchDocuments, setActiveRagOwner } from "@/utils/ragOrama";
+import { deactivateActiveRagOwner, getPageRecord, getRagSources, hasRemoteRagProvider, isHotRemoteRagProvider, searchDocuments, setActiveRagOwner } from "@/utils/ragOrama";
 import type { AnswerReceipt, RetrievalResult } from "@/utils/ragTypes";
 import { clearStoredCloudApiKey, getCloudErrorKind, getStoredCloudApiKey, isCloudProviderError, normalizeCloudError, resolveConversationRouteWithCloud, storeCloudApiKey, streamCloudAgentAnswer, verifyCloudApiKey } from "@/utils/aiProvider";
 import { streamHostedAgentAnswer } from "@/utils/openRouterProvider";
-import { asksForLiveBlobInventoryRefresh, blobInventoryDetailForQuestion, createChatToolObservation, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, runChatTool, type ChatToolResult } from "@/utils/chatTools";
-import { classifyQueryIntent } from "@/utils/queryRouter";
+import { createChatToolObservation, readBlobInventory, readBlobInventoryForAgent, runChatTool, type ChatToolResult } from "@/utils/chatTools";
 import { buildAdaptiveAgentSystemInstruction, isInternalGuideSource } from "@/utils/agentPolicy";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -295,7 +294,6 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
     const request = beginRequest();
     const { signal } = request;
     let pendingMessageId: string | undefined;
-    let deferredToolFallback: ChatToolResult | null = null;
     let streamedText = "";
     let preserveStatus = false;
     const updateCurrentMessages = (updater: (previous: ChatMessage[]) => ChatMessage[]) => {
@@ -320,31 +318,6 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       setStatus("");
       if (account) await setActiveRagOwner(account.address.toString());
       assertRequestCurrent();
-      const routed = classifyQueryIntent(userQuery);
-      const previousWasBlobInventory = messages.at(-1)?.role === "ai"
-        && messages.at(-1)?.tool === "blob_inventory"
-        && messages.at(-1)?.toolObservation?.kind === "blob_inventory";
-      if ((routed.intent === "exact_quote" || routed.intent === "page_lookup") && routed.quotedText) {
-        const result = await lookupExactQuote(routed.quotedText, signal);
-        assertRequestCurrent();
-        if (result) {
-          const matchLabel = result.method === "exact" ? t("exact match", "khớp nguyên văn") : t("close match", "khớp gần đúng");
-          const citedResult = { ...result, citationId: "S1" };
-          updateCurrentMessages((previous) => [...previous, createChatMessage({
-            role: "ai",
-            tool: "document_lookup",
-            text: t(
-              `I found this on page ${result.pageNumber}/${result.totalPages} of ${result.displayName} (${matchLabel}) [S1].\n\n“…${result.excerpt}…”`,
-              `Tìm thấy câu này ở trang ${result.pageNumber}/${result.totalPages} của ${result.displayName} (${matchLabel}) [S1].\n\n“…${result.excerpt}…”`,
-            ),
-            links: result.link ? [{ label: t(`Open ${result.displayName} on page ${result.pageNumber}`, `Mở ${result.displayName} tại trang ${result.pageNumber}`), url: result.link }] : undefined,
-            sources: [citedResult],
-          })]);
-        } else {
-          updateCurrentMessages((previous) => [...previous, createChatMessage({ role: "ai", tool: "document_lookup", text: t("I could not find this quote in the current page index. If it is a scanned PDF, select the document and create its RAG with full-page OCR.", "Không tìm thấy câu này trong page index hiện tại. Nếu đây là PDF scan, hãy chọn tài liệu và dùng Tạo RAG để OCR toàn bộ trang.") })]);
-        }
-        return;
-      }
       const recentTurns = messages.slice(-6).map((message) => ({
         role: message.role,
         text: message.text.slice(0, 600),
@@ -352,72 +325,11 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       }));
       const availableSources = [...new Set(recentTurns.flatMap((turn) => turn.sources))];
       const hasRecentImage = messages.slice(-3).some((message) => Boolean(message.imageUrls?.length));
-      const cloudRoute = geminiUsage.contentAnalysis && geminiApiKey && routed.intent === "general" && hasRecentImage && availableSources.length
+      const cloudRoute = geminiUsage.contentAnalysis && geminiApiKey && hasRecentImage && availableSources.length
         ? await resolveConversationRouteWithCloud({ question: userQuery, recentTurns, availableSources, cloudApiKey: geminiApiKey, signal })
         : null;
       assertRequestCurrent();
       const resolvedScope = cloudRoute && cloudRoute.confidence >= 0.55 ? cloudRoute.scope : null;
-      const toolResult = await runChatTool(userQuery, account?.address.toString(), {
-        preferredSources: cloudRoute?.referencedSources,
-        forceImage: resolvedScope === "image",
-        forceImageDescription: resolvedScope === "image" && cloudRoute?.imageAction === "describe",
-        allowCloudDescription: geminiUsage.contentAnalysis,
-        language,
-      }, signal);
-      assertRequestCurrent();
-      const inventoryDetail = blobInventoryDetailForQuestion(userQuery);
-      const inventoryData = toolResult?.data;
-      const liveInventoryRefreshRequested = Boolean(
-        asksForLiveBlobInventoryRefresh(userQuery)
-        && (routed.intent === "inventory" || toolResult?.name === "blob_inventory")
-      );
-      const allowsLiveInventoryRefresh = Boolean(
-        refreshBlobInventory
-        && inventoryDetail !== "all"
-        && (
-          liveInventoryRefreshRequested
-          || (previousWasBlobInventory && isBlobInventoryConfirmationFollowUp(userQuery))
-        )
-      );
-      const letAgentPhraseInventory = Boolean(
-        geminiUsage.chat
-        && toolResult?.name === "blob_inventory"
-        && inventoryDetail !== "all"
-        && (
-          (inventoryData?.status === "verified" && inventoryData.freshness === "recent_cache")
-          || allowsLiveInventoryRefresh
-        )
-      );
-      if (toolResult && !letAgentPhraseInventory) {
-        updateCurrentMessages((previous) => [...previous, createChatMessage({
-          role: "ai",
-          text: toolResult.text,
-          imageUrls: toolResult.imageUrls,
-          links: toolResult.links,
-          tool: toolResult.name,
-          toolObservation: createChatToolObservation(toolResult),
-          referencedSources: toolResult.referencedSources,
-        })]);
-        return;
-      }
-      if (toolResult) {
-        deferredToolFallback = toolResult;
-      } else if (previousWasBlobInventory && isBlobInventoryConfirmationFollowUp(userQuery)) {
-        deferredToolFallback = readBlobInventory(inventoryDetail, { language });
-      }
-      const localInventoryFallback = deferredToolFallback;
-      if (!geminiUsage.chat && localInventoryFallback) {
-        updateCurrentMessages((previous) => [...previous, createChatMessage({
-          role: "ai",
-          text: localInventoryFallback.text,
-          imageUrls: localInventoryFallback.imageUrls,
-          links: localInventoryFallback.links,
-          tool: localInventoryFallback.name,
-          toolObservation: createChatToolObservation(localInventoryFallback),
-          referencedSources: localInventoryFallback.referencedSources,
-        })]);
-        return;
-      }
       if (!geminiUsage.chat) {
         updateCurrentMessages((previous) => [...previous, createChatMessage({ role: "ai", text: t(
           "AI chat is off. You can enable it in Settings; wallet and Shelby data tools remain available.",
@@ -436,9 +348,6 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       pendingMessageId = pendingMessage.id;
       updateCurrentMessages((previous) => [...previous, pendingMessage]);
       let knowledgeSearchAttempted = false;
-      let recoveredInventoryMisroute = false;
-      let inventoryRefreshSucceeded = false;
-      let inventoryReadAfterRefresh = false;
       let agentToolResult: ChatToolResult | null = null;
       const streamAgentAnswer = geminiApiKey ? streamCloudAgentAnswer : streamHostedAgentAnswer;
       await streamAgentAnswer(
@@ -456,18 +365,6 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
           searchKnowledge: async ({ query: semanticQuery }, requestSignal) => {
             assertRequestCurrent();
             requestSignal?.throwIfAborted();
-            if (
-              toolResult?.name === "blob_inventory"
-              || (previousWasBlobInventory && isBlobInventoryConfirmationFollowUp(userQuery))
-            ) {
-              recoveredInventoryMisroute = true;
-              agentToolResult = deferredToolFallback ?? readBlobInventory(inventoryDetail, { language });
-              return {
-                found: false,
-                evidence: [],
-                message: "This follows an app inventory answer, not document evidence. Do not infer a count from RAG; the app will render its inventory snapshot directly.",
-              };
-            }
             knowledgeSearchAttempted = true;
             if (!ragReady) {
               return { found: false, evidence: [], message: "The user has no searchable knowledge base on this device or Shelby." };
@@ -490,42 +387,43 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
                 : "No sufficiently relevant passage was found. State this limitation in the user's language and do not guess document content.",
             };
           },
-          getWalletBlobInventory: async (_request, requestSignal) => {
+          getWalletBlobInventory: async (inventoryRequest, requestSignal) => {
             assertRequestCurrent();
             requestSignal?.throwIfAborted();
-            const result = readBlobInventory(inventoryDetail, { language });
+            const result = readBlobInventory(inventoryRequest.detail, { language });
             agentToolResult = result;
-            if (inventoryRefreshSucceeded) inventoryReadAfterRefresh = true;
-            const data = result.data;
-            if (!data || data.kind !== "blob_inventory") return { ok: false, code: "inventory_unavailable" };
-            if (liveInventoryRefreshRequested && !inventoryRefreshSucceeded) {
-              return {
-                ok: false,
-                code: "live_refresh_required",
-                fetchedAt: data.fetchedAt,
-                message: "The user requested current network data. Refresh Shelby before using this snapshot.",
-              };
+            const payload = readBlobInventoryForAgent(inventoryRequest);
+            const status = payload.status;
+            if (status === "not_loaded") return { ...payload, ok: false, code: "inventory_unavailable" };
+            return payload;
+          },
+          inspectApplication: async ({ query: applicationQuery }, requestSignal) => {
+            assertRequestCurrent();
+            const activeSignal = requestSignal ?? signal;
+            activeSignal.throwIfAborted();
+            const result = await runChatTool(applicationQuery, account?.address.toString(), {
+              preferredSources: cloudRoute?.referencedSources,
+              forceImage: resolvedScope === "image",
+              forceImageDescription: resolvedScope === "image" && cloudRoute?.imageAction === "describe",
+              allowCloudDescription: geminiUsage.contentAnalysis,
+              language,
+            }, activeSignal);
+            activeSignal.throwIfAborted();
+            assertRequestCurrent();
+            if (!result || result.name === "blob_inventory") {
+              return { ok: false, code: "application_inspection_unavailable" };
             }
-            if (data.status !== "verified" || data.freshness !== "recent_cache") {
-              return {
-                ok: false,
-                code: data.status === "not_loaded" ? "not_loaded" : "stale_snapshot",
-                lastKnownCount: data.count,
-                fetchedAt: data.fetchedAt,
-                freshness: data.freshness,
-                message: "This is not a current network reading. Do not claim the count is current; the app will show a safe refresh instruction.",
-              };
-            }
+            agentToolResult = result;
             return {
               ok: true,
-              count: data.count,
-              ...(inventoryDetail === "sample" ? { examples: data.examples } : {}),
-              fetchedAt: data.fetchedAt,
-              freshness: data.freshness,
-              verified: true,
+              kind: result.name,
+              facts: result.text,
+              referencedSources: result.referencedSources ?? [],
+              previewCount: result.imageUrls?.length ?? 0,
+              linkCount: result.links?.length ?? 0,
             };
           },
-          ...(allowsLiveInventoryRefresh ? {
+          ...(refreshBlobInventory ? {
             refreshWalletBlobInventory: async (requestSignal?: AbortSignal) => {
               assertRequestCurrent();
               const activeSignal = requestSignal ?? signal;
@@ -533,11 +431,9 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
               if (!refreshBlobInventory) {
                 return { ok: false, code: "refresh_not_authorized_for_turn" };
               }
-              const refreshed = await refreshBlobInventory(inventoryDetail, activeSignal);
+              const refreshed = await refreshBlobInventory("count", activeSignal);
               activeSignal.throwIfAborted();
               assertRequestCurrent();
-              const result = readBlobInventory(inventoryDetail, { language });
-              agentToolResult = result;
               if (refreshed.status !== "refreshed") {
                 return {
                   ok: false,
@@ -545,7 +441,6 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
                   message: "The live Shelby refresh did not complete. Do not present cached data as current.",
                 };
               }
-              inventoryRefreshSucceeded = true;
               return {
                 ok: true,
                 refreshedAt: refreshed.fetchedAt,
@@ -559,50 +454,6 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       );
       assertRequestCurrent();
       let finalAgentToolResult = agentToolResult as ChatToolResult | null;
-      if (liveInventoryRefreshRequested && !inventoryRefreshSucceeded) {
-        const lastSnapshot = finalAgentToolResult ?? deferredToolFallback ?? readBlobInventory(inventoryDetail, { language });
-        finalAgentToolResult = {
-          ...lastSnapshot,
-          text: t(
-            `I could not complete a live Shelby refresh. Last available information:\n\n${lastSnapshot.text}`,
-            `Chưa thể hoàn tất lần cập nhật trực tiếp từ Shelby. Thông tin gần nhất:\n\n${lastSnapshot.text}`,
-          ),
-          data: lastSnapshot.data ? {
-            ...lastSnapshot.data,
-            status: "stale",
-            freshness: "stale_cache",
-          } : undefined,
-        };
-        streamedText = finalAgentToolResult.text;
-        relevantDocs = [];
-        knowledgeSearchAttempted = false;
-      } else if (inventoryRefreshSucceeded && !inventoryReadAfterRefresh && finalAgentToolResult) {
-        streamedText = finalAgentToolResult.text;
-      } else if (recoveredInventoryMisroute && finalAgentToolResult) {
-        streamedText = finalAgentToolResult.text;
-      } else if (
-        finalAgentToolResult?.data?.kind === "blob_inventory"
-        && (finalAgentToolResult.data.status !== "verified" || finalAgentToolResult.data.freshness !== "recent_cache")
-      ) {
-        streamedText = finalAgentToolResult.text;
-      } else if (
-        finalAgentToolResult?.data?.kind === "blob_inventory"
-        && !isBlobInventoryAnswerConsistent(finalAgentToolResult, streamedText)
-      ) {
-        streamedText = finalAgentToolResult.text;
-      }
-      if (deferredToolFallback && !finalAgentToolResult && !knowledgeSearchAttempted) {
-        streamedText = deferredToolFallback.text;
-        finalAgentToolResult = deferredToolFallback;
-        relevantDocs = [];
-      }
-      if (deferredToolFallback && !finalAgentToolResult && knowledgeSearchAttempted) {
-        finalAgentToolResult = deferredToolFallback;
-        if (!relevantDocs.length) {
-          streamedText = deferredToolFallback.text;
-          knowledgeSearchAttempted = false;
-        }
-      }
       let grounding = finalizeCitationGrounding(
         streamedText,
         relevantDocs,
@@ -639,6 +490,8 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
         interrupted: undefined,
         sources: citedSources,
         links: citedLinks.slice(0, 4),
+        imageUrls: finalAgentToolResult?.imageUrls,
+        referencedSources: finalAgentToolResult?.referencedSources,
         hotReadProof,
         tool: finalAgentToolResult?.name,
         toolObservation: createChatToolObservation(finalAgentToolResult),
@@ -663,28 +516,6 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             `Gemini đang tạm giới hạn yêu cầu của key …${geminiApiKey.slice(-4)}. Key vẫn được lưu cục bộ; hãy chờ rồi chọn Thử lại.`,
           ));
           preserveStatus = true;
-        }
-        const localFallback = deferredToolFallback;
-        if (pendingMessageId && localFallback && !streamedText) {
-          updateCurrentMessages((previous) => previous.map((message) => message.id === pendingMessageId ? {
-            ...message,
-            text: localFallback.text,
-            typing: false,
-            interrupted: undefined,
-            imageUrls: localFallback.imageUrls,
-            links: localFallback.links,
-            tool: localFallback.name,
-            toolObservation: createChatToolObservation(localFallback),
-            referencedSources: localFallback.referencedSources,
-          } : message));
-          if (cloudErrorKind !== "rate_limit") {
-            setStatus(t(
-              "AI wording was unavailable, so the app showed the available Shelby data directly.",
-              "AI chưa thể diễn đạt câu trả lời, nên ứng dụng đã hiển thị trực tiếp dữ liệu Shelby hiện có.",
-            ));
-          }
-          preserveStatus = true;
-          return;
         }
         const errorText = `❌ ${pendingMessageId && cloudProviderError
           ? cloudErrorMessage(error)

@@ -85,6 +85,181 @@ describe("hosted Qwen agent", () => {
     ]));
   });
 
+  it("lets Qwen select a filename filter for the inventory tool", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "inventory-1",
+            type: "function",
+            function: {
+              name: "get_wallet_blob_inventory",
+              arguments: "{\"detail\":\"sample\",\"nameQuery\":\"anime\"}",
+            },
+          }],
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: "I found two anime blobs: anime2.jpeg and anime-avatar.jpg.",
+        },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const getWalletBlobInventory = vi.fn().mockResolvedValue({
+      ok: true,
+      count: 36,
+      nameQuery: "anime",
+      matchedCount: 2,
+      matches: ["anime2.jpeg", "anime-avatar.jpg"],
+      freshness: "stale_cache",
+    });
+
+    const answer = await streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "Which anime blobs do I have?" }] }] },
+      vi.fn(),
+      { searchKnowledge: vi.fn(), getWalletBlobInventory },
+    );
+
+    expect(answer).toContain("anime2.jpeg");
+    expect(getWalletBlobInventory).toHaveBeenCalledWith({
+      detail: "sample",
+      nameQuery: "anime",
+    }, undefined);
+  });
+
+  it("lets Qwen phrase a deterministic application observation", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "app-1",
+            type: "function",
+            function: {
+              name: "inspect_application",
+              arguments: "{\"query\":\"Show my indexed anime images\"}",
+            },
+          }],
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: "I found two indexed anime images and attached their previews.",
+        },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const inspectApplication = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "show_images",
+      previewCount: 2,
+    });
+
+    const answer = await streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "Show my indexed anime images" }] }] },
+      vi.fn(),
+      {
+        searchKnowledge: vi.fn(),
+        getWalletBlobInventory: vi.fn(),
+        inspectApplication,
+      },
+    );
+
+    expect(answer).toContain("two indexed anime images");
+    expect(inspectApplication).toHaveBeenCalledWith(
+      { query: "Show my indexed anime images" },
+      undefined,
+    );
+  });
+
+  it("lets the harness repair a document answer that omitted its tool citation", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call-1",
+            type: "function",
+            function: { name: "search_user_knowledge", arguments: "{\"query\":\"package.json libraries\"}" },
+          }],
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "The project uses Shelby and Aptos libraries." },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "The project uses Shelby storage and Aptos integration libraries [S1]." },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const searchKnowledge = vi.fn().mockResolvedValue({
+      found: true,
+      evidence: [{ citation: "S1", excerpt: "Dependencies include Shelby and Aptos SDK packages." }],
+    });
+
+    const answer = await streamHostedAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "Which libraries does package.json use?" }] }],
+        systemInstruction: "Use citations.",
+      },
+      vi.fn(),
+      { searchKnowledge, getWalletBlobInventory: vi.fn() },
+    );
+
+    expect(answer).toContain("[S1]");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const repairBody = JSON.parse(String((fetchMock.mock.calls[2][1] as RequestInit).body));
+    expect(repairBody.toolChoice).toBe("none");
+    expect(repairBody.messages.at(-2)).toMatchObject({
+      role: "assistant",
+      content: "The project uses Shelby and Aptos libraries.",
+    });
+    expect(repairBody.messages.at(-1)).toMatchObject({
+      role: "user",
+      content: expect.stringContaining("allowed set: [S1]"),
+    });
+  });
+
+  it("does not loop when Qwen ignores the single citation repair", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call-1",
+            type: "function",
+            function: { name: "search_user_knowledge", arguments: "{\"query\":\"document\"}" },
+          }],
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "First uncited draft." },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "Still uncited." },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "Read my document." }] }] },
+      vi.fn(),
+      {
+        searchKnowledge: vi.fn().mockResolvedValue({
+          found: true,
+          evidence: [{ citation: "S1", excerpt: "Evidence" }],
+        }),
+        getWalletBlobInventory: vi.fn(),
+      },
+    )).resolves.toBe("Still uncited.");
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("surfaces hosted rate limits without treating them as a rejected user key", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ kind: "rate_limit" }, 429)));
 

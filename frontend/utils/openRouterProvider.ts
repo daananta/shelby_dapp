@@ -1,6 +1,7 @@
 import {
   AgentHarnessLimitError,
   DEFAULT_AGENT_HARNESS_BUDGET,
+  createFinalAnswerRepairInstruction,
   createAgentHarnessState,
   executeAgentToolCalls,
   type AgentFunctionCall,
@@ -80,12 +81,16 @@ function parseToolCalls(value: unknown): Array<AgentFunctionCall & { id: string 
   });
 }
 
-async function requestHostedChat(messages: OpenRouterMessage[], signal?: AbortSignal): Promise<HostedChatResponse["message"]> {
+async function requestHostedChat(
+  messages: OpenRouterMessage[],
+  signal?: AbortSignal,
+  toolChoice: "auto" | "none" = "auto",
+): Promise<HostedChatResponse["message"]> {
   signal?.throwIfAborted();
   const response = await fetch("/api/ai/v1/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify({ messages, toolChoice }),
     signal,
   });
   const payload = await response.json().catch(() => ({})) as HostedChatResponse & { error?: string; kind?: string };
@@ -146,9 +151,15 @@ export async function streamHostedAgentAnswer(
       maxExecutions: 2,
       allowRepeatedSignature: true,
       unavailableCode: "blob_inventory_unavailable",
-      execute: async (args, requestSignal) => handlers.getWalletBlobInventory({
-        detail: args.detail === "all" || args.detail === "sample" ? args.detail : "count",
-      }, requestSignal),
+      execute: async (args, requestSignal) => {
+        const nameQuery = typeof args.nameQuery === "string" && args.nameQuery.trim()
+          ? args.nameQuery.trim().slice(0, 200)
+          : undefined;
+        return handlers.getWalletBlobInventory({
+          detail: args.detail === "all" || args.detail === "sample" ? args.detail : "count",
+          nameQuery,
+        }, requestSignal);
+      },
     }],
     ["refresh_wallet_blob_inventory", {
       name: "refresh_wallet_blob_inventory",
@@ -158,13 +169,27 @@ export async function streamHostedAgentAnswer(
         ? handlers.refreshWalletBlobInventory(requestSignal)
         : { ok: false, code: "blob_inventory_refresh_unavailable" },
     }],
+    ["inspect_application", {
+      name: "inspect_application",
+      maxExecutions: 1,
+      unavailableCode: "application_inspection_unavailable",
+      execute: async (args, requestSignal) => {
+        const query = typeof args.query === "string" && args.query.trim()
+          ? args.query.trim().slice(0, 1_000)
+          : latestText;
+        return handlers.inspectApplication
+          ? handlers.inspectApplication({ query }, requestSignal)
+          : { ok: false, code: "application_inspection_unavailable" };
+      },
+    }],
   ]);
 
   const harnessState = createAgentHarnessState();
   let toolRound = 0;
+  let repairOnly = false;
   while (toolRound <= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
     signal?.throwIfAborted();
-    const response = await requestHostedChat(messages, signal);
+    const response = await requestHostedChat(messages, signal, repairOnly ? "none" : "auto");
     const calls = parseToolCalls(response?.tool_calls);
     if (!calls.length) {
       const answer = typeof response?.content === "string" ? response.content.trim() : "";
@@ -172,6 +197,17 @@ export async function streamHostedAgentAnswer(
         "There is not enough information for a confident answer.",
         "Không tìm thấy đủ thông tin để trả lời chắc chắn.",
       );
+      const repairInstruction = createFinalAnswerRepairInstruction(harnessState, finalAnswer);
+      if (repairInstruction) {
+        messages.push({
+          role: "assistant",
+          content: finalAnswer,
+          ...(Array.isArray(response?.reasoning_details) ? { reasoning_details: response.reasoning_details } : {}),
+        });
+        messages.push({ role: "user", content: repairInstruction });
+        repairOnly = true;
+        continue;
+      }
       signal?.throwIfAborted();
       onChunk(finalAnswer);
       return finalAnswer;

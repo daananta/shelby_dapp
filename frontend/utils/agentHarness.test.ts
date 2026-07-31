@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   AgentHarnessLimitError,
+  createFinalAnswerRepairInstruction,
   createAgentHarnessState,
   executeAgentToolCalls,
+  validateAgentFinalAnswer,
   type AgentToolDefinition,
 } from "@/utils/agentHarness";
 
@@ -212,5 +214,67 @@ describe("bounded agent harness", () => {
       ok: false,
       code: "agent_total_response_limit",
     });
+  });
+
+  it("derives a citation contract from tool evidence without classifying the user question", async () => {
+    const tools = registry({
+      name: "knowledge",
+      maxExecutions: 1,
+      unavailableCode: "knowledge_unavailable",
+      execute: vi.fn().mockResolvedValue({
+        found: true,
+        evidence: [
+          { citation: "S1", excerpt: "First passage" },
+          { citation: "s2", excerpt: "Second passage" },
+          { citation: "invalid", excerpt: "Ignored" },
+        ],
+      }),
+    });
+    const state = createAgentHarnessState();
+
+    await executeAgentToolCalls({
+      calls: [{ name: "knowledge", args: { query: "anything" } }],
+      registry: tools,
+      state,
+      round: 1,
+    });
+
+    expect(validateAgentFinalAnswer(state, "Supported [S1].")).toMatchObject({
+      valid: true,
+      requiresCitations: true,
+      allowedCitationIds: ["S1", "S2"],
+    });
+    expect(validateAgentFinalAnswer(state, "Missing citation.")).toMatchObject({
+      valid: false,
+      reason: "missing_citation",
+    });
+    expect(validateAgentFinalAnswer(state, "Invented [S99].")).toMatchObject({
+      valid: false,
+      reason: "unknown_citation",
+    });
+  });
+
+  it("allows exactly one bounded final-answer repair", async () => {
+    const tools = registry({
+      name: "knowledge",
+      maxExecutions: 1,
+      unavailableCode: "knowledge_unavailable",
+      execute: vi.fn().mockResolvedValue({
+        evidence: [{ citation: "S1", excerpt: "Evidence" }],
+      }),
+    });
+    const state = createAgentHarnessState();
+    await executeAgentToolCalls({
+      calls: [{ name: "knowledge" }],
+      registry: tools,
+      state,
+      round: 1,
+    });
+
+    const instruction = createFinalAnswerRepairInstruction(state, "No citation.");
+    expect(instruction).toContain("[S1]");
+    expect(instruction).toContain("Return only the corrected user-facing answer");
+    expect(createFinalAnswerRepairInstruction(state, "Still no citation.")).toBeUndefined();
+    expect(state.finalAnswerRepairs).toBe(1);
   });
 });

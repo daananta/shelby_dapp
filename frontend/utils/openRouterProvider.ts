@@ -35,6 +35,8 @@ type HostedChatResponse = {
   };
 };
 
+type HostedGatewayPayload = HostedChatResponse & { error?: string; kind?: string };
+
 const MAX_HOSTED_IMAGE_BYTES = 2 * 1024 * 1024;
 const MAX_HOSTED_IMAGE_SOURCE_BYTES = 12 * 1024 * 1024;
 const MAX_HOSTED_IMAGE_EDGE = 1_600;
@@ -49,6 +51,104 @@ export class HostedAiError extends Error {
     super(message);
     this.name = "HostedAiError";
   }
+}
+
+function isLocalPreviewHost(): boolean {
+  if (typeof location === "undefined") return false;
+  return location.hostname === "localhost" || location.hostname === "127.0.0.1" || location.hostname === "::1";
+}
+
+async function requestHostedGateway(
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<{ response: Response; payload: HostedGatewayPayload }> {
+  let response: Response;
+  try {
+    response = await fetch("/api/ai/v1/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (error) {
+    if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+    throw new HostedAiError(
+      "unavailable",
+      localize(
+        "The AI service could not be reached. Check your connection and try again.",
+        "Không thể kết nối tới dịch vụ AI. Hãy kiểm tra mạng và thử lại.",
+      ),
+    );
+  }
+
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (!contentType.includes("json")) {
+    throw new HostedAiError(
+      "unavailable",
+      isLocalPreviewHost()
+        ? localize(
+          "This local preview does not run the AI service. Start the full app with npm run dev:fullstack, or use production.",
+          "Bản xem trước local chưa chạy dịch vụ AI. Hãy dùng npm run dev:fullstack hoặc bản production.",
+        )
+        : localize(
+          "The AI service returned an unexpected response. Please try again.",
+          "Dịch vụ AI trả về phản hồi không đúng định dạng. Hãy thử lại.",
+        ),
+      response.status,
+    );
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new HostedAiError(
+      "invalid_response",
+      localize("The AI service returned invalid JSON.", "Dịch vụ AI trả về dữ liệu JSON không hợp lệ."),
+      response.status,
+    );
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new HostedAiError(
+      "invalid_response",
+      localize("The AI service returned an invalid response.", "Dịch vụ AI trả về phản hồi không hợp lệ."),
+      response.status,
+    );
+  }
+  return { response, payload: payload as HostedGatewayPayload };
+}
+
+function hostedGatewayFailure(
+  response: Response,
+  payload: HostedGatewayPayload,
+  mode: "chat" | "vision",
+): HostedAiError {
+  if (response.status === 429 || payload.kind === "rate_limit") {
+    return new HostedAiError(
+      "rate_limit",
+      mode === "vision"
+        ? localize("Qwen vision is receiving too many requests. Please wait a moment and try again.", "Qwen Vision đang nhận quá nhiều yêu cầu. Hãy chờ một chút rồi thử lại.")
+        : localize("Qwen is receiving too many requests. Please wait a moment and try again.", "Qwen đang nhận quá nhiều yêu cầu. Hãy chờ một chút rồi thử lại."),
+      response.status,
+    );
+  }
+  if (response.status === 503 || payload.kind === "provider_auth") {
+    return new HostedAiError(
+      "unavailable",
+      localize(
+        "The app's AI service needs server configuration. Try Gemini or contact the app owner.",
+        "Dịch vụ AI của ứng dụng chưa được cấu hình đầy đủ. Hãy dùng Gemini hoặc liên hệ chủ ứng dụng.",
+      ),
+      response.status,
+    );
+  }
+  return new HostedAiError(
+    "unavailable",
+    mode === "vision"
+      ? localize("Qwen could not inspect this image right now.", "Qwen chưa thể phân tích ảnh này lúc này.")
+      : localize("Qwen is temporarily unavailable. Please try again shortly.", "Qwen đang tạm thời chưa sẵn sàng. Vui lòng thử lại sau ít phút."),
+    response.status,
+  );
 }
 
 function hostedImageError(message: string, vietnamese: string, status: number) {
@@ -304,27 +404,8 @@ async function requestHostedChat(
   toolChoice: "auto" | "none" = "auto",
 ): Promise<HostedChatResponse["message"]> {
   signal?.throwIfAborted();
-  const response = await fetch("/api/ai/v1/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages, toolChoice }),
-    signal,
-  });
-  const payload = await response.json().catch(() => ({})) as HostedChatResponse & { error?: string; kind?: string };
-  if (!response.ok) {
-    if (response.status === 429 || payload.kind === "rate_limit") {
-      throw new HostedAiError(
-        "rate_limit",
-        localize("Qwen is receiving too many requests. Please wait a moment and try again.", "Qwen đang nhận quá nhiều yêu cầu. Hãy chờ một chút rồi thử lại."),
-        response.status,
-      );
-    }
-    throw new HostedAiError(
-      "unavailable",
-      localize("Qwen is temporarily unavailable. Please try again shortly.", "Qwen đang tạm thời chưa sẵn sàng. Vui lòng thử lại sau ít phút."),
-      response.status,
-    );
-  }
+  const { response, payload } = await requestHostedGateway({ messages, toolChoice }, signal);
+  if (!response.ok) throw hostedGatewayFailure(response, payload, "chat");
   if (!payload.message) {
     throw new HostedAiError(
       "invalid_response",
@@ -385,32 +466,13 @@ export async function describeImageWithHostedAi(
   }
   const data = bytesAsBase64(imageBytes, signal);
   signal?.throwIfAborted();
-  const response = await fetch("/api/ai/v1/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      mode: "vision",
-      image: { data, mimeType, fileName: fileName.slice(0, 200) },
-      language,
-      question: question.trim().slice(0, 1_000),
-    }),
-    signal,
-  });
-  const payload = await response.json().catch(() => ({})) as HostedChatResponse & { error?: string; kind?: string };
-  if (!response.ok) {
-    if (response.status === 429 || payload.kind === "rate_limit") {
-      throw new HostedAiError(
-        "rate_limit",
-        localize("Qwen vision is receiving too many requests. Please wait a moment and try again.", "Qwen Vision đang nhận quá nhiều yêu cầu. Hãy chờ một chút rồi thử lại."),
-        response.status,
-      );
-    }
-    throw new HostedAiError(
-      "unavailable",
-      localize("Qwen could not inspect this image right now.", "Qwen chưa thể phân tích ảnh này lúc này."),
-      response.status,
-    );
-  }
+  const { response, payload } = await requestHostedGateway({
+    mode: "vision",
+    image: { data, mimeType, fileName: fileName.slice(0, 200) },
+    language,
+    question: question.trim().slice(0, 1_000),
+  }, signal);
+  if (!response.ok) throw hostedGatewayFailure(response, payload, "vision");
   const description = typeof payload.message?.content === "string" ? payload.message.content.trim() : "";
   if (!description) {
     throw new HostedAiError(

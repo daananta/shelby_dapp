@@ -6,6 +6,7 @@
   "license": "Apache-2.0",
   "scripts": {
     "dev": "vite",
+    "dev:fullstack": "vercel dev --listen 5173",
     "typecheck": "tsc && tsc -p tsconfig.api.json",
     "build": "npm run typecheck && vite build",
     "test": "vitest run",

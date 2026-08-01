@@ -49,11 +49,15 @@ Requirements:
 ```bash
 npm install
 cp .env.example .env
-npm run dev
+npm run dev:fullstack
 ```
 
-Open the local URL shown by Vite, connect a wallet, select eligible blobs, and
+Open `http://localhost:5173`, connect a wallet, select eligible blobs, and
 choose **Create RAG**.
+
+`npm run dev` starts the Vite frontend only. Use it for UI work that does not
+need the server-side AI routes; hosted Qwen chat and vision require
+`npm run dev:fullstack` or a deployed environment.
 
 ## Configuration
 
@@ -86,6 +90,8 @@ See [.env.example](.env.example) for the complete template and
 - Optional cloud OCR and semantic indexing can send selected document content to
   the configured provider. Lexical retrieval and supported local OCR remain
   available without them.
+- AI chat sends the question and only the retrieved excerpts or indexed image
+  needed for that answer to the selected provider.
 
 ## Supported content
 

@@ -475,4 +475,51 @@ describe("hosted Qwen agent", () => {
       { searchKnowledge: vi.fn(), getWalletBlobInventory: vi.fn() },
     )).rejects.toMatchObject({ name: "HostedAiError", kind: "rate_limit", status: 429 } satisfies Partial<HostedAiError>);
   });
+
+  it("explains when a Vite-only local preview does not provide the AI route", async () => {
+    vi.stubGlobal("location", { hostname: "127.0.0.1" });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("<!doctype html>", {
+      status: 200,
+      headers: { "content-type": "text/html" },
+    })));
+
+    await expect(streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "Hello" }] }] },
+      vi.fn(),
+      { searchKnowledge: vi.fn(), getWalletBlobInventory: vi.fn() },
+    )).rejects.toMatchObject({
+      name: "HostedAiError",
+      kind: "unavailable",
+      message: expect.stringContaining("dev:fullstack"),
+    });
+  });
+
+  it("distinguishes missing server provider configuration from provider overload", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ kind: "provider_auth" }, 503)));
+
+    await expect(streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "Hello" }] }] },
+      vi.fn(),
+      { searchKnowledge: vi.fn(), getWalletBlobInventory: vi.fn() },
+    )).rejects.toMatchObject({
+      name: "HostedAiError",
+      kind: "unavailable",
+      status: 503,
+      message: expect.stringContaining("server configuration"),
+    });
+  });
+
+  it("normalizes gateway network failures without swallowing aborts", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
+
+    await expect(streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "Hello" }] }] },
+      vi.fn(),
+      { searchKnowledge: vi.fn(), getWalletBlobInventory: vi.fn() },
+    )).rejects.toMatchObject({
+      name: "HostedAiError",
+      kind: "unavailable",
+      message: expect.stringContaining("could not be reached"),
+    });
+  });
 });

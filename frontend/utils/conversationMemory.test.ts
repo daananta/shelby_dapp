@@ -69,9 +69,10 @@ describe("scoped conversation memory", () => {
       },
     ]);
     const serialized = JSON.stringify(history);
-    expect(serialized).toContain("Indexed image context");
+    expect(serialized).toContain("previously answered using the indexed image");
     expect(serialized).toContain("anime2.jpeg");
     expect(serialized).toContain("silver-white hair");
+    expect(serialized).not.toContain("Indexed image context");
     expect(serialized).not.toContain("app-provided data");
     expect(serialized).not.toContain("use the tool to search again");
   });

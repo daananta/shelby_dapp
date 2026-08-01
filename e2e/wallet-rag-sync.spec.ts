@@ -100,6 +100,7 @@ test("keeps AI chat and optional Gemini indexing permissions explicit", async ({
   await expect(contentSwitch).toHaveAttribute("aria-checked", "false");
   await expect(semanticSwitch).toHaveAttribute("aria-checked", "false");
   await expect(page.getByText("Khi chat, AI vẫn có thể xem ảnh đã index nếu bạn yêu cầu.", { exact: false })).toBeVisible();
+  await expect(page.getByText("chỉ các đoạn trích hoặc ảnh đã index cần cho câu trả lời", { exact: false })).toBeVisible();
 
   await contentSwitch.click();
   await semanticSwitch.click();

@@ -68,6 +68,13 @@ export function RagConfigPanel({
             <div className="flex min-w-0 items-start gap-2.5"><BrainCircuit className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700 dark:text-lime-300" /><div><strong className="block text-xs text-slate-800 dark:text-slate-200">{t("Semantic search", "Tìm theo ý nghĩa")}</strong><p className="mt-0.5 text-[11px] leading-4 text-slate-500 dark:text-slate-400">{t("Creates embeddings in batches of up to 20 chunks and a vector for each query. When off, RAG still works with keyword search.", "Tạo embeddings theo lô tối đa 20 chunks và vector cho câu tra cứu. Khi tắt, RAG vẫn tìm được bằng từ khóa.")}</p></div></div>
             {usageSwitch(geminiUsage.semanticSearch, t("Enable semantic search", "Tạo tìm kiếm theo ý nghĩa"), () => setPreference("semanticSearch", !geminiUsage.semanticSearch))}
           </div>
+          <div className="flex items-start gap-2.5 py-3 text-[11px] leading-4 text-slate-600 dark:text-slate-400">
+            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700 dark:text-lime-300" />
+            <p>{t(
+              "For AI chat, your question and only the retrieved excerpts or indexed image needed for that answer are sent to Gemini or Qwen. API keys are never stored in RAG or uploaded to Shelby.",
+              "Khi chat AI, câu hỏi và chỉ các đoạn trích hoặc ảnh đã index cần cho câu trả lời được gửi tới Gemini hoặc Qwen. API key không được lưu trong RAG hay tải lên Shelby.",
+            )}</p>
+          </div>
         </div>
       </div>
 

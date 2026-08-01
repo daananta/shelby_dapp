@@ -42,6 +42,18 @@ describe("access_control query3 BCS", () => {
     });
   });
 
+  it("fails closed for truncated or non-canonical BCS values", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const overlongEmptyVector = `01${"00".repeat(32)}008000000000`;
+      for (const response of ["", "00", "0001", "02", "01", "0002", "000000", overlongEmptyVector]) {
+        expect(parseAccessPolicyQuery(response)).toEqual({ type: "unknown", canAccess: null });
+      }
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
   it("uses the exact full blob-name encoding required by the contract", () => {
     expect(createAccessControlBlobName("0xabc", "books/a.pdf")).toBe(`@${"abc".padStart(64, "0")}/books/a.pdf`);
   });

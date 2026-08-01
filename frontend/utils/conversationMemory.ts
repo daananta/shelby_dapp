@@ -51,7 +51,7 @@ export function buildAdaptiveGeminiHistory(messages: MemoryMessage[]) {
         .slice(0, 3)
       : [];
     const safeImageMemory = imageSources.length
-      ? `Indexed image context: ${imageSources.map((source) => JSON.stringify(source)).join(", ")}\n${answer.text.slice(0, 4_000)}`
+      ? `I previously answered using ${imageSources.length === 1 ? "the indexed image" : "the indexed images"} ${imageSources.map((source) => JSON.stringify(source)).join(", ")}. ${answer.text.slice(0, 4_000)}`
       : null;
     const safeToolMemory = answer.toolObservation?.kind === "blob_inventory"
       ? `Previous Shelby inventory observation: status=${answer.toolObservation.status}; observedAt=${answer.toolObservation.observedAt}; fetchedAt=${answer.toolObservation.fetchedAt ?? "unknown"}. Exact inventory facts are not retained in chat memory.`

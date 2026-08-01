@@ -1,5 +1,13 @@
-import { describe, expect, it } from "vitest";
-import { chunkText, extractSourceMapText, inferDocumentMetadata, isUsefulExtractedText, normalizeSearchText } from "@/utils/textExtractor";
+import { describe, expect, it, vi } from "vitest";
+
+const pdfMocks = vi.hoisted(() => ({ getDocument: vi.fn() }));
+
+vi.mock("pdfjs-dist", () => ({
+  GlobalWorkerOptions: { workerSrc: "" },
+  getDocument: pdfMocks.getDocument,
+}));
+
+import { chunkText, extractSinglePageFromUrl, extractSourceMapText, inferDocumentMetadata, isUsefulExtractedText, normalizeSearchText } from "@/utils/textExtractor";
 
 const pages = [
   { pageNumber: 1, totalPages: 351, text: "https://thuviensach.vn" },
@@ -44,5 +52,54 @@ describe("document metadata", () => {
   it("flags a long but repetitive PDF text layer as OCR-worthy", () => {
     expect(isUsefulExtractedText("AAAA ".repeat(80))).toBe(false);
     expect(isUsefulExtractedText("Trí tuệ của người xưa được kể lại qua nhiều câu chuyện xử án, ứng xử và đạo lý trong đời sống.")).toBe(true);
+  });
+
+  it("passes authenticated Shelby headers to PDF.js when rereading receipt evidence", async () => {
+    const cleanup = vi.fn();
+    const destroy = vi.fn();
+    pdfMocks.getDocument.mockReturnValue({
+      destroy: vi.fn(),
+      promise: Promise.resolve({
+        numPages: 1,
+        destroy,
+        getPage: vi.fn().mockResolvedValue({
+          cleanup,
+          getTextContent: vi.fn().mockResolvedValue({ items: [{ str: "Shelby evidence" }] }),
+        }),
+      }),
+    });
+
+    await expect(extractSinglePageFromUrl(
+      "https://api.testnet.shelby.xyz/blob.pdf",
+      "blob.pdf",
+      1,
+      "application/pdf",
+      undefined,
+      { Authorization: "Bearer AG-test-client" },
+    )).resolves.toMatchObject({ pageNumber: 1, text: "Shelby evidence" });
+
+    expect(pdfMocks.getDocument).toHaveBeenCalledWith({
+      url: "https://api.testnet.shelby.xyz/blob.pdf",
+      httpHeaders: { Authorization: "Bearer AG-test-client" },
+    });
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(destroy).toHaveBeenCalledOnce();
+  });
+
+  it("destroys a failed PDF loading task used by receipt verification", async () => {
+    const destroyLoadingTask = vi.fn();
+    pdfMocks.getDocument.mockReturnValue({
+      destroy: destroyLoadingTask,
+      promise: Promise.reject(new Error("PDF unavailable")),
+    });
+
+    await expect(extractSinglePageFromUrl(
+      "https://api.testnet.shelby.xyz/blob.pdf",
+      "blob.pdf",
+      1,
+      "application/pdf",
+    )).rejects.toThrow("PDF unavailable");
+
+    expect(destroyLoadingTask).toHaveBeenCalledOnce();
   });
 });

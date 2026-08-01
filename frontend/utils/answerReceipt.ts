@@ -1,6 +1,7 @@
 import { AccountAddress } from "@aptos-labs/ts-sdk";
 import { BlobNameSchema, generateCommitments } from "@shelby-protocol/sdk/browser";
 import { blobClient, getShelbyBlobUrl } from "@/utils/shelbyConfig";
+import { SHELBY_CLIENT_API_KEY } from "@/utils/geomiClientKey";
 import { getErasureProvider } from "@/utils/shelbyErasure";
 import { normalizeHex, sha256Text } from "@/utils/contentIntegrity";
 import { extractSinglePageFromUrl, normalizeSearchText } from "@/utils/textExtractor";
@@ -620,7 +621,10 @@ async function verifySource(source: RetrievalResult, signal?: AbortSignal): Prom
     }
 
     const url = getShelbyBlobUrl(provenance.owner, source.source);
-    const response = await fetch(url, { signal });
+    const requestHeaders = SHELBY_CLIENT_API_KEY
+      ? { Authorization: `Bearer ${SHELBY_CLIENT_API_KEY}` }
+      : undefined;
+    const response = await fetch(url, { headers: requestHeaders, signal });
     if (!response.ok || !response.body) throw new Error(localize(`Unable to download the source file (${response.status}).`, `Không tải được tệp nguồn (${response.status}).`));
     const contentLength = Number(response.headers.get("content-length") ?? metadata.size);
     if (contentLength > MAX_VERIFY_BYTES) throw new Error(localize("The file exceeds the 25 MB verification limit.", "Tệp vượt giới hạn đối chiếu 25 MB."));
@@ -637,7 +641,14 @@ async function verifySource(source: RetrievalResult, signal?: AbortSignal): Prom
 
     const extractionMethod = provenance.extractionMethod;
     if (extractionMethod === "text_layer" && source.pageNumber > 0) {
-      const page = await extractSinglePageFromUrl(url, source.source, source.pageNumber, provenance.mimeType, signal);
+      const page = await extractSinglePageFromUrl(
+        url,
+        source.source,
+        source.pageNumber,
+        provenance.mimeType,
+        signal,
+        requestHeaders,
+      );
       signal?.throwIfAborted();
       const normalizedPage = normalizeSearchText(page.text);
       const normalizedExcerpt = normalizeSearchText(source.excerpt);

@@ -26,8 +26,15 @@ class BcsReader {
   private offset = 0;
   constructor(private readonly data: Uint8Array) {}
 
-  readU8(): number { return this.data[this.offset++]; }
-  readBool(): boolean { return this.readU8() !== 0; }
+  readU8(): number {
+    if (this.offset >= this.data.length) throw new Error("BCS bị cắt ngắn.");
+    return this.data[this.offset++];
+  }
+  readBool(): boolean {
+    const value = this.readU8();
+    if (value !== 0 && value !== 1) throw new Error("BCS bool không hợp lệ.");
+    return value === 1;
+  }
   readU64(): bigint {
     const bytes = this.readBytes(8);
     let value = 0n;
@@ -36,17 +43,24 @@ class BcsReader {
   }
   readUleb128(): number {
     let value = 0;
-    let shift = 0;
-    for (;;) {
+    let multiplier = 1;
+    for (let index = 0; index < 5; index += 1) {
       const byte = this.readU8();
-      value |= (byte & 0x7f) << shift;
-      if ((byte & 0x80) === 0) return value;
-      shift += 7;
-      if (shift > 28) throw new Error("ULEB128 quá lớn.");
+      if (index === 4 && (byte & 0xf0) !== 0) throw new Error("ULEB128 quá lớn.");
+      value += (byte & 0x7f) * multiplier;
+      if (!Number.isSafeInteger(value)) throw new Error("ULEB128 quá lớn.");
+      if ((byte & 0x80) === 0) {
+        if (index > 0 && (byte & 0x7f) === 0) throw new Error("ULEB128 không đúng chuẩn.");
+        return value;
+      }
+      multiplier *= 128;
     }
+    throw new Error("ULEB128 quá lớn.");
   }
   readBytes(length: number): Uint8Array {
-    if (this.offset + length > this.data.length) throw new Error("BCS bị cắt ngắn.");
+    if (!Number.isSafeInteger(length) || length < 0 || length > this.data.length - this.offset) {
+      throw new Error("BCS bị cắt ngắn.");
+    }
     const result = this.data.slice(this.offset, this.offset + length);
     this.offset += length;
     return result;
@@ -54,6 +68,9 @@ class BcsReader {
   skipBytes(length: number) { this.readBytes(length); }
   readVectorU8(): Uint8Array { return this.readBytes(this.readUleb128()); }
   readString(): string { return new TextDecoder().decode(this.readVectorU8()); }
+  assertDone() {
+    if (this.offset !== this.data.length) throw new Error("BCS chứa dữ liệu thừa.");
+  }
 }
 
 function hexToBytes(hex: string): Uint8Array {
@@ -68,7 +85,9 @@ export function parseAccessPolicyQuery(hex: string): AccessPolicyInfo {
     const reader = new BcsReader(hexToBytes(hex));
     if (!reader.readBool()) {
       const hasCanAccess = reader.readBool();
-      return { type: "none", canAccess: hasCanAccess ? reader.readBool() : null };
+      const policy: AccessPolicyInfo = { type: "none", canAccess: hasCanAccess ? reader.readBool() : null };
+      reader.assertDone();
+      return policy;
     }
     reader.skipBytes(32); // metadata owner
     const greenBoxScheme = reader.readU8();
@@ -96,6 +115,7 @@ export function parseAccessPolicyQuery(hex: string): AccessPolicyInfo {
       policy.greenBoxScheme = greenBoxScheme;
       policy.greenBoxBytes = greenBoxBytes;
     }
+    reader.assertDone();
     return policy;
   } catch (error) {
     console.warn("Không thể đọc BCS access policy:", error);

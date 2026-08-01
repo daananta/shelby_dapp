@@ -104,11 +104,19 @@ export function extractSourceMapText(rawText: string, fileName: string): string 
   }
 }
 
-export async function extractPagesFromUrl(url: string, fileName: string, maxPdfPages = 500, onProgress?: (message: string) => void, detectedMimeType?: string, signal?: AbortSignal): Promise<ExtractedPage[]> {
+export async function extractPagesFromUrl(
+  url: string,
+  fileName: string,
+  maxPdfPages = 500,
+  onProgress?: (message: string) => void,
+  detectedMimeType?: string,
+  signal?: AbortSignal,
+  requestHeaders?: Record<string, string>,
+): Promise<ExtractedPage[]> {
   signal?.throwIfAborted();
   const isPdf = detectedMimeType === "application/pdf" || (!detectedMimeType && fileName.toLowerCase().endsWith(".pdf"));
   if (!isPdf) {
-    const response = await fetch(url, { signal });
+    const response = await fetch(url, { headers: requestHeaders, signal });
     if (!response.ok) throw new Error(localize(`Unable to download the file (${response.status}).`, `Không thể tải tệp (${response.status}).`));
     const text = await response.text();
     if (text.length > 5_000_000) throw new Error(localize(
@@ -123,7 +131,7 @@ export async function extractPagesFromUrl(url: string, fileName: string, maxPdfP
   const pdfjs = await import("pdfjs-dist");
   signal?.throwIfAborted();
   pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
-  const loadingTask = pdfjs.getDocument(url);
+  const loadingTask = pdfjs.getDocument(requestHeaders ? { url, httpHeaders: requestHeaders } : url);
   const abortLoading = () => { void loadingTask.destroy(); };
   signal?.addEventListener("abort", abortLoading, { once: true });
   let pdf: Awaited<typeof loadingTask.promise>;
@@ -172,31 +180,49 @@ export async function extractPagesFromUrl(url: string, fileName: string, maxPdfP
 }
 
 /** Re-extracts one page for an Answer Receipt without loading every PDF page. */
-export async function extractSinglePageFromUrl(url: string, fileName: string, pageNumber: number, detectedMimeType?: string, signal?: AbortSignal): Promise<ExtractedPage> {
+export async function extractSinglePageFromUrl(
+  url: string,
+  fileName: string,
+  pageNumber: number,
+  detectedMimeType?: string,
+  signal?: AbortSignal,
+  requestHeaders?: Record<string, string>,
+): Promise<ExtractedPage> {
   const isPdf = detectedMimeType === "application/pdf" || (!detectedMimeType && fileName.toLowerCase().endsWith(".pdf"));
   if (!isPdf) {
-    const [page] = await extractPagesFromUrl(url, fileName, 1, undefined, detectedMimeType, signal);
+    const [page] = await extractPagesFromUrl(url, fileName, 1, undefined, detectedMimeType, signal, requestHeaders);
     return page;
   }
   const pdfjs = await import("pdfjs-dist");
   pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
   signal?.throwIfAborted();
-  const loadingTask = pdfjs.getDocument(url);
+  const loadingTask = pdfjs.getDocument(requestHeaders ? { url, httpHeaders: requestHeaders } : url);
   const abortLoading = () => { void loadingTask.destroy(); };
   signal?.addEventListener("abort", abortLoading, { once: true });
-  const pdf = await loadingTask.promise;
+  let pdf: Awaited<typeof loadingTask.promise>;
   try {
+    pdf = await loadingTask.promise;
     signal?.throwIfAborted();
+  } catch (error) {
+    signal?.removeEventListener("abort", abortLoading);
+    await loadingTask.destroy();
+    if (signal?.aborted) throw new DOMException(localize("PDF reading stopped.", "Đã dừng đọc PDF."), "AbortError");
+    throw error;
+  }
+  try {
     if (pageNumber < 1 || pageNumber > pdf.numPages) throw new Error(localize(
       `Page ${pageNumber} does not exist in this PDF.`,
       `Trang ${pageNumber} không tồn tại trong PDF.`,
     ));
     const page = await pdf.getPage(pageNumber);
-    const content = await page.getTextContent();
-    signal?.throwIfAborted();
-    const text = content.items.map((item: any) => item.str).join(" ").replace(/\s+/g, " ").trim();
-    page.cleanup();
-    return { pageNumber, totalPages: pdf.numPages, text };
+    try {
+      const content = await page.getTextContent();
+      signal?.throwIfAborted();
+      const text = content.items.map((item: any) => item.str).join(" ").replace(/\s+/g, " ").trim();
+      return { pageNumber, totalPages: pdf.numPages, text };
+    } finally {
+      page.cleanup();
+    }
   } finally {
     signal?.removeEventListener("abort", abortLoading);
     await pdf.destroy();

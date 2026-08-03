@@ -70,6 +70,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
     loading,
     uploading,
     uploadProgress,
+    isSandboxMode,
     selectedBlobNames,
     setSelectedBlobNames,
     loadError,
@@ -608,6 +609,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
             handleIndexBlobs={handleIndexBlobs}
             pendingBlobNames={pendingBlobNames}
             mockPurchasedBlobNames={mockPurchasedBlobNames}
+            purchaseAccessEnabled={isSandboxMode}
             isPurchasableAndLocked={isPurchasableAndLocked}
             handlePurchaseAccess={handlePurchaseAccess}
             onOpenUpload={() => setActiveTab("upload")}

@@ -59,11 +59,73 @@ describe("hosted Qwen gateway", () => {
     expect(upstreamBody.reasoning).toEqual({ effort: "none", exclude: true });
     expect(upstreamBody.tools).toEqual(expect.arrayContaining([
       expect.objectContaining({
+        function: expect.objectContaining({ name: "get_connected_wallet" }),
+      }),
+      expect.objectContaining({
         function: expect.objectContaining({ name: "analyze_indexed_image" }),
       }),
     ]));
     expect(new Headers(init.headers).get("authorization")).toBe("Bearer server-only-test-key");
     expect(JSON.stringify(recorder.read().payload)).not.toContain("server-only-test-key");
+  });
+
+  it("exposes only browser capabilities that are available for the current turn", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    const upstream = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", content: "Hello." }, finish_reason: "stop" }],
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", upstream);
+    const recorder = responseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.61" },
+      body: {
+        messages: [{ role: "user", content: "Hello" }],
+        availableTools: ["search_user_knowledge", "get_connected_wallet"],
+      },
+    }, recorder.response);
+
+    expect(recorder.read().statusCode).toBe(200);
+    const [, init] = upstream.mock.calls[0] as [string, RequestInit];
+    const upstreamBody = JSON.parse(String(init.body));
+    expect(upstreamBody.tools.map((tool: { function: { name: string } }) => tool.function.name))
+      .toEqual(["search_user_knowledge", "get_connected_wallet"]);
+  });
+
+  it("rejects an upstream tool call that the current browser turn cannot execute", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "unknown-call",
+            type: "function",
+            function: { name: "analyze_indexed_image", arguments: "{}" },
+          }],
+        },
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } })));
+    const recorder = responseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.62" },
+      body: {
+        messages: [{ role: "user", content: "What is my address?" }],
+        availableTools: ["get_connected_wallet"],
+      },
+    }, recorder.response);
+
+    expect(recorder.read()).toMatchObject({
+      statusCode: 502,
+      payload: { error: "Hosted AI is unavailable" },
+    });
   });
 
   it("disables tools for a bounded final-answer repair request", async () => {
@@ -253,6 +315,113 @@ describe("hosted Qwen gateway", () => {
 
     expect(recorder.read().statusCode).toBe(403);
     expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("reports an upstream timeout distinctly from a provider failure", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    const timeout = Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(timeout));
+    const recorder = responseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.65" },
+      body: { messages: [{ role: "user", content: "Hello" }] },
+    }, recorder.response);
+
+    expect(recorder.read()).toMatchObject({
+      statusCode: 504,
+      payload: { kind: "timeout" },
+    });
+  });
+
+  it("does not charge internal agent steps against the user-turn rate bucket", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    const upstream = vi.fn().mockImplementation(async () => new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", content: "Done." }, finish_reason: "stop" }],
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", upstream);
+    const ip = "203.0.113.63";
+
+    for (let index = 0; index < 15; index += 1) {
+      const recorder = responseRecorder();
+      await handler({
+        method: "POST",
+        headers: { origin: "https://example.test", "x-forwarded-for": ip },
+        body: { messages: [{ role: "user", content: `Question ${index}` }] },
+      }, recorder.response);
+      expect(recorder.read().statusCode).toBe(200);
+    }
+
+    const limited = responseRecorder();
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": ip },
+      body: { messages: [{ role: "user", content: "One turn too many" }] },
+    }, limited.response);
+    expect(limited.read().statusCode).toBe(429);
+
+    const continuation = responseRecorder();
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": ip },
+      body: {
+        availableTools: ["get_connected_wallet"],
+        messages: [
+          { role: "user", content: "What is my address?" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: "wallet-call",
+              type: "function",
+              function: { name: "get_connected_wallet", arguments: "{\"detail\":\"address\"}" },
+            }],
+          },
+          { role: "tool", tool_call_id: "wallet-call", content: "{\"ok\":true,\"address\":\"0x1234\"}" },
+        ],
+      },
+    }, continuation.response);
+    expect(continuation.read().statusCode).toBe(200);
+  });
+
+  it("still caps aggregate hosted chat calls even when a request claims to be an agent continuation", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", content: "Done." }, finish_reason: "stop" }],
+    }), { status: 200, headers: { "content-type": "application/json" } })));
+    const request = {
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.64" },
+      body: {
+        availableTools: ["get_connected_wallet"],
+        messages: [
+          { role: "user", content: "What is my address?" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: "wallet-call",
+              type: "function",
+              function: { name: "get_connected_wallet", arguments: "{\"detail\":\"address\"}" },
+            }],
+          },
+          { role: "tool", tool_call_id: "wallet-call", content: "{\"ok\":true,\"address\":\"0x1234\"}" },
+        ],
+      },
+    } as const;
+
+    for (let index = 0; index < 60; index += 1) {
+      const recorder = responseRecorder();
+      await handler(request, recorder.response);
+      expect(recorder.read().statusCode).toBe(200);
+    }
+    const limited = responseRecorder();
+    await handler(request, limited.response);
+    expect(limited.read().statusCode).toBe(429);
   });
 
   it("rejects oversized or malformed chat history", async () => {

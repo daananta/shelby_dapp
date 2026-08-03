@@ -23,6 +23,10 @@ class EmbeddingProviderError extends Error {
   }
 }
 
+function isTimeoutError(error: unknown) {
+  return error instanceof Error && (error.name === "TimeoutError" || error.message.toLowerCase().includes("timed out"));
+}
+
 function firstHeader(value: HeaderValue) {
   return Array.isArray(value) ? value[0] : value;
 }
@@ -121,6 +125,10 @@ export default async function handler(request: RequestLike, response: ResponseLi
     response.status(200).json({ vectors, model: "gemini-embedding-001", dimensions: 768 });
   } catch (error) {
     console.error("RAG gateway embedding failure", error);
+    if (isTimeoutError(error)) {
+      response.status(504).json({ error: "Embedding provider timed out", kind: "timeout" });
+      return;
+    }
     if (error instanceof EmbeddingProviderError) {
       if (error.retryAfter) response.setHeader("Retry-After", error.retryAfter);
       if (error.status === 429) {

@@ -41,6 +41,7 @@ interface BlobLibraryProps {
   handleIndexBlobs: (targets: any[], options?: { force?: boolean }) => Promise<void>;
   pendingBlobNames: Set<string>;
   mockPurchasedBlobNames: string[];
+  purchaseAccessEnabled: boolean;
   isPurchasableAndLocked: (blob: any) => boolean;
   handlePurchaseAccess: (blob: any) => Promise<void>;
   onOpenUpload: () => void;
@@ -63,6 +64,7 @@ export function BlobLibrary({
   handleIndexBlobs,
   pendingBlobNames,
   mockPurchasedBlobNames,
+  purchaseAccessEnabled,
   isPurchasableAndLocked,
   handlePurchaseAccess,
   onOpenUpload,
@@ -140,10 +142,12 @@ export function BlobLibrary({
     await refreshRagStatus();
   };
 
-  const renderRagStatus = (source?: RagSource, needsDecryption = false, decryptionReason?: string) => {
+  const renderRagStatus = (source?: RagSource, needsDecryption = false, decryptionReason?: string, accessPending = false) => {
     if (needsDecryption) return <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-500/10 dark:text-amber-300" title={decryptionReason}><span className="h-1.5 w-1.5 rounded-full bg-amber-500" />{t("needs decryption", "cần giải mã")}</span>;
     if (!source) return <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-white/5 dark:text-slate-400"><span className="h-1.5 w-1.5 rounded-full bg-slate-300 dark:bg-slate-500" />{t("not indexed", "chưa nạp")}</span>;
+    if (accessPending) return <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-500/10 dark:text-amber-300" title={t("The local RAG is preserved, but this file is excluded from search until Shelby access can be verified.", "RAG trên máy vẫn được giữ, nhưng tệp tạm bị loại khỏi tìm kiếm đến khi xác minh được quyền đọc trên Shelby.")}><span className="h-1.5 w-1.5 rounded-full bg-amber-500" />{t("saved · access pending", "đã lưu · chờ xác minh")}</span>;
     if (source.status === "indexed") {
+      if (source.lastAttemptError) return <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:bg-amber-500/10 dark:text-amber-300" title={userFacingRagError(source.lastAttemptError)}><span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />{t("RAG ready · update failed", "RAG dùng được · cập nhật lỗi")}</span>;
       const statusTitle = source.type === "image"
         ? t(
           "Images use one descriptor chunk; this is expected.",
@@ -335,6 +339,7 @@ export function BlobLibrary({
               const isEligible = isRagSourceEligible(b, ownerAddress);
               const tag = decision.info.tag;
               const isLocked = !isEligible;
+              const accessPending = b.accessPolicy?.type === "unknown" || b.accessPolicy?.type === "custom";
               const blobName = getBlobName(b);
               const ragSource = statusBySource.get(blobName);
               const isEditing = editingSource === blobName;
@@ -417,7 +422,7 @@ export function BlobLibrary({
                             <span>•</span>
                             <span>{getAccessLabel(b)}</span>
                             <span>•</span>
-                            {renderRagStatus(ragSource, decision.needsDecryption, decision.reason)}
+                            {renderRagStatus(ragSource, decision.needsDecryption, decision.reason, accessPending)}
                           </div>
                           {decision.needsDecryption
                             ? <p className="mt-1 line-clamp-1 max-w-[320px] text-[10px] leading-4 text-amber-700/80 dark:text-amber-300/75" title={decision.reason}>{decision.reason}</p>
@@ -433,7 +438,7 @@ export function BlobLibrary({
                             <span className="sr-only">{t(`Retry indexing ${getDisplayName(blobName, b)}`, `Thử nạp lại ${getDisplayName(blobName, b)}`)}</span>
                           </Button>
                         )}
-                        {isPurchasableAndLocked(b) && (
+                        {purchaseAccessEnabled && isPurchasableAndLocked(b) && (
                           <Button
                             variant="outline"
                             size="sm"

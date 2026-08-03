@@ -38,6 +38,10 @@ export interface DocumentManifest {
   status: DocumentStatus;
   indexedAt: number;
   error?: string;
+  /** Most recent failed rebuild, retained separately when last-good evidence is still valid. */
+  lastAttemptAt?: number;
+  lastAttemptRevision?: string;
+  lastAttemptError?: string;
 }
 
 export interface PageRecord {

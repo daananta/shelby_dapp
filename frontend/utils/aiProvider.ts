@@ -1,4 +1,4 @@
-import { FunctionCallingMode, GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
+import { FunctionCallingMode, GoogleGenerativeAI } from "@google/generative-ai";
 import type { FunctionDeclaration, Tool } from "@google/generative-ai";
 import { clearStoredCloudApiKey, getStoredCloudApiKey, storeCloudApiKey } from "@/utils/cloudKeyStorage";
 import { normalizeConversationRoute, type ConversationRoute } from "@/utils/conversationRoute";
@@ -12,62 +12,49 @@ import {
   createToolBudgetFinalizationInstruction,
   createAgentHarnessState,
   executeAgentToolCalls,
+  nextRequiredObservationTools,
+  validateAgentFinalAnswer,
   type AgentFunctionCall,
-  type AgentToolDefinition,
 } from "@/utils/agentHarness";
+import {
+  availableAgentToolNames,
+  createMissingObservationInstruction,
+  createAgentToolRegistry,
+  requiredObservationPlan,
+  type AgentToolHandlers,
+  type AiRequest,
+} from "@/utils/agentRuntime";
+import { selectAgentToolSpecs } from "../../shared/agentTools";
 
 export { clearStoredCloudApiKey, getStoredCloudApiKey, storeCloudApiKey };
-
-export interface AiRequest {
-  prompt?: string;
-  contents?: any[];
-  cloudApiKey?: string;
-  systemInstruction?: string;
-}
-
-export interface KnowledgeSearchRequest {
-  query: string;
-}
-
-export interface KnowledgeSearchResponse {
-  found: boolean;
-  evidence: Array<{
-    citation: string;
-    page?: number;
-    excerpt: string;
-  }>;
-  message?: string;
-}
-
-export interface BlobInventoryAgentRequest {
-  detail: "count" | "sample" | "all";
-  nameQuery?: string;
-}
-
-export interface ApplicationInspectionRequest {
-  query: string;
-}
-
-export interface IndexedImageAnalysisRequest {
-  /** Exact indexed source when known. Omit to use the most recent image context. */
-  source?: string;
-  /** Self-contained visual task chosen by the model from the user's request. */
-  question: string;
-}
-
-export interface AgentToolHandlers {
-  searchKnowledge: (request: KnowledgeSearchRequest, signal?: AbortSignal) => Promise<KnowledgeSearchResponse>;
-  getWalletBlobInventory: (request: BlobInventoryAgentRequest, signal?: AbortSignal) => Promise<Record<string, unknown>>;
-  refreshWalletBlobInventory?: (signal?: AbortSignal) => Promise<Record<string, unknown>>;
-  inspectApplication?: (request: ApplicationInspectionRequest, signal?: AbortSignal) => Promise<Record<string, unknown>>;
-  analyzeIndexedImage?: (request: IndexedImageAnalysisRequest, signal?: AbortSignal) => Promise<Record<string, unknown>>;
-}
+export type {
+  AgentToolHandlers,
+  AiRequest,
+  ApplicationInspectionRequest,
+  BlobInventoryAgentRequest,
+  ConnectedWalletRequest,
+  IndexedImageAnalysisRequest,
+  KnowledgeSearchRequest,
+  KnowledgeSearchResponse,
+} from "@/utils/agentRuntime";
 
 const CLOUD_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"];
 const ROUTER_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"];
 const GEMINI_MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000";
 const CLOUD_AGENT_TIMEOUT_MS = 30_000;
 const conversationRouteCache = new Map<string, ConversationRoute>();
+
+function geminiFunctionDeclarations(names: ReadonlySet<string>): FunctionDeclaration[] {
+  return selectAgentToolSpecs(names).map((tool) => {
+    const parameters = { ...tool.function.parameters } as Record<string, unknown>;
+    delete parameters.additionalProperties;
+    return {
+      name: tool.function.name,
+      description: tool.function.description,
+      parameters: parameters as unknown as FunctionDeclaration["parameters"],
+    };
+  });
+}
 
 export type CloudErrorKind = "rate_limit" | "invalid_key" | "network" | "timeout" | "other";
 
@@ -339,157 +326,21 @@ export async function streamCloudAgentAnswer(
   const latestParts = latest?.parts;
   if (!Array.isArray(latestParts) || !latestParts.length) throw new Error(localize("The question is invalid.", "Câu hỏi không hợp lệ."));
 
-  const agentTools: Tool = {
-    functionDeclarations: [
-      {
-        name: "search_user_knowledge",
-        description: "Search the user's private/imported Shelby documents. Call this only when the latest request depends on document content or clearly follows up on cited document evidence. Never use it for wallet state, blob counts/lists, general knowledge, or ordinary conversation.",
-        parameters: {
-          type: SchemaType.OBJECT,
-          properties: {
-            query: {
-              type: SchemaType.STRING,
-              description: "A self-contained semantic search query that resolves conversational references without inventing a filename.",
-            },
-          },
-          required: ["query"],
-        },
-      },
-      {
-        name: "get_wallet_blob_inventory",
-        description: "Read the connected wallet's latest app-cached Shelby blob inventory snapshot. This does not refresh the Shelby network. Call it for blob counts/lists and follow-ups that ask to confirm a previous blob-inventory answer. Report the supplied snapshot time honestly and never use document search for these requests.",
-        parameters: {
-          type: SchemaType.OBJECT,
-          properties: {
-            detail: {
-              type: SchemaType.STRING,
-              format: "enum",
-              enum: ["count", "sample", "all"],
-              description: "Use count for totals or confirmation, sample only when examples are requested, and all only when every name is explicitly requested.",
-            },
-            nameQuery: {
-              type: SchemaType.STRING,
-              description: "Optional filename substring supplied by the user, for example anime, pdf, or invoice. Use it when the user asks which blobs match a name or type.",
-            },
-          },
-          required: ["detail"],
-        },
-      },
-      ...(handlers.refreshWalletBlobInventory ? [{
-        name: "refresh_wallet_blob_inventory",
-        description: "Refresh the connected wallet's Shelby blob inventory from the network. Use this only when the user explicitly asks for current/live data or when the inventory tool reports a stale snapshot. This is read-only and must be followed by get_wallet_blob_inventory before answering.",
-        parameters: {
-          type: SchemaType.OBJECT,
-          properties: {},
-        },
-      }] : []),
-      {
-        name: "inspect_application",
-        description: "Use the app's read-only capabilities for wallet/account facts, indexed image names and previews, document inventory, identity, or deterministic calculations. Use this to list indexed images or show/open a named image; it does not inspect image pixels. Pass a self-contained request. Do not use this instead of search_user_knowledge for document content or get_wallet_blob_inventory for generic blob inventory names/counts.",
-        parameters: {
-          type: SchemaType.OBJECT,
-          properties: {
-            query: {
-              type: SchemaType.STRING,
-              description: "The self-contained read-only app request to inspect.",
-            },
-          },
-          required: ["query"],
-        },
-      },
-      ...(handlers.analyzeIndexedImage ? [{
-        name: "analyze_indexed_image",
-        description: "Inspect the original pixels of one indexed image when the user's answer requires visual details, visible text, objects, actions, or evidence from the image itself. Do not call merely to list image names or attach a preview. Use the exact indexed source when it is known; omit source for a clear follow-up to the most recently shown single image. The application validates access and supplies the image privately.",
-        parameters: {
-          type: SchemaType.OBJECT,
-          properties: {
-            source: {
-              type: SchemaType.STRING,
-              description: "Optional exact indexed image source or filename. Omit only when one recently shown image is the clear subject.",
-            },
-            question: {
-              type: SchemaType.STRING,
-              description: "The self-contained visual question to answer from pixels, preserving the user's requested detail and language.",
-            },
-          },
-          required: ["question"],
-        },
-      } satisfies FunctionDeclaration] : []),
-    ],
-  };
-
   const latestText = String(latestParts.find((part: { text?: string }) => part.text)?.text ?? "").slice(0, 1_000);
-  const toolRegistry = new Map<string, AgentToolDefinition>([
-    ["search_user_knowledge", {
-      name: "search_user_knowledge",
-      maxExecutions: 1,
-      unavailableCode: "knowledge_search_unavailable",
-      execute: async (args, requestSignal) => {
-        const rawQuery = args.query;
-        const query = typeof rawQuery === "string" && rawQuery.trim()
-          ? rawQuery.trim().slice(0, 1_000)
-          : latestText;
-        return { ...await handlers.searchKnowledge({ query }, requestSignal) };
-      },
-    }],
-    ["get_wallet_blob_inventory", {
-      name: "get_wallet_blob_inventory",
-      maxExecutions: 2,
-      allowRepeatedSignature: true,
-      unavailableCode: "blob_inventory_unavailable",
-      execute: async (args, requestSignal) => {
-        const detail = args.detail === "all" || args.detail === "sample"
-          ? args.detail
-          : "count";
-        const nameQuery = typeof args.nameQuery === "string" && args.nameQuery.trim()
-          ? args.nameQuery.trim().slice(0, 200)
-          : undefined;
-        return handlers.getWalletBlobInventory({ detail, nameQuery }, requestSignal);
-      },
-    }],
-    ["refresh_wallet_blob_inventory", {
-      name: "refresh_wallet_blob_inventory",
-      maxExecutions: 1,
-      unavailableCode: "blob_inventory_refresh_unavailable",
-      execute: async (_args, requestSignal) => handlers.refreshWalletBlobInventory
-        ? handlers.refreshWalletBlobInventory(requestSignal)
-        : { ok: false, code: "blob_inventory_refresh_unavailable" },
-    }],
-    ["inspect_application", {
-      name: "inspect_application",
-      maxExecutions: 1,
-      unavailableCode: "application_inspection_unavailable",
-      execute: async (args, requestSignal) => {
-        const query = typeof args.query === "string" && args.query.trim()
-          ? args.query.trim().slice(0, 1_000)
-          : latestText;
-        return handlers.inspectApplication
-          ? handlers.inspectApplication({ query }, requestSignal)
-          : { ok: false, code: "application_inspection_unavailable" };
-      },
-    }],
-    ["analyze_indexed_image", {
-      name: "analyze_indexed_image",
-      maxExecutions: 1,
-      unavailableCode: "image_analysis_unavailable",
-      execute: async (args, requestSignal) => {
-        const source = typeof args.source === "string" && args.source.trim()
-          ? args.source.trim().slice(0, 200)
-          : undefined;
-        const question = typeof args.question === "string" && args.question.trim()
-          ? args.question.trim().slice(0, 1_000)
-          : latestText;
-        return handlers.analyzeIndexedImage
-          ? handlers.analyzeIndexedImage({ source, question }, requestSignal)
-          : { ok: false, code: "image_analysis_unavailable" };
-      },
-    }],
-  ]);
+  const toolRegistry = createAgentToolRegistry(handlers, latestText);
+  const availableTools = availableAgentToolNames(toolRegistry);
+  const observationPlan = requiredObservationPlan(latestText, availableTools);
+  const agentTools: Tool = {
+    functionDeclarations: geminiFunctionDeclarations(new Set(availableTools)),
+  };
 
   let lastError: unknown;
   for (const modelName of CLOUD_MODELS) {
     let emitted = false;
     let harnessStarted = false;
+    const harnessState = createAgentHarnessState();
+    const recoveredObservationStages = new Set<string>();
+    let requiredTools = nextRequiredObservationTools(harnessState, observationPlan);
     try {
       signal?.throwIfAborted();
       const model = clientFor(normalizedApiKey).getGenerativeModel({
@@ -522,21 +373,79 @@ export async function streamCloudAgentAnswer(
         }
         const text = chunk.text();
         if (!text || sawFunctionCall) continue;
-        emitted = true;
         directAnswer += text;
-        onChunk(text);
       }
       const firstResponse = await first.response;
       signal?.throwIfAborted();
       let calls = (firstResponse.functionCalls() ?? []) as AgentFunctionCall[];
 
+      if (requiredTools.length && !calls.some((call) => requiredTools.some((name) => name === call.name))) {
+        const rejectedCalls = calls.map((call) => ({
+          functionResponse: {
+            name: call.name,
+            response: {
+              ok: false,
+              code: "wrong_tool_for_required_observation",
+              message: "Choose the relevant application capability from the correction that follows.",
+            },
+          },
+        }));
+        const recovery = await chat.sendMessageStream([
+          ...rejectedCalls,
+          { text: createMissingObservationInstruction(requiredTools) },
+        ], {
+          signal,
+          timeout: CLOUD_AGENT_TIMEOUT_MS,
+        });
+        for await (const chunk of recovery.stream) {
+          signal?.throwIfAborted();
+          // Recovery planning text is intentionally private. Only a completed
+          // tool-grounded final answer is committed to the chat UI.
+          if (typeof chunk.functionCalls === "function") chunk.functionCalls();
+        }
+        const recoveryResponse = await recovery.response;
+        signal?.throwIfAborted();
+        calls = (recoveryResponse.functionCalls() ?? []) as AgentFunctionCall[];
+        recoveredObservationStages.add(requiredTools.join("|"));
+        if (!calls.some((call) => requiredTools.some((name) => name === call.name))) {
+          throw new Error(localize(
+            "The AI did not use the required app data for this request. Please try again.",
+            "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
+          ));
+        }
+        directAnswer = "";
+      }
+
       if (!calls.length) {
-        const direct = directAnswer || firstResponse.text().trim();
+        let direct = directAnswer || firstResponse.text().trim();
         if (direct) {
-          if (!directAnswer) {
-            emitted = true;
-            onChunk(direct);
+          const repairInstruction = createFinalAnswerRepairInstruction(harnessState, direct);
+          if (repairInstruction) {
+            const repair = await chat.sendMessageStream([{ text: repairInstruction }], {
+              signal,
+              timeout: CLOUD_AGENT_TIMEOUT_MS,
+            });
+            const repairedChunks: string[] = [];
+            for await (const chunk of repair.stream) {
+              signal?.throwIfAborted();
+              if ((typeof chunk.functionCalls === "function" ? chunk.functionCalls() ?? [] : []).length) continue;
+              const text = chunk.text();
+              if (text) repairedChunks.push(text);
+            }
+            const repairedResponse = await repair.response;
+            signal?.throwIfAborted();
+            if ((repairedResponse.functionCalls() ?? []).length) throw new Error(localize(
+              "Gemini could not produce a safe final answer.",
+              "Gemini chưa tạo được câu trả lời cuối an toàn.",
+            ));
+            direct = repairedChunks.join("") || repairedResponse.text().trim();
           }
+          if (!validateAgentFinalAnswer(harnessState, direct).valid) throw new Error(localize(
+            "Gemini could not produce a safe final answer.",
+            "Gemini chưa tạo được câu trả lời cuối an toàn.",
+          ));
+          emitted = true;
+          onChunk(direct);
           return direct;
         }
         throw new Error(localize("Gemini did not produce an answer.", "Gemini không tạo được câu trả lời."));
@@ -547,7 +456,6 @@ export async function streamCloudAgentAnswer(
         onChunk("", "replace");
       }
       harnessStarted = true;
-      const harnessState = createAgentHarnessState();
       for (let round = 1; round <= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds; round += 1) {
         const batch = await executeAgentToolCalls({
           calls,
@@ -573,7 +481,92 @@ export async function streamCloudAgentAnswer(
         signal?.throwIfAborted();
         const nextCalls = (finalResponse.functionCalls() ?? []) as AgentFunctionCall[];
         const bufferedAnswer = bufferedChunks.join("");
+        let answer = bufferedAnswer || finalResponse.text().trim();
+        let answerChunks = bufferedChunks;
+        requiredTools = nextRequiredObservationTools(harnessState, observationPlan);
+        const recoveryStageKey = requiredTools.join("|");
+        if (
+          nextCalls.length
+          && requiredTools.length
+          && !nextCalls.some((call) => requiredTools.some((name) => name === call.name))
+        ) {
+          if (recoveredObservationStages.has(recoveryStageKey) || round >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
+            throw new Error(localize(
+              "The AI did not use the required app data for this request. Please try again.",
+              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
+            ));
+          }
+          const recovery = await chat.sendMessageStream([
+            ...nextCalls.map((call) => ({
+              functionResponse: {
+                name: call.name,
+                response: {
+                  ok: false,
+                  code: "wrong_tool_for_required_observation",
+                  message: "Choose the relevant application capability from the correction that follows.",
+                },
+              },
+            })),
+            { text: createMissingObservationInstruction(requiredTools) },
+          ], {
+            signal,
+            timeout: CLOUD_AGENT_TIMEOUT_MS,
+          });
+          for await (const chunk of recovery.stream) {
+            signal?.throwIfAborted();
+            if (typeof chunk.functionCalls === "function") chunk.functionCalls();
+          }
+          const recoveryResponse = await recovery.response;
+          signal?.throwIfAborted();
+          const recoveryCalls = (recoveryResponse.functionCalls() ?? []) as AgentFunctionCall[];
+          recoveredObservationStages.add(recoveryStageKey);
+          if (!recoveryCalls.some((call) => requiredTools.some((name) => name === call.name))) {
+            throw new Error(localize(
+              "The AI did not use the required app data for this request. Please try again.",
+              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
+            ));
+          }
+          calls = recoveryCalls;
+          continue;
+        }
+        if (!nextCalls.length && requiredTools.length) {
+          if (recoveredObservationStages.has(recoveryStageKey) || round >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
+            throw new Error(localize(
+              "The AI did not use the required app data for this request. Please try again.",
+              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
+            ));
+          }
+          const recovery = await chat.sendMessageStream([{
+            text: createMissingObservationInstruction(requiredTools),
+          }], {
+            signal,
+            timeout: CLOUD_AGENT_TIMEOUT_MS,
+          });
+          for await (const chunk of recovery.stream) {
+            signal?.throwIfAborted();
+            if (typeof chunk.functionCalls === "function") chunk.functionCalls();
+          }
+          const recoveryResponse = await recovery.response;
+          signal?.throwIfAborted();
+          const recoveryCalls = (recoveryResponse.functionCalls() ?? []) as AgentFunctionCall[];
+          recoveredObservationStages.add(recoveryStageKey);
+          if (!recoveryCalls.some((call) => requiredTools.some((name) => name === call.name))) {
+            throw new Error(localize(
+              "The AI did not use the required app data for this request. Please try again.",
+              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
+            ));
+          }
+          calls = recoveryCalls;
+          continue;
+        }
         if (nextCalls.length) {
+          if (requiredTools.length
+            && round >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
+            throw new Error(localize(
+              "The AI did not use the required app data for this request. Please try again.",
+              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
+            ));
+          }
           if (round >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
             const finalizationResult = await chat.sendMessageStream([
               ...createToolBudgetExhaustedResponses(nextCalls),
@@ -598,26 +591,22 @@ export async function streamCloudAgentAnswer(
             signal?.throwIfAborted();
             const finalizationCalls = (finalizationResponse.functionCalls() ?? []) as AgentFunctionCall[];
             const finalizationAnswer = finalizationChunks.join("") || finalizationResponse.text().trim();
-            if (!requestedAnotherTool && !finalizationCalls.length && finalizationAnswer) {
-              emitted = true;
-              if (finalizationChunks.length) {
-                for (const chunk of finalizationChunks) onChunk(chunk);
-              } else {
-                onChunk(finalizationAnswer);
-              }
-              return finalizationAnswer;
+            if (requestedAnotherTool || finalizationCalls.length || !finalizationAnswer) {
+              throw new AgentHarnessLimitError("agent_round_limit");
             }
-            throw new AgentHarnessLimitError("agent_round_limit");
+            // The boundary answer is still subject to the same citation and
+            // exact-fact checks as an ordinary tool-grounded answer.
+            answer = finalizationAnswer;
+            answerChunks = finalizationChunks;
+          } else {
+            // Planning text can precede a function call. Keep it private and
+            // commit only the first model response that no longer requests work.
+            calls = nextCalls;
+            continue;
           }
-          // Planning text can precede a function call. Keep it private and
-          // commit only the first model response that no longer requests work.
-          calls = nextCalls;
-          continue;
         }
-        let answer = bufferedAnswer || finalResponse.text().trim();
-        let answerChunks = bufferedChunks;
-        const repairInstruction = createFinalAnswerRepairInstruction(harnessState, answer);
-        if (repairInstruction) {
+        let repairInstruction = createFinalAnswerRepairInstruction(harnessState, answer);
+        while (repairInstruction) {
           const repairResult = await chat.sendMessageStream([{ text: repairInstruction }], {
             signal,
             timeout: CLOUD_AGENT_TIMEOUT_MS,
@@ -637,13 +626,18 @@ export async function streamCloudAgentAnswer(
           const repairResponse = await repairResult.response;
           signal?.throwIfAborted();
           const repairCalls = (repairResponse.functionCalls() ?? []) as AgentFunctionCall[];
-          if (!repairRequestedTool && !repairCalls.length) {
-            const repairedAnswer = repairedChunks.join("") || repairResponse.text().trim();
-            if (repairedAnswer) {
-              answer = repairedAnswer;
-              answerChunks = repairedChunks;
-            }
-          }
+          if (repairRequestedTool || repairCalls.length) break;
+          const repairedAnswer = repairedChunks.join("") || repairResponse.text().trim();
+          if (!repairedAnswer) break;
+          answer = repairedAnswer;
+          answerChunks = repairedChunks;
+          repairInstruction = createFinalAnswerRepairInstruction(harnessState, answer);
+        }
+        if (answer && !validateAgentFinalAnswer(harnessState, answer).valid) {
+          throw new Error(localize(
+            "The AI could not preserve the verified app facts in its final answer. Please try again.",
+            "AI chưa giữ đúng dữ kiện đã được ứng dụng xác minh trong câu trả lời cuối. Hãy thử lại.",
+          ));
         }
         if (answer) {
           emitted = true;

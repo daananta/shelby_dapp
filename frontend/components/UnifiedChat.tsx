@@ -8,7 +8,7 @@ import { deactivateActiveRagOwner, getPageRecord, getRagSources, hasRemoteRagPro
 import type { AnswerReceipt, RetrievalResult } from "@/utils/ragTypes";
 import { clearStoredCloudApiKey, describeImageWithCloud, getCloudErrorKind, getStoredCloudApiKey, isCloudProviderError, normalizeCloudError, storeCloudApiKey, streamCloudAgentAnswer, verifyCloudApiKey } from "@/utils/aiProvider";
 import { describeImageWithHostedAi, streamHostedAgentAnswer } from "@/utils/openRouterProvider";
-import { analyzeIndexedImage, createChatToolObservation, readBlobInventory, readBlobInventoryForAgent, runChatTool, type ChatToolResult } from "@/utils/chatTools";
+import { analyzeIndexedImage, createChatToolObservation, readBlobInventory, readBlobInventoryForAgent, readConnectedWallet, runChatTool, type ChatToolResult } from "@/utils/chatTools";
 import { buildAdaptiveAgentSystemInstruction, isInternalGuideSource } from "@/utils/agentPolicy";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -326,8 +326,8 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       const preferredImageSources = recentImageMessage?.referencedSources ?? [];
       if (!geminiUsage.chat) {
         updateCurrentMessages((previous) => [...previous, createChatMessage({ role: "ai", text: t(
-          "AI chat is off. You can enable it in Settings; wallet and Shelby data tools remain available.",
-          "Trò chuyện với AI đang tắt. Bạn có thể bật lại trong Cấu hình; các công cụ ví và kho Shelby vẫn dùng được.",
+          "AI chat is off. Enable it in Settings to ask general questions or use wallet and Shelby data tools.",
+          "Trò chuyện với AI đang tắt. Hãy bật lại trong Cấu hình để hỏi kiến thức chung hoặc dùng dữ liệu ví và Shelby.",
         ) })]);
         return;
       }
@@ -391,6 +391,33 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             if (status === "not_loaded") return { ...payload, ok: false, code: "inventory_unavailable" };
             return payload;
           },
+          getConnectedWallet: async ({ detail }, requestSignal) => {
+            assertRequestCurrent();
+            const activeSignal = requestSignal ?? signal;
+            activeSignal.throwIfAborted();
+            const result = await readConnectedWallet(
+              detail,
+              account?.address.toString(),
+              { language },
+              activeSignal,
+            );
+            activeSignal.throwIfAborted();
+            assertRequestCurrent();
+            agentToolResult = result;
+            const walletData = result.walletData;
+            const requiredExactStrings = walletData?.detail === "address"
+              ? walletData.address ? [walletData.address] : []
+              : walletData?.detail === "account_info"
+                ? [walletData.sequenceNumber, walletData.authenticationKey].filter((value): value is string => Boolean(value))
+                : walletData?.formattedAmount ? [walletData.formattedAmount] : [];
+            return {
+              ok: true,
+              kind: result.name,
+              facts: result.text,
+              wallet: walletData ?? { kind: "connected_wallet", detail, connected: false },
+              ...(requiredExactStrings.length ? { answerContract: { requiredExactStrings } } : {}),
+            };
+          },
           inspectApplication: async ({ query: applicationQuery }, requestSignal) => {
             assertRequestCurrent();
             const activeSignal = requestSignal ?? signal;
@@ -408,7 +435,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             }
             activeSignal.throwIfAborted();
             assertRequestCurrent();
-            if (!result || result.name === "blob_inventory") {
+            if (!result || ["blob_inventory", "wallet_address", "apt_balance", "shelbyusd_balance", "account_info"].includes(result.name)) {
               return { ok: false, code: "application_inspection_unavailable" };
             }
             agentToolResult = result;

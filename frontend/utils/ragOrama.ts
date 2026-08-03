@@ -7,6 +7,7 @@ import { getGeminiUsagePreferences } from "@/utils/geminiUsage";
 import { isRagArtifactName } from "@/utils/hotRag";
 import { sha256Text } from "@/utils/contentIntegrity";
 import { localize } from "@/i18n";
+import { sourceContentIdentity } from "@/utils/ragLifecycle";
 
 export type { MetadataValue, DocumentManifest, PageRecord, PortableRagPackage, RetrievalResult, StoryEntry } from "@/utils/ragTypes";
 
@@ -30,12 +31,24 @@ export interface RagSource {
   revision: string;
   indexedAt: number;
   error?: string;
+  lastAttemptAt?: number;
+  lastAttemptRevision?: string;
+  lastAttemptError?: string;
+}
+
+interface ShelbyInventoryRecord {
+  names: string[];
+  eligibleNames?: string[];
+  /** Policies that could not be verified in the latest otherwise-successful refresh. */
+  unresolvedNames?: string[];
+  fetchedAt: number;
+  verified?: boolean;
 }
 
 interface WorkspaceRecord {
   id: string;
   owner: string;
-  inventory: { names: string[]; eligibleNames?: string[]; fetchedAt: number; verified?: boolean } | null;
+  inventory: ShelbyInventoryRecord | null;
   stories: StoryEntry[];
 }
 
@@ -74,7 +87,6 @@ function emitRagState() {
  * until the first authoritative refresh migrates them.
  */
 function isSourceEligibleInCurrentInventory(source: string): boolean {
-  if (workspace?.inventory?.verified === false) return false;
   const eligibleNames = workspace?.inventory?.eligibleNames;
   return !Array.isArray(eligibleNames) || eligibleNames.includes(source);
 }
@@ -245,18 +257,41 @@ async function ensureContentLoaded() {
   contentLoaded = true;
 }
 
-export async function setActiveRagOwner(owner: string) {
+export async function setActiveRagOwner(owner: string, shouldActivate: () => boolean = () => true): Promise<boolean> {
   const normalized = owner.toLowerCase();
+  let activated = false;
   ownerSwitch = ownerSwitch.then(async () => {
-    if (activeOwner === normalized) return;
+    if (!shouldActivate()) return;
+    if (activeOwner === normalized) {
+      activated = true;
+      return;
+    }
     // Change the authority before hydration starts. Any in-flight write for the
     // previous wallet can still finish its owner-keyed IndexedDB transaction,
     // but must not mutate the new wallet's in-memory workspace afterwards.
     activeOwner = normalized;
     queryEmbeddingCache.clear();
     await loadOwner(normalized);
+    if (!shouldActivate() && activeOwner === normalized) {
+      // A wallet/request can become stale while IndexedDB is hydrating. Do not
+      // leave that old owner authoritative until another component switches it.
+      activeOwner = null;
+      manifests.clear();
+      pages.clear();
+      chunks.clear();
+      workspace = null;
+      lexicalDb = null;
+      contentLoaded = false;
+      queryEmbeddingCache.clear();
+      remoteRagProvider = null;
+      remoteRagCache = null;
+      emitRagState();
+      return;
+    }
+    activated = activeOwner === normalized;
   });
   await ownerSwitch;
+  return activated && shouldActivate();
 }
 
 /**
@@ -314,15 +349,18 @@ function asRagSource(manifest: DocumentManifest): RagSource {
     revision: manifest.revision,
     indexedAt: manifest.indexedAt,
     error: manifest.error,
+    lastAttemptAt: manifest.lastAttemptAt,
+    lastAttemptRevision: manifest.lastAttemptRevision,
+    lastAttemptError: manifest.lastAttemptError,
   };
 }
 
 export function getRagSources(): RagSource[] {
-  return Array.from(manifests.values()).filter((manifest) => isSourceEligibleInCurrentInventory(manifest.source)).map(asRagSource);
+  return Array.from(manifests.values()).map(asRagSource);
 }
 
 export function getDocumentManifests(): DocumentManifest[] {
-  return Array.from(manifests.values()).filter((manifest) => isSourceEligibleInCurrentInventory(manifest.source));
+  return Array.from(manifests.values());
 }
 
 export async function exportPortableRagPackage(options: { includeEmbeddings?: boolean; exportedAt?: number } = {}): Promise<PortableRagPackage> {
@@ -352,7 +390,135 @@ export async function exportPortableRagPackage(options: { includeEmbeddings?: bo
 export function isPortableRagPackage(value: unknown): value is PortableRagPackage {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<PortableRagPackage>;
-  return candidate.format === "shelby-rag-package" && candidate.version === 1 && Array.isArray(candidate.documents);
+  return candidate.format === "shelby-rag-package"
+    && candidate.version === 1
+    && Number.isSafeInteger(candidate.exportedAt)
+    && Number(candidate.exportedAt) > 0
+    && typeof candidate.sourceOwner === "string"
+    && candidate.sourceOwner.length > 0
+    && Array.isArray(candidate.documents)
+    && candidate.documents.length <= 512;
+}
+
+const MAX_PORTABLE_PAGES = 100_000;
+const MAX_PORTABLE_CHUNKS = 100_000;
+const MAX_PORTABLE_TEXT_CHARACTERS = 96 * 1024 * 1024;
+
+function isFiniteNonNegative(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isSafePositiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function isBoundedText(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.length <= maxLength;
+}
+
+function portablePackageError(): Error {
+  return new Error(localize(
+    "This Shelby RAG backup is malformed or exceeds the safe import limit.",
+    "Gói Shelby RAG bị lỗi cấu trúc hoặc vượt giới hạn nhập an toàn.",
+  ));
+}
+
+/** Validate and materialize every document before opening a write transaction. */
+function preparePortableReplacements(packageData: PortableRagPackage, importOwner: string): DocumentReplacement[] {
+  const replacements: DocumentReplacement[] = [];
+  const sources = new Set<string>();
+  let totalPages = 0;
+  let totalChunks = 0;
+  let totalTextCharacters = 0;
+
+  for (const portable of packageData.documents) {
+    const manifest = portable?.manifest;
+    if (
+      !manifest
+      || !isBoundedText(manifest.source, 512)
+      || !manifest.source.trim()
+      || !isBoundedText(manifest.displayName, 512)
+      || !isBoundedText(manifest.mimeType, 256)
+      || (manifest.type !== "text" && manifest.type !== "image" && manifest.type !== "video")
+      || !Array.isArray(manifest.aliases)
+      || !manifest.aliases.every((value) => isBoundedText(value, 512))
+      || !Array.isArray(manifest.authors)
+      || !manifest.authors.every((value) => isBoundedText(value, 512))
+      || !isFiniteNonNegative(manifest.pageCount)
+      || !isFiniteNonNegative(manifest.chunkCount)
+      || !isFiniteNonNegative(manifest.ocrCoverage)
+      || !Array.isArray(portable.pages)
+      || !Array.isArray(portable.chunks)
+      || !Array.isArray(portable.stories)
+      || sources.has(manifest.source)
+    ) throw portablePackageError();
+    sources.add(manifest.source);
+    totalPages += portable.pages.length;
+    totalChunks += portable.chunks.length;
+    if (totalPages > MAX_PORTABLE_PAGES || totalChunks > MAX_PORTABLE_CHUNKS) throw portablePackageError();
+
+    const documentId = `${importOwner}:${manifest.source}`;
+    const pageNumbers = new Set<number>();
+    const pageRecords: PageRecord[] = portable.pages.map((page) => {
+      if (
+        page?.source !== manifest.source
+        || !isBoundedText(page.displayName, 512)
+        || !isSafePositiveInteger(page.pageNumber)
+        || !isSafePositiveInteger(page.totalPages)
+        || page.pageNumber > page.totalPages
+        || !isBoundedText(page.rawText, MAX_PORTABLE_TEXT_CHARACTERS)
+        || !isBoundedText(page.normalizedText, MAX_PORTABLE_TEXT_CHARACTERS)
+        || !["text_layer", "local_ocr", "cloud_vision", "cloud_video", "mixed"].includes(page.extractionMethod)
+        || pageNumbers.has(page.pageNumber)
+      ) throw portablePackageError();
+      pageNumbers.add(page.pageNumber);
+      totalTextCharacters += page.rawText.length + page.normalizedText.length;
+      if (totalTextCharacters > MAX_PORTABLE_TEXT_CHARACTERS) throw portablePackageError();
+      return { ...page, id: `${documentId}:page:${page.pageNumber}`, owner: importOwner, documentId };
+    });
+
+    const chunkRecords: ChunkRecord[] = portable.chunks.map((chunk, index) => {
+      if (
+        chunk?.source !== manifest.source
+        || !isBoundedText(chunk.displayName, 512)
+        || (chunk.type !== "text" && chunk.type !== "image" && chunk.type !== "video")
+        || !isBoundedText(chunk.text, MAX_PORTABLE_TEXT_CHARACTERS)
+        || !isBoundedText(chunk.normalizedText, MAX_PORTABLE_TEXT_CHARACTERS)
+        || !isSafePositiveInteger(chunk.pageNumber)
+        || !isSafePositiveInteger(chunk.totalPages)
+        || chunk.pageNumber > chunk.totalPages
+        || (chunk.embedding !== undefined && (!Array.isArray(chunk.embedding) || chunk.embedding.length > 4_096 || chunk.embedding.some((value) => !Number.isFinite(value))))
+      ) throw portablePackageError();
+      totalTextCharacters += chunk.text.length + chunk.normalizedText.length;
+      if (totalTextCharacters > MAX_PORTABLE_TEXT_CHARACTERS) throw portablePackageError();
+      return { ...chunk, id: `${documentId}:chunk:${index}`, owner: importOwner, documentId };
+    });
+
+    if (portable.stories.some((story) => (
+      story?.source !== manifest.source
+      || !isFiniteNonNegative(story.number)
+      || !isBoundedText(story.title, 1_000)
+      || !isSafePositiveInteger(story.pageNumber)
+    ))) throw portablePackageError();
+
+    const { originalSourceOwner: _originalSourceOwner, sourceRevision, sourceIndexedAt, ...portableManifest } = manifest;
+    const hasEmbeddings = chunkRecords.some((chunk) => Boolean(chunk.embedding?.length));
+    replacements.push({
+      manifest: {
+        ...portableManifest,
+        id: documentId,
+        owner: importOwner,
+        revision: sourceRevision ?? `imported:${packageData.exportedAt}:v4`,
+        embeddingStatus: hasEmbeddings ? "ready" : "unavailable",
+        indexedAt: sourceIndexedAt ?? Date.now(),
+        status: "indexed",
+      },
+      pages: pageRecords,
+      chunks: chunkRecords,
+      stories: portable.stories,
+    });
+  }
+  return replacements;
 }
 
 /** Import lexical/page evidence atomically. Embeddings are intentionally rebuilt on this device. */
@@ -362,35 +528,14 @@ export async function importPortableRagPackage(value: unknown, expectedOwner?: s
   const importOwner = (expectedOwner ?? activeOwner).toLowerCase();
   if (activeOwner !== importOwner) throw new DOMException(localize("The wallet changed; RAG import stopped.", "Ví đã thay đổi; dừng nhập RAG."), "AbortError");
   if (!isPortableRagPackage(value)) throw new Error(localize("This is not a valid Shelby RAG v1 backup.", "Đây không phải gói Shelby RAG v1 hợp lệ."));
-  let imported = 0;
-  for (const portable of value.documents) {
-    signal?.throwIfAborted();
-    if (!portable?.manifest?.source || !Array.isArray(portable.pages) || !Array.isArray(portable.chunks)) continue;
+  const replacements = preparePortableReplacements(value, importOwner)
     // A remote capsule can outlive or predate its source policy. Never restore
     // a document that the latest authoritative Shelby refresh no longer allows.
-    if (!isSourceEligibleInCurrentInventory(portable.manifest.source)) continue;
-    if (activeOwner !== importOwner) throw new DOMException(localize("The wallet changed; RAG import stopped.", "Ví đã thay đổi; dừng nhập RAG."), "AbortError");
-    const documentId = `${importOwner}:${portable.manifest.source}`;
-    const { originalSourceOwner: _originalSourceOwner, sourceRevision, sourceIndexedAt, ...portableManifest } = portable.manifest;
-    const hasEmbeddings = portable.chunks.some((chunk) => Boolean(chunk.embedding?.length));
-    const manifest: DocumentManifest = {
-      ...portableManifest,
-      id: documentId,
-      owner: importOwner,
-      revision: sourceRevision ?? `imported:${value.exportedAt}:v4`,
-      embeddingStatus: hasEmbeddings ? "ready" : "unavailable",
-      indexedAt: sourceIndexedAt ?? Date.now(),
-      status: "indexed",
-    };
-    const pageRecords: PageRecord[] = portable.pages.map((page) => ({ ...page, id: `${documentId}:page:${page.pageNumber}`, owner: importOwner, documentId }));
-    const chunkRecords: ChunkRecord[] = portable.chunks.map((chunk, index) => ({ ...chunk, id: `${documentId}:chunk:${index}`, owner: importOwner, documentId }));
-    await replaceDocument({ manifest, pages: pageRecords, chunks: chunkRecords, stories: portable.stories ?? [] });
-    signal?.throwIfAborted();
-    if (activeOwner !== importOwner) throw new DOMException(localize("The wallet changed; RAG import stopped.", "Ví đã thay đổi; dừng nhập RAG."), "AbortError");
-    imported += 1;
-  }
-  if (!imported) throw new Error(localize("The RAG backup contains no valid documents.", "Gói RAG không có tài liệu hợp lệ để nhập."));
-  return imported;
+    .filter((replacement) => isSourceEligibleInCurrentInventory(replacement.manifest.source));
+  signal?.throwIfAborted();
+  if (!replacements.length) throw new Error(localize("The RAG backup contains no valid documents.", "Gói RAG không có tài liệu hợp lệ để nhập."));
+  await replaceDocuments(replacements, signal);
+  return replacements.length;
 }
 
 /** JSON-equivalent footprint of the active wallet's persisted RAG, including vectors. */
@@ -407,46 +552,85 @@ async function keysForDocument(store: IDBObjectStore, documentId: string): Promi
   return requestValue(store.index("documentId").getAllKeys(documentId));
 }
 
-export async function replaceDocument(replacement: DocumentReplacement): Promise<void> {
-  const commitOwner = replacement.manifest.owner.toLowerCase();
+function emptyWorkspace(owner: string): WorkspaceRecord {
+  return { id: owner, owner, inventory: null, stories: [] };
+}
+
+function workspaceForOwner(value: WorkspaceRecord | null | undefined, owner: string): WorkspaceRecord {
+  return value?.owner === owner && Array.isArray(value.stories) ? value : emptyWorkspace(owner);
+}
+
+async function replaceDocuments(replacements: DocumentReplacement[], signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  if (!replacements.length) return;
+  const commitOwner = replacements[0].manifest.owner.toLowerCase();
+  const replacedSources = new Set<string>();
+  for (const replacement of replacements) {
+    if (replacement.manifest.owner.toLowerCase() !== commitOwner || replacedSources.has(replacement.manifest.source)) {
+      throw new Error(localize("The RAG commit contains conflicting documents.", "Bản ghi RAG chứa tài liệu xung đột."));
+    }
+    replacedSources.add(replacement.manifest.source);
+  }
   if (!activeOwner || commitOwner !== activeOwner) throw new DOMException("Ví đã thay đổi; dừng commit index.", "AbortError");
-  const previousWorkspace = workspace?.owner === commitOwner
-    ? workspace
-    : { id: commitOwner, owner: commitOwner, inventory: null, stories: [] } satisfies WorkspaceRecord;
-  const nextWorkspace: WorkspaceRecord = {
-    ...previousWorkspace,
-    stories: [...previousWorkspace.stories.filter((story) => story.source !== replacement.manifest.source), ...replacement.stories],
+  let nextWorkspace: WorkspaceRecord = {
+    ...workspaceForOwner(workspace, commitOwner),
+    stories: [
+      ...workspaceForOwner(workspace, commitOwner).stories.filter((story) => !replacedSources.has(story.source)),
+      ...replacements.flatMap((replacement) => replacement.stories),
+    ],
   };
   const db = await openDatabase();
+  signal?.throwIfAborted();
   if (activeOwner !== commitOwner) throw new DOMException("Ví đã thay đổi; dừng commit index.", "AbortError");
   if (db) {
     const transaction = db.transaction(["manifests", "pages", "chunks", "workspace"], "readwrite");
     const pageStore = transaction.objectStore("pages");
     const chunkStore = transaction.objectStore("chunks");
-    const [oldPageKeys, oldChunkKeys] = await Promise.all([
-      keysForDocument(pageStore, replacement.manifest.id),
-      keysForDocument(chunkStore, replacement.manifest.id),
+    const workspaceStore = transaction.objectStore("workspace");
+    const [persistedWorkspace, derivedKeys] = await Promise.all([
+      requestValue(workspaceStore.get(commitOwner)) as Promise<WorkspaceRecord | undefined>,
+      Promise.all(replacements.map(async (replacement) => ({
+        replacement,
+        pageKeys: await keysForDocument(pageStore, replacement.manifest.id),
+        chunkKeys: await keysForDocument(chunkStore, replacement.manifest.id),
+      }))),
     ]);
+    const latestWorkspace = workspaceForOwner(persistedWorkspace, commitOwner);
+    nextWorkspace = {
+      ...latestWorkspace,
+      stories: [
+        ...latestWorkspace.stories.filter((story) => !replacedSources.has(story.source)),
+        ...replacements.flatMap((replacement) => replacement.stories),
+      ],
+    };
+    signal?.throwIfAborted();
     if (activeOwner !== commitOwner) {
       transaction.abort();
       throw new DOMException("Ví đã thay đổi; dừng commit index.", "AbortError");
     }
-    oldPageKeys.forEach((key) => pageStore.delete(key));
-    oldChunkKeys.forEach((key) => chunkStore.delete(key));
-    replacement.pages.forEach((page) => pageStore.put(page));
-    replacement.chunks.forEach((chunk) => chunkStore.put(chunk));
-    transaction.objectStore("manifests").put(replacement.manifest);
-    transaction.objectStore("workspace").put(nextWorkspace);
+    derivedKeys.forEach(({ replacement, pageKeys, chunkKeys }) => {
+      pageKeys.forEach((key) => pageStore.delete(key));
+      chunkKeys.forEach((key) => chunkStore.delete(key));
+      replacement.pages.forEach((page) => pageStore.put(page));
+      replacement.chunks.forEach((chunk) => chunkStore.put(chunk));
+      transaction.objectStore("manifests").put(replacement.manifest);
+    });
+    workspaceStore.put(nextWorkspace);
     await transactionDone(transaction);
   }
   if (activeOwner !== commitOwner) throw new DOMException("Ví đã thay đổi; index đã được lưu cho ví cũ nhưng không áp dụng vào phiên mới.", "AbortError");
   workspace = nextWorkspace;
-  manifests.set(replacement.manifest.source, replacement.manifest);
+  replacements.forEach((replacement) => manifests.set(replacement.manifest.source, replacement.manifest));
   pages.clear();
   chunks.clear();
   contentLoaded = false;
   lexicalDb = null;
+  queryEmbeddingCache.clear();
   emitRagState();
+}
+
+export async function replaceDocument(replacement: DocumentReplacement): Promise<void> {
+  await replaceDocuments([replacement]);
 }
 
 export async function updateUserDocumentMetadata(source: string, title: string, aliases: string[]) {
@@ -472,64 +656,115 @@ export async function updateUserDocumentMetadata(source: string, title: string, 
   emitRagState();
 }
 
-export async function setShelbyBlobInventory(owner: string, names: string[], eligibleNames: string[] = names) {
+export async function setShelbyBlobInventory(
+  owner: string,
+  names: string[],
+  eligibleNames: string[] = names,
+  unresolvedNames: string[] = [],
+  shouldApply: () => boolean = () => true,
+): Promise<boolean> {
   const inventoryOwner = owner.toLowerCase();
-  await setActiveRagOwner(inventoryOwner);
+  if (!shouldApply()) return false;
+  const activated = await setActiveRagOwner(inventoryOwner, shouldApply);
+  if (!activated || !shouldApply()) return false;
   if (activeOwner !== inventoryOwner) throw new DOMException("Ví đã thay đổi; bỏ qua dữ liệu Shelby cũ.", "AbortError");
   const uniqueNames = [...new Set(names.filter(Boolean))];
-  const uniqueEligibleNames = [...new Set(eligibleNames.filter(Boolean))];
+  const knownNames = new Set(uniqueNames);
+  const uniqueEligibleNames = [...new Set(eligibleNames.filter((name) => Boolean(name) && knownNames.has(name)))];
   const eligible = new Set(uniqueEligibleNames);
-  const removedManifests = Array.from(manifests.values()).filter((manifest) => !eligible.has(manifest.source));
-  const removedDocumentIds = new Set(removedManifests.map((manifest) => manifest.id));
-  const nextWorkspace: WorkspaceRecord = {
+  const uniqueUnresolvedNames = [...new Set(unresolvedNames.filter((name) => knownNames.has(name) && !eligible.has(name)))];
+  const unresolved = new Set(uniqueUnresolvedNames);
+  // Unknown is not revocation: keep its cached bytes but exclude it from search.
+  // A source is deleted only after Shelby no longer lists it or its policy was
+  // positively resolved as ineligible.
+  let removedManifests = Array.from(manifests.values()).filter((manifest) => (
+    !knownNames.has(manifest.source)
+    || (!eligible.has(manifest.source) && !unresolved.has(manifest.source))
+  ));
+  let nextWorkspace: WorkspaceRecord = {
     id: inventoryOwner,
     owner: inventoryOwner,
-    inventory: { names: uniqueNames, eligibleNames: uniqueEligibleNames, fetchedAt: Date.now(), verified: true },
-    stories: (workspace?.stories ?? []).filter((story) => eligible.has(story.source)),
+    inventory: {
+      names: uniqueNames,
+      eligibleNames: uniqueEligibleNames,
+      unresolvedNames: uniqueUnresolvedNames,
+      fetchedAt: Date.now(),
+      verified: uniqueUnresolvedNames.length === 0,
+    },
+    stories: (workspace?.stories ?? []).filter((story) => eligible.has(story.source) || unresolved.has(story.source)),
   };
+  let persistedManifestsAfterPolicy: DocumentManifest[] | null = null;
   const db = await openDatabase();
+  if (!shouldApply()) return false;
   if (activeOwner !== inventoryOwner) throw new DOMException("Ví đã thay đổi; bỏ qua dữ liệu Shelby cũ.", "AbortError");
   if (db) {
     // Persist the new authority snapshot and remove derived evidence in one
     // transaction: export/search can never observe a new policy beside old data.
     const transaction = db.transaction(["manifests", "pages", "chunks", "workspace"], "readwrite");
+    const manifestStore = transaction.objectStore("manifests");
     const pageStore = transaction.objectStore("pages");
     const chunkStore = transaction.objectStore("chunks");
+    const workspaceStore = transaction.objectStore("workspace");
+    const [persistedManifests, persistedWorkspace] = await Promise.all([
+      requestValue(manifestStore.index("owner").getAll(inventoryOwner)) as Promise<DocumentManifest[]>,
+      requestValue(workspaceStore.get(inventoryOwner)) as Promise<WorkspaceRecord | undefined>,
+    ]);
+    removedManifests = persistedManifests.filter((manifest) => (
+      !knownNames.has(manifest.source)
+      || (!eligible.has(manifest.source) && !unresolved.has(manifest.source))
+    ));
+    const removedIds = new Set(removedManifests.map((manifest) => manifest.id));
+    persistedManifestsAfterPolicy = persistedManifests.filter((manifest) => !removedIds.has(manifest.id));
+    const latestWorkspace = workspaceForOwner(persistedWorkspace, inventoryOwner);
+    nextWorkspace = {
+      ...nextWorkspace,
+      stories: latestWorkspace.stories.filter((story) => eligible.has(story.source) || unresolved.has(story.source)),
+    };
     const derivedKeys = await Promise.all(removedManifests.map(async (manifest) => ({
       manifest,
       pageKeys: await keysForDocument(pageStore, manifest.id),
       chunkKeys: await keysForDocument(chunkStore, manifest.id),
     })));
-    if (activeOwner !== inventoryOwner) {
+    if (!shouldApply() || activeOwner !== inventoryOwner) {
       transaction.abort();
-      throw new DOMException("Ví đã thay đổi; bỏ qua dữ liệu Shelby cũ.", "AbortError");
+      return false;
     }
     derivedKeys.forEach(({ manifest, pageKeys, chunkKeys }) => {
       pageKeys.forEach((key) => pageStore.delete(key));
       chunkKeys.forEach((key) => chunkStore.delete(key));
-      transaction.objectStore("manifests").delete(manifest.id);
+      manifestStore.delete(manifest.id);
     });
-    transaction.objectStore("workspace").put(nextWorkspace);
+    workspaceStore.put(nextWorkspace);
     await transactionDone(transaction);
   }
+  if (!shouldApply()) return false;
   if (activeOwner !== inventoryOwner) throw new DOMException("Ví đã thay đổi; dữ liệu cũ không được áp dụng vào phiên mới.", "AbortError");
-  removedManifests.forEach((manifest) => manifests.delete(manifest.source));
-  workspace = nextWorkspace;
-  if (removedDocumentIds.size) {
-    pages.clear();
-    chunks.clear();
-    contentLoaded = false;
-    lexicalDb = null;
-    queryEmbeddingCache.clear();
+  if (persistedManifestsAfterPolicy) {
+    // Apply the snapshot already read inside the owner-keyed transaction. A
+    // direct asynchronous `loadOwner()` here could race a wallet switch and
+    // hydrate the previous wallet after the new one became active.
+    manifests.clear();
+    persistedManifestsAfterPolicy.forEach((manifest) => manifests.set(manifest.source, manifest));
+    workspace = nextWorkspace;
+  } else {
+    removedManifests.forEach((manifest) => manifests.delete(manifest.source));
+    workspace = nextWorkspace;
   }
+  pages.clear();
+  chunks.clear();
+  contentLoaded = false;
+  lexicalDb = null;
+  queryEmbeddingCache.clear();
   emitRagState();
+  return true;
 }
 
 /** Fail closed on an unverified policy refresh without deleting cached bytes. */
-export async function invalidateShelbyBlobInventory(owner: string) {
+export async function invalidateShelbyBlobInventory(owner: string, shouldApply: () => boolean = () => true): Promise<boolean> {
   const inventoryOwner = owner.toLowerCase();
-  await setActiveRagOwner(inventoryOwner);
-  if (activeOwner !== inventoryOwner) return;
+  if (!shouldApply()) return false;
+  const activated = await setActiveRagOwner(inventoryOwner, shouldApply);
+  if (!activated || !shouldApply() || activeOwner !== inventoryOwner) return false;
   const previous = workspace?.inventory;
   const nextWorkspace: WorkspaceRecord = {
     id: inventoryOwner,
@@ -537,23 +772,25 @@ export async function invalidateShelbyBlobInventory(owner: string) {
     inventory: {
       names: previous?.names ?? [],
       eligibleNames: previous?.eligibleNames ?? [],
+      unresolvedNames: previous?.unresolvedNames ?? [],
       fetchedAt: previous?.fetchedAt ?? 0,
       verified: false,
     },
     stories: workspace?.stories ?? [],
   };
   const db = await openDatabase();
-  if (activeOwner !== inventoryOwner) return;
+  if (!shouldApply() || activeOwner !== inventoryOwner) return false;
   if (db) {
     const transaction = db.transaction("workspace", "readwrite");
     transaction.objectStore("workspace").put(nextWorkspace);
     await transactionDone(transaction);
   }
-  if (activeOwner !== inventoryOwner) return;
+  if (!shouldApply() || activeOwner !== inventoryOwner) return false;
   workspace = nextWorkspace;
   lexicalDb = null;
   queryEmbeddingCache.clear();
   emitRagState();
+  return true;
 }
 
 export function getShelbyBlobInventory() {
@@ -1094,12 +1331,21 @@ export async function recordSourceFailure(source: RagSourceFailureInput, error: 
   const message = error instanceof Error ? error.message : String(error);
   const previous = manifests.get(source.source);
   if (previous) {
+    const attemptedRevision = source.revision ?? previous.revision;
+    const canKeepLastGood = previous.status === "indexed"
+      && sourceContentIdentity(previous.revision) !== ""
+      && sourceContentIdentity(previous.revision) === sourceContentIdentity(attemptedRevision);
     const updated = {
       ...previous,
-      revision: source.revision ?? previous.revision,
-      status: "failed" as const,
-      error: localize(`Latest processing attempt failed: ${message}`, `Lần nạp gần nhất lỗi: ${message}`),
-      indexedAt: Date.now(),
+      ...(canKeepLastGood ? {} : {
+        revision: attemptedRevision,
+        status: "failed" as const,
+        error: localize(`Latest processing attempt failed: ${message}`, `Lần nạp gần nhất lỗi: ${message}`),
+        indexedAt: Date.now(),
+      }),
+      lastAttemptAt: Date.now(),
+      lastAttemptRevision: attemptedRevision,
+      lastAttemptError: localize(`Latest processing attempt failed: ${message}`, `Lần nạp gần nhất lỗi: ${message}`),
     };
     const db = await openDatabase();
     if (db) { const tx = db.transaction("manifests", "readwrite"); tx.objectStore("manifests").put(updated); await transactionDone(tx); }
@@ -1123,7 +1369,10 @@ export async function recordSourceSkipped(source: RagSourceFailureInput, reason:
   await recordSourceFailure(source, reason, expectedOwner);
   if (activeOwner !== skipOwner) return;
   const manifest = manifests.get(source.source);
-  if (manifest) {
+  // `recordSourceFailure` deliberately preserves a same-content last-good
+  // index. A missing parser in the latest attempt must not turn that usable
+  // evidence into a skipped document.
+  if (manifest && manifest.status !== "indexed") {
     const updated = { ...manifest, status: "skipped" as const };
     const db = await openDatabase();
     if (db) { const tx = db.transaction("manifests", "readwrite"); tx.objectStore("manifests").put(updated); await transactionDone(tx); }

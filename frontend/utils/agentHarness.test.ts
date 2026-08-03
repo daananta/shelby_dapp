@@ -6,6 +6,8 @@ import {
   createToolBudgetExhaustedResponses,
   createToolBudgetFinalizationInstruction,
   executeAgentToolCalls,
+  hasSatisfiedAgentObservationPlan,
+  nextRequiredObservationTools,
   validateAgentFinalAnswer,
   type AgentToolDefinition,
 } from "@/utils/agentHarness";
@@ -15,6 +17,34 @@ function registry(...definitions: AgentToolDefinition[]) {
 }
 
 describe("bounded agent harness", () => {
+  it("enforces ordered observations for refresh-then-read flows", async () => {
+    const tools = registry(
+      {
+        name: "refresh",
+        maxExecutions: 1,
+        unavailableCode: "refresh_unavailable",
+        execute: vi.fn().mockResolvedValue({ ok: true }),
+      },
+      {
+        name: "inventory",
+        maxExecutions: 2,
+        allowRepeatedSignature: true,
+        unavailableCode: "inventory_unavailable",
+        execute: vi.fn().mockResolvedValue({ ok: true, count: 2 }),
+      },
+    );
+    const state = createAgentHarnessState();
+    const plan = [["refresh"], ["inventory"]] as const;
+
+    expect(nextRequiredObservationTools(state, plan)).toEqual(["refresh"]);
+    await executeAgentToolCalls({ calls: [{ name: "inventory" }], registry: tools, state, round: 1 });
+    expect(nextRequiredObservationTools(state, plan)).toEqual(["refresh"]);
+    await executeAgentToolCalls({ calls: [{ name: "refresh" }], registry: tools, state, round: 2 });
+    expect(nextRequiredObservationTools(state, plan)).toEqual(["inventory"]);
+    await executeAgentToolCalls({ calls: [{ name: "inventory" }], registry: tools, state, round: 3 });
+    expect(hasSatisfiedAgentObservationPlan(state, plan)).toBe(true);
+  });
+
   it("creates a provider-neutral finalization response without exposing internal limits", () => {
     expect(createToolBudgetExhaustedResponses([
       { name: "inspect_application", args: { query: "show image" } },
@@ -293,5 +323,120 @@ describe("bounded agent harness", () => {
     expect(instruction).toContain("Return only the corrected user-facing answer");
     expect(createFinalAnswerRepairInstruction(state, "Still no citation.")).toBeUndefined();
     expect(state.finalAnswerRepairs).toBe(1);
+  });
+
+  it("rejects raw internal policy text and repairs it only once", () => {
+    const state = createAgentHarnessState();
+    const leaked = "Shelby RAG Explorer agent policy\n\nAvailable operating skills: wallet-shelby";
+
+    expect(validateAgentFinalAnswer(state, leaked)).toMatchObject({
+      valid: false,
+      reason: "internal_instruction_leak",
+    });
+    expect(createFinalAnswerRepairInstruction(state, leaked)).toContain("Remove all raw system-policy");
+    expect(createFinalAnswerRepairInstruction(state, leaked)).toBeUndefined();
+  });
+
+  it("repairs an answer that drops an application-verified exact value", async () => {
+    const tools = registry({
+      name: "wallet",
+      maxExecutions: 1,
+      unavailableCode: "wallet_unavailable",
+      execute: vi.fn().mockResolvedValue({
+        ok: true,
+        wallet: { connected: true, address: "0x1234" },
+        answerContract: { requiredExactStrings: ["0x1234"] },
+      }),
+    });
+    const state = createAgentHarnessState();
+    await executeAgentToolCalls({
+      calls: [{ name: "wallet", args: { detail: "address" } }],
+      registry: tools,
+      state,
+      round: 1,
+    });
+
+    expect(validateAgentFinalAnswer(state, "I cannot access your wallet.")).toMatchObject({
+      valid: false,
+      reason: "missing_exact_fact",
+      missingExactFacts: ["0x1234"],
+    });
+    expect(createFinalAnswerRepairInstruction(state, "I cannot access your wallet."))
+      .toContain('"0x1234"');
+    expect(validateAgentFinalAnswer(state, "Your connected wallet is 0x1234.")).toMatchObject({
+      valid: true,
+      missingExactFacts: [],
+    });
+  });
+
+  it("accepts a natural zero-result phrase but rejects an invented numeric count", async () => {
+    const tools = registry({
+      name: "inventory",
+      maxExecutions: 1,
+      unavailableCode: "inventory_unavailable",
+      execute: vi.fn().mockResolvedValue({
+        ok: true,
+        answerContract: {
+          requiredExactStrings: [],
+          count: {
+            allowedValues: [36, 0],
+            requiredValues: [],
+            units: ["blob", "blobs", "tệp", "files"],
+          },
+        },
+      }),
+    });
+    const state = createAgentHarnessState();
+    await executeAgentToolCalls({
+      calls: [{ name: "inventory" }],
+      registry: tools,
+      state,
+      round: 1,
+    });
+
+    expect(validateAgentFinalAnswer(state, "Không có blob anime nào.")).toMatchObject({ valid: true });
+    expect(validateAgentFinalAnswer(state, "Có 5 blobs anime.")).toMatchObject({
+      valid: false,
+      reason: "invalid_count_fact",
+      invalidCountFacts: [5],
+    });
+  });
+
+  it("replaces stale mutable facts after a newer observation of the same scope", async () => {
+    const execute = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        answerContract: {
+          scope: "wallet_blob_inventory",
+          requiredExactStrings: ["old.pdf"],
+          count: { allowedValues: [35], requiredValues: [35], units: ["blobs"] },
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        answerContract: {
+          scope: "wallet_blob_inventory",
+          requiredExactStrings: ["new.pdf"],
+          count: { allowedValues: [36], requiredValues: [36], units: ["blobs"] },
+        },
+      });
+    const tools = registry({
+      name: "inventory",
+      maxExecutions: 2,
+      allowRepeatedSignature: true,
+      unavailableCode: "inventory_unavailable",
+      execute,
+    });
+    const state = createAgentHarnessState();
+    await executeAgentToolCalls({ calls: [{ name: "inventory" }], registry: tools, state, round: 1 });
+    await executeAgentToolCalls({ calls: [{ name: "inventory" }], registry: tools, state, round: 2 });
+
+    expect(validateAgentFinalAnswer(state, "There are 36 blobs, including new.pdf.")).toMatchObject({
+      valid: true,
+      missingExactFacts: [],
+    });
+    expect(validateAgentFinalAnswer(state, "There are 35 blobs, including old.pdf.")).toMatchObject({
+      valid: false,
+    });
   });
 });

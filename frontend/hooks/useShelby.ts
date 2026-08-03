@@ -211,11 +211,12 @@ export function useShelby() {
 
     if (mockWorkspace) {
       setLoadError(null);
-      await setActiveRagOwner(ownerAddress);
+      const activated = await setActiveRagOwner(ownerAddress, isCurrentRequest);
+      if (!activated) return [];
       if (!isCurrentRequest()) return [];
       const names = sandboxBlobs.map((blob: any) => getBlobName(blob));
       const ragEligibleNames = sandboxBlobs.map(getModifiedBlobForRag).filter((blob: any) => isRagSourceEligible(blob, ownerAddress)).map((blob: any) => getBlobName(blob));
-      await setShelbyBlobInventory(ownerAddress, names, ragEligibleNames);
+      await setShelbyBlobInventory(ownerAddress, names, ragEligibleNames, [], isCurrentRequest);
       if (!isCurrentRequest()) return [];
       setBlobs(sandboxBlobs);
       reconcileSelection(ragEligibleNames);
@@ -229,7 +230,8 @@ export function useShelby() {
     try {
       setLoading(true);
       setLoadError(null);
-      await setActiveRagOwner(ownerAddress);
+      const activated = await setActiveRagOwner(ownerAddress, isCurrentRequest);
+      if (!activated) return [];
       if (!isCurrentRequest()) return [];
       const clientKeyIssue = isE2EShelbyConfigurationError() ? "missing" : SHELBY_CLIENT_KEY_ISSUE;
       if (clientKeyIssue) {
@@ -244,22 +246,30 @@ export function useShelby() {
       const names = finalData.map((blob: any) => getBlobName(blob));
       const ragEligibleNames = finalData.map(getModifiedBlobForRag).filter((blob: any) => isRagSourceEligible(blob, ownerAddress)).map((blob: any) => getBlobName(blob));
       if (!accessSnapshot.verified) {
-        // A transient policy RPC/BCS failure is not authoritative revocation.
-        // Disable search, but preserve already indexed bytes until a fully
-        // verified policy snapshot can reconcile them.
-        await invalidateShelbyBlobInventory(ownerAddress);
+        // A transient failure for one policy is not authoritative revocation
+        // for every other blob. Persist the partial snapshot: resolved eligible
+        // sources remain searchable, unresolved sources fail closed, and their
+        // cached bytes are preserved for a later retry.
+        await setShelbyBlobInventory(
+          ownerAddress,
+          names,
+          ragEligibleNames,
+          accessSnapshot.unresolvedNames,
+          isCurrentRequest,
+        );
         if (!isCurrentRequest()) return [];
         setBlobs(finalData);
+        reconcileSelection(ragEligibleNames);
         toast({
-          title: localize("Shelby loaded; access check is unavailable", "Đã tải Shelby; chưa kiểm tra được quyền truy cập"),
+          title: localize("Some files could not be verified", "Chưa xác minh được một số tệp"),
           description: localize(
-            "Your local RAG was preserved, but document search is paused until access policies can be verified.",
-            "RAG trên máy vẫn được giữ, nhưng tra cứu tài liệu tạm dừng đến khi xác minh lại được quyền truy cập.",
+            "Verified files remain searchable. Files with an unavailable access check are excluded until the next refresh.",
+            "Các tệp đã xác minh vẫn có thể tra cứu. Tệp chưa kiểm tra được quyền sẽ tạm bị loại đến lần làm mới tiếp theo.",
           ),
         });
         return finalData;
       }
-      await setShelbyBlobInventory(ownerAddress, names, ragEligibleNames);
+      await setShelbyBlobInventory(ownerAddress, names, ragEligibleNames, [], isCurrentRequest);
       if (!isCurrentRequest()) return [];
       setBlobs(finalData);
       reconcileSelection(ragEligibleNames);
@@ -276,10 +286,11 @@ export function useShelby() {
         description: errorCopy.description,
         variant: "destructive",
       });
-      await invalidateShelbyBlobInventory(ownerAddress);
+      await invalidateShelbyBlobInventory(ownerAddress, isCurrentRequest);
       if (!isCurrentRequest()) return [];
-      // Preserve the last good visual snapshot. The searchable inventory was
-      // invalidated above, so chat cannot claim stale data is current.
+      // Preserve the last-good visual and searchable snapshot. Inventory tools
+      // still report it as stale, while document search remains scoped to the
+      // last positively verified eligible names.
       setBlobs((previous) => previous.length ? previous : sandboxBlobs);
       return sandboxBlobs;
     } finally {

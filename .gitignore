@@ -46,3 +46,4 @@ test_gemini.js
 test_models.js
 test_pdf.ts
 test_regex.js
+.env*

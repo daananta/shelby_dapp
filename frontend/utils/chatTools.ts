@@ -1,6 +1,8 @@
 import { aptosClient } from "@/utils/aptosClient";
 import { getImageDocuments, getRagSources, getShelbyBlobInventory, getVectorDB, type ImageDocument } from "@/utils/ragOrama";
+import { asksForLiveInventoryRefresh } from "@/utils/queryRouter";
 import { SHELBYUSD_FA_METADATA_ADDRESS } from "@shelby-protocol/sdk/browser";
+import type { ConnectedWalletDetail } from "../../shared/agentTools";
 
 export interface ChatToolResult {
   name: "wallet_address" | "apt_balance" | "shelbyusd_balance" | "account_info" | "blob_inventory" | "document_inventory" | "document_lookup" | "show_images" | "identity" | "calculator";
@@ -10,6 +12,7 @@ export interface ChatToolResult {
   /** Stable RAG sources referenced by this tool result for follow-up resolution. */
   referencedSources?: string[];
   data?: BlobInventoryToolData;
+  walletData?: WalletToolData;
 }
 
 export interface ChatToolContext {
@@ -52,6 +55,16 @@ export interface ChatToolObservation {
   status: BlobInventoryToolData["status"];
   observedAt: number;
   fetchedAt?: number;
+}
+
+export interface WalletToolData {
+  kind: "connected_wallet";
+  detail: ConnectedWalletDetail;
+  connected: boolean;
+  address?: string;
+  formattedAmount?: string;
+  sequenceNumber?: string;
+  authenticationKey?: string;
 }
 
 const OCTAS_PER_APT = 100_000_000n;
@@ -168,7 +181,7 @@ export function isBlobInventoryConfirmationFollowUp(question: string): boolean {
 }
 
 export function asksForLiveBlobInventoryRefresh(question: string): boolean {
-  return /(?:làm mới|đồng bộ lại|cập nhật lại|kiểm tra lại|mới nhất|hiện tại|ngay bây giờ|refresh|sync again|check again|latest|current|right now)/i.test(question);
+  return asksForLiveInventoryRefresh(question);
 }
 
 export function createChatToolObservation(result: ChatToolResult | null | undefined): ChatToolObservation | undefined {
@@ -296,9 +309,16 @@ export function readBlobInventoryForAgent(
   const recent = inventory.verified && ageMs <= RECENT_INVENTORY_MS;
   const nameQuery = request.nameQuery?.trim().slice(0, 200);
   const normalizedQuery = nameQuery?.toLocaleLowerCase("en-US");
-  const matchingNames = normalizedQuery
-    ? inventory.names.filter((name) => name.toLocaleLowerCase("en-US").includes(normalizedQuery)).slice(0, BLOB_LIST_LIMIT)
+  const allMatchingNames = normalizedQuery
+    ? inventory.names.filter((name) => name.toLocaleLowerCase("en-US").includes(normalizedQuery))
     : [];
+  const matchingNames = allMatchingNames.slice(0, BLOB_LIST_LIMIT);
+  const disclosedNames = nameQuery
+    ? matchingNames.slice(0, BLOB_EXAMPLE_LIMIT)
+    : request.detail === "sample" || request.detail === "all"
+      ? inventory.names.slice(0, BLOB_EXAMPLE_LIMIT)
+      : [];
+  const expectedCount = nameQuery ? allMatchingNames.length : inventory.names.length;
 
   return {
     ok: true,
@@ -307,8 +327,9 @@ export function readBlobInventoryForAgent(
     count: inventory.names.length,
     ...(nameQuery ? {
       nameQuery,
-      matchedCount: matchingNames.length,
+      matchedCount: allMatchingNames.length,
       matches: matchingNames,
+      truncated: allMatchingNames.length > BLOB_LIST_LIMIT,
     } : request.detail === "all" ? {
       names: inventory.names.slice(0, BLOB_LIST_LIMIT),
       truncated: inventory.names.length > BLOB_LIST_LIMIT,
@@ -320,6 +341,15 @@ export function readBlobInventoryForAgent(
     ...(Number.isFinite(ageMs) ? { ageMs } : {}),
     refreshRequired: !recent,
     lastRefreshSucceeded: inventory.verified,
+    answerContract: {
+      scope: "wallet_blob_inventory",
+      requiredExactStrings: disclosedNames,
+      count: {
+        allowedValues: [...new Set([inventory.names.length, expectedCount])],
+        requiredValues: expectedCount > 0 ? [expectedCount] : [],
+        units: ["blob", "blobs", "tệp", "file", "files"],
+      },
+    },
   };
 }
 
@@ -344,6 +374,86 @@ function formatApt(balance: bigint): string {
 function formatAssetAmount(raw: number, decimals: number): string {
   const value = raw / 10 ** decimals;
   return value.toLocaleString("en-US", { maximumFractionDigits: Math.min(decimals, 8) });
+}
+
+/** Reads one explicit public fact from the Aptos wallet connected to the app. */
+export async function readConnectedWallet(
+  detail: ConnectedWalletDetail,
+  address?: string,
+  context: Pick<ChatToolContext, "language"> = {},
+  signal?: AbortSignal,
+): Promise<ChatToolResult> {
+  signal?.throwIfAborted();
+  const t = (english: string, vietnamese: string) => context.language === "en" ? english : vietnamese;
+  if (!address) {
+    return {
+      name: detail === "address" ? "wallet_address" : detail === "apt_balance" ? "apt_balance" : detail === "shelbyusd_balance" ? "shelbyusd_balance" : "account_info",
+      text: t(
+        "No Aptos wallet is connected to this app. Connect one first, then ask again.",
+        "Chưa có ví Aptos nào kết nối với ứng dụng. Hãy kết nối ví rồi hỏi lại.",
+      ),
+      walletData: { kind: "connected_wallet", detail, connected: false },
+    };
+  }
+
+  if (detail === "address") {
+    return {
+      name: "wallet_address",
+      text: t(`Your connected Aptos wallet address is:\n${address}`, `Địa chỉ ví Aptos đang kết nối của bạn là:\n${address}`),
+      walletData: { kind: "connected_wallet", detail, connected: true, address },
+    };
+  }
+
+  const aptos = aptosClient();
+  if (detail === "apt_balance") {
+    const rawBalance = await aptos.getBalance({ accountAddress: address, asset: "0x1::aptos_coin::AptosCoin" });
+    signal?.throwIfAborted();
+    const formattedAmount = formatApt(BigInt(rawBalance));
+    return {
+      name: "apt_balance",
+      text: t(
+        `The current Aptos balance of wallet ${address.slice(0, 8)}…${address.slice(-6)} is ${formattedAmount}.`,
+        `Số dư Aptos hiện tại của ví ${address.slice(0, 8)}…${address.slice(-6)} là ${formattedAmount}.`,
+      ),
+      walletData: { kind: "connected_wallet", detail, connected: true, address, formattedAmount },
+    };
+  }
+
+  if (detail === "shelbyusd_balance") {
+    const [balance, metadata] = await Promise.all([
+      aptos.getBalance({ accountAddress: address, asset: SHELBYUSD_FA_METADATA_ADDRESS }),
+      aptos.getFungibleAssetMetadata({ options: { where: { asset_type: { _eq: SHELBYUSD_FA_METADATA_ADDRESS } }, limit: 1 } }),
+    ]);
+    signal?.throwIfAborted();
+    const decimals = metadata[0]?.decimals ?? 6;
+    const formattedAmount = `${formatAssetAmount(balance, decimals)} ShelbyUSD`;
+    return {
+      name: "shelbyusd_balance",
+      text: t(
+        `The current ShelbyUSD balance of wallet ${address.slice(0, 8)}…${address.slice(-6)} is ${formattedAmount}.`,
+        `Số dư ShelbyUSD hiện tại của ví ${address.slice(0, 8)}…${address.slice(-6)} là ${formattedAmount}.`,
+      ),
+      walletData: { kind: "connected_wallet", detail, connected: true, address, formattedAmount },
+    };
+  }
+
+  const info = await aptos.getAccountInfo({ accountAddress: address });
+  signal?.throwIfAborted();
+  return {
+    name: "account_info",
+    text: t(
+      `On-chain information for wallet ${address.slice(0, 8)}…${address.slice(-6)}:\n- Sequence number: ${info.sequence_number}\n- Authentication key: ${info.authentication_key}`,
+      `Thông tin on-chain của ví ${address.slice(0, 8)}…${address.slice(-6)}:\n- Sequence number: ${info.sequence_number}\n- Authentication key: ${info.authentication_key}`,
+    ),
+    walletData: {
+      kind: "connected_wallet",
+      detail,
+      connected: true,
+      address,
+      sequenceNumber: info.sequence_number,
+      authenticationKey: info.authentication_key,
+    },
+  };
 }
 
 function calculateBasicExpression(question: string): number | null {
@@ -403,16 +513,7 @@ export async function runChatTool(question: string, address?: string, context: C
   const t = (english: string, vietnamese: string) => context.language === "en" ? english : vietnamese;
 
   if (/(địa chỉ.*ví|ví.*địa chỉ|wallet address)/i.test(normalized)) {
-    if (!address) {
-      return {
-        name: "wallet_address",
-        text: t("Connect your Aptos wallet first to view its address.", "Hãy kết nối ví Aptos trước để xem địa chỉ."),
-      };
-    }
-    return {
-      name: "wallet_address",
-      text: t(`Your Aptos wallet address is:\n${address}`, `Địa chỉ ví Aptos của bạn là:\n${address}`),
-    };
+    return readConnectedWallet("address", address, context, signal);
   }
 
   if (/^(tôi là ai|tôi là người nào|who am i)\??$/i.test(normalized)) {
@@ -460,62 +561,15 @@ export async function runChatTool(question: string, address?: string, context: C
   }
 
   if (/shelby[\s_-]*usd/i.test(normalized) && /(số dư|balance|bao nhiêu)/i.test(normalized)) {
-    if (!address) {
-      return {
-        name: "shelbyusd_balance",
-        text: t("Connect your Aptos wallet first to check ShelbyUSD.", "Hãy kết nối ví Aptos trước để kiểm tra ShelbyUSD."),
-      };
-    }
-    const aptos = aptosClient();
-    const [balance, metadata] = await Promise.all([
-      aptos.getBalance({ accountAddress: address, asset: SHELBYUSD_FA_METADATA_ADDRESS }),
-      aptos.getFungibleAssetMetadata({ options: { where: { asset_type: { _eq: SHELBYUSD_FA_METADATA_ADDRESS } }, limit: 1 } }),
-    ]);
-    signal?.throwIfAborted();
-    const decimals = metadata[0]?.decimals ?? 6;
-    return {
-      name: "shelbyusd_balance",
-      text: t(
-        `The current ShelbyUSD balance of wallet ${address.slice(0, 8)}…${address.slice(-6)} is ${formatAssetAmount(balance, decimals)} ShelbyUSD.`,
-        `Số dư ShelbyUSD hiện tại của ví ${address.slice(0, 8)}…${address.slice(-6)} là ${formatAssetAmount(balance, decimals)} ShelbyUSD.`,
-      ),
-    };
+    return readConnectedWallet("shelbyusd_balance", address, context, signal);
   }
 
   if (/(số dư|balance|bao nhiêu\s+apt|apt.*bao nhiêu)/i.test(normalized)) {
-    if (!address) {
-      return {
-        name: "apt_balance",
-        text: t("Connect your Aptos wallet first to check its balance.", "Hãy kết nối ví Aptos trước để kiểm tra số dư."),
-      };
-    }
-    const balance = await aptosClient().getBalance({ accountAddress: address, asset: "0x1::aptos_coin::AptosCoin" });
-    signal?.throwIfAborted();
-    return {
-      name: "apt_balance",
-      text: t(
-        `The current Aptos balance of wallet ${address.slice(0, 8)}…${address.slice(-6)} is ${formatApt(BigInt(balance))}.`,
-        `Số dư Aptos hiện tại của ví ${address.slice(0, 8)}…${address.slice(-6)} là ${formatApt(BigInt(balance))}.`,
-      ),
-    };
+    return readConnectedWallet("apt_balance", address, context, signal);
   }
 
   if (/(thông tin (tài khoản|ví)|account info|sequence number|authentication key)/i.test(normalized)) {
-    if (!address) {
-      return {
-        name: "account_info",
-        text: t("Connect your Aptos wallet first to view its on-chain information.", "Hãy kết nối ví Aptos trước để xem thông tin on-chain."),
-      };
-    }
-    const info = await aptosClient().getAccountInfo({ accountAddress: address });
-    signal?.throwIfAborted();
-    return {
-      name: "account_info",
-      text: t(
-        `On-chain information for wallet ${address.slice(0, 8)}…${address.slice(-6)}:\n- Sequence number: ${info.sequence_number}\n- Authentication key: ${info.authentication_key}`,
-        `Thông tin on-chain của ví ${address.slice(0, 8)}…${address.slice(-6)}:\n- Sequence number: ${info.sequence_number}\n- Authentication key: ${info.authentication_key}`,
-      ),
-    };
+    return readConnectedWallet("account_info", address, context, signal);
   }
 
   const asksForBlobInventory = /(?:danh sách|liệt kê)(?:\s+(?:tất cả|toàn bộ))?\s+(?:blob|tệp|file)|(?:bao nhiêu|mấy)\s+(?:blob|tệp|file)|(?:blob|tệp|file).*(?:nào|gì)|(list|show|how many|which|what).*(blobs?|files?)/i.test(normalized)

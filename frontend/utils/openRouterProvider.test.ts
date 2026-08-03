@@ -232,6 +232,109 @@ describe("hosted Qwen agent", () => {
     }, undefined);
   });
 
+  it("uses the dedicated connected-wallet tool and preserves the public Aptos address", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "I cannot access your wallet for privacy reasons." },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "wallet-1",
+            type: "function",
+            function: { name: "get_connected_wallet", arguments: "{\"detail\":\"address\"}" },
+          }],
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "Địa chỉ ví Aptos đang kết nối là 0x1234." },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const getConnectedWallet = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "wallet_address",
+      wallet: { connected: true, address: "0x1234" },
+      answerContract: { requiredExactStrings: ["0x1234"] },
+    });
+
+    await expect(streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "địa chỉ ví của tôi là gì" }] }] },
+      vi.fn(),
+      {
+        searchKnowledge: vi.fn(),
+        getWalletBlobInventory: vi.fn(),
+        getConnectedWallet,
+      },
+    )).resolves.toContain("0x1234");
+
+    expect(getConnectedWallet).toHaveBeenCalledWith({ detail: "address" }, undefined);
+    const firstBody = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect(firstBody.availableTools).toEqual([
+      "search_user_knowledge",
+      "get_wallet_blob_inventory",
+      "get_connected_wallet",
+    ]);
+    const recoveryBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(recoveryBody.messages.at(-1)).toMatchObject({
+      role: "user",
+      content: expect.stringContaining("get_connected_wallet"),
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not accept an irrelevant tool as the required wallet observation", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "search-1",
+            type: "function",
+            function: { name: "search_user_knowledge", arguments: "{\"query\":\"wallet address\"}" },
+          }],
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "wallet-1",
+            type: "function",
+            function: { name: "get_connected_wallet", arguments: "{\"detail\":\"address\"}" },
+          }],
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "Your connected Aptos wallet is 0x1234." },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const searchKnowledge = vi.fn().mockResolvedValue({ found: false, evidence: [] });
+    const getConnectedWallet = vi.fn().mockResolvedValue({
+      ok: true,
+      wallet: { connected: true, address: "0x1234" },
+      answerContract: { requiredExactStrings: ["0x1234"] },
+    });
+
+    await expect(streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "What is my wallet address?" }] }] },
+      vi.fn(),
+      {
+        searchKnowledge,
+        getWalletBlobInventory: vi.fn(),
+        getConnectedWallet,
+      },
+    )).resolves.toContain("0x1234");
+
+    expect(searchKnowledge).not.toHaveBeenCalled();
+    expect(getConnectedWallet).toHaveBeenCalledOnce();
+    const recoveryBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(recoveryBody.messages.at(-1).content).toContain("get_connected_wallet");
+  });
+
   it("lets Qwen phrase a deterministic application observation", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse({
@@ -343,9 +446,13 @@ describe("hosted Qwen agent", () => {
       },
     });
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(toolCall("inventory-1", "get_wallet_blob_inventory", { detail: "sample", nameQuery: "anime2.jpeg" }))
       .mockResolvedValueOnce(toolCall("image-1", "inspect_application", { query: "Show me anime2.jpeg from my indexed Shelby blobs." }))
+      .mockResolvedValueOnce(toolCall("inventory-1", "get_wallet_blob_inventory", { detail: "sample", nameQuery: "anime2.jpeg" }))
       .mockResolvedValueOnce(toolCall("search-1", "search_user_knowledge", { query: "anime2.jpeg" }))
+      .mockResolvedValueOnce(toolCall("image-2", "inspect_application", { query: "Show me anime2.jpeg" }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: { role: "assistant", content: "The indexed preview is attached." },
+      }))
       .mockResolvedValueOnce(jsonResponse({
         message: { role: "assistant", content: "Here is anime2.jpeg; its indexed preview is attached." },
       }));
@@ -355,6 +462,7 @@ describe("hosted Qwen agent", () => {
       kind: "show_images",
       previewCount: 1,
       referencedSources: ["anime2.jpeg"],
+      answerContract: { requiredExactStrings: ["anime2.jpeg"] },
     });
 
     const answer = await streamHostedAgentAnswer(
@@ -376,9 +484,12 @@ describe("hosted Qwen agent", () => {
 
     expect(answer).toBe("Here is anime2.jpeg; its indexed preview is attached.");
     expect(inspectApplication).toHaveBeenCalledOnce();
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    const finalBody = JSON.parse(String((fetchMock.mock.calls[3][1] as RequestInit).body));
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    const finalBody = JSON.parse(String((fetchMock.mock.calls[4][1] as RequestInit).body));
     expect(finalBody.toolChoice).toBe("none");
+    const repairBody = JSON.parse(String((fetchMock.mock.calls[5][1] as RequestInit).body));
+    expect(repairBody.toolChoice).toBe("none");
+    expect(repairBody.messages.at(-1).content).toContain("anime2.jpeg");
     expect(answer).not.toContain("agent_round_limit");
   });
 
@@ -430,7 +541,7 @@ describe("hosted Qwen agent", () => {
     });
   });
 
-  it("does not loop when Qwen ignores the single citation repair", async () => {
+  it("stops after one bounded repair when Qwen still omits the citation", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse({
         message: {
@@ -461,7 +572,7 @@ describe("hosted Qwen agent", () => {
         }),
         getWalletBlobInventory: vi.fn(),
       },
-    )).resolves.toBe("Still uncited.");
+    )).rejects.toMatchObject({ name: "HostedAiError", kind: "invalid_response" });
 
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
@@ -474,6 +585,21 @@ describe("hosted Qwen agent", () => {
       vi.fn(),
       { searchKnowledge: vi.fn(), getWalletBlobInventory: vi.fn() },
     )).rejects.toMatchObject({ name: "HostedAiError", kind: "rate_limit", status: 429 } satisfies Partial<HostedAiError>);
+  });
+
+  it("surfaces a hosted timeout separately from rate limits and rejected credentials", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ kind: "timeout" }, 504)));
+
+    await expect(streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "Hello" }] }] },
+      vi.fn(),
+      { searchKnowledge: vi.fn(), getWalletBlobInventory: vi.fn() },
+    )).rejects.toMatchObject({
+      name: "HostedAiError",
+      kind: "timeout",
+      status: 504,
+      message: expect.stringContaining("took too long"),
+    });
   });
 
   it("explains when a Vite-only local preview does not provide the AI route", async () => {

@@ -12,6 +12,17 @@ describe("query router", () => {
   it("keeps general knowledge outside document RAG", () => {
     expect(classifyQueryIntent("Con ngựa có chạy nhanh không?")).toEqual({ intent: "general", documentScoped: false });
     expect(classifyQueryIntent('“Knowledge is power” nghĩa là gì?')).toEqual({ intent: "general", documentScoped: false });
+    expect(classifyQueryIntent("How many pages does a typical book have?")).toEqual({ intent: "general", documentScoped: false });
+    expect(classifyQueryIntent("What is work-life balance?")).toEqual({ intent: "general", documentScoped: false });
+    expect(classifyQueryIntent("Explain what a wallet address is.")).toEqual({ intent: "general", documentScoped: false });
+    expect(classifyQueryIntent("How many files can a directory contain?")).toEqual({ intent: "general", documentScoped: false });
+  });
+
+  it("recognizes an explicit request to inspect a concrete indexed filename", () => {
+    expect(classifyQueryIntent("Open package.json and identify the main libraries used.")).toEqual({
+      intent: "document_semantic",
+      documentScoped: true,
+    });
   });
 
   it("uses exact lookup only when the user explicitly asks to locate a quote", () => {
@@ -24,7 +35,9 @@ describe("query router", () => {
     expect(classifyQueryIntent("Kể câu chuyện 243").intent).toBe("story_lookup");
     expect(classifyQueryIntent("Tôi có sách không, kể câu chuyện thứ 112 trong sách").intent).toBe("story_lookup");
     expect(classifyQueryIntent("How many blobs does my wallet have?").intent).toBe("inventory");
+    expect(classifyQueryIntent("Tôi có những blob nào?").intent).toBe("inventory");
     expect(classifyQueryIntent("Kiểm tra số blob hiện tại của ví tôi").intent).toBe("inventory");
+    expect(classifyQueryIntent("Which wallet is connected?").intent).toBe("wallet");
     expect(classifyQueryIntent("Tell me story number 12 from my book").intent).toBe("story_lookup");
   });
 
@@ -34,6 +47,12 @@ describe("query router", () => {
     expect(classifyQueryIntent("Which indexed image blobs are available?")).toMatchObject({ intent: "image", documentScoped: true });
     expect(classifyQueryIntent("List indexed image blobs")).toMatchObject({ intent: "image", documentScoped: true });
     expect(classifyQueryIntent("Inspect indexed image blobs")).toMatchObject({ intent: "image", documentScoped: true });
+  });
+
+  it("keeps visual-detail follow-ups inside the image trust boundary", () => {
+    expect(classifyQueryIntent("Describe what is visible in this image.").intent).toBe("image");
+    expect(classifyQueryIntent("Which visible details support that description?").intent).toBe("image");
+    expect(classifyQueryIntent("Trong ảnh này nhìn thấy gì?").intent).toBe("image");
   });
 
   it("does not guess ambiguous references with local pronoun rules", () => {

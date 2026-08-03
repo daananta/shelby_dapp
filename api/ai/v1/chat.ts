@@ -1,3 +1,5 @@
+import { AGENT_TOOL_NAMES, selectAgentToolSpecs } from "../../../shared/agentTools";
+
 type HeaderValue = string | string[] | undefined;
 type RequestLike = {
   method?: string;
@@ -35,7 +37,8 @@ const MAX_OUTPUT_TOKENS = 1_200;
 const MAX_VISION_OUTPUT_TOKENS = 700;
 const FAST_REASONING = { effort: "none", exclude: true } as const;
 const RATE_WINDOW_MS = 60_000;
-const RATE_LIMIT = 15;
+const CHAT_START_RATE_LIMIT = 15;
+const CHAT_TOTAL_RATE_LIMIT = 60;
 const VISION_RATE_LIMIT = 5;
 const ALLOWED_IMAGE_MIME_TYPES = new Set([
   "image/jpeg",
@@ -44,106 +47,8 @@ const ALLOWED_IMAGE_MIME_TYPES = new Set([
   "image/gif",
 ]);
 const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-const ALLOWED_TOOL_NAMES = new Set([
-  "search_user_knowledge",
-  "get_wallet_blob_inventory",
-  "refresh_wallet_blob_inventory",
-  "inspect_application",
-  "analyze_indexed_image",
-]);
+const ALLOWED_TOOL_NAMES = new Set<string>(AGENT_TOOL_NAMES);
 const rateBuckets = new Map<string, { count: number; resetsAt: number }>();
-
-const TOOLS = [
-  {
-    type: "function",
-    function: {
-      name: "search_user_knowledge",
-      description: "Search the user's private/imported Shelby documents. Call only when the request depends on document content or follows up on document evidence. Never use for wallet state, blob counts/lists, or general knowledge.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "A self-contained semantic query that resolves conversational references without inventing a filename.",
-          },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "get_wallet_blob_inventory",
-      description: "Read the connected wallet's latest app-cached Shelby blob inventory. Use for blob counts/lists and follow-ups that ask to confirm an inventory answer.",
-      parameters: {
-        type: "object",
-        properties: {
-          detail: { type: "string", enum: ["count", "sample", "all"] },
-          nameQuery: {
-            type: "string",
-            description: "Optional filename substring when the user asks which blobs match a name or type.",
-          },
-        },
-        required: ["detail"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "refresh_wallet_blob_inventory",
-      description: "Refresh the connected wallet's Shelby inventory. Use only when the user explicitly requests current/live data or the inventory tool reports a stale snapshot. Then call get_wallet_blob_inventory before answering.",
-      parameters: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "inspect_application",
-      description: "Use read-only app capabilities for wallet/account facts, indexed image names and previews, document inventory, identity, or deterministic calculations. Use this to list indexed images or show/open a named image; it does not inspect image pixels. Do not use for document content or generic blob inventory names/counts.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "A self-contained version of the user's read-only app request.",
-          },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "analyze_indexed_image",
-      description: "Inspect the original pixels of an indexed image. Call when the answer requires visual contents, readable text, or details that are not already present in app context. Do not call merely to list image names or attach an existing preview.",
-      parameters: {
-        type: "object",
-        properties: {
-          source: {
-            type: "string",
-            description: "The exact indexed filename when known. Omit it only when the preceding conversation unambiguously identifies one image.",
-          },
-          question: {
-            type: "string",
-            description: "The self-contained visual question to answer from the original pixels, preserving the user's requested detail and language.",
-          },
-        },
-        required: ["question"],
-        additionalProperties: false,
-      },
-    },
-  },
-] as const;
 
 function firstHeader(value: HeaderValue) {
   return Array.isArray(value) ? value[0] : value;
@@ -163,7 +68,7 @@ function isOriginAllowed(request: RequestLike) {
   return origin === expected;
 }
 
-function consumeRateLimit(request: RequestLike, scope: "chat" | "vision", limit: number) {
+function consumeRateLimit(request: RequestLike, scope: "chat_start" | "chat_total" | "vision", limit: number) {
   const forwarded = firstHeader(request.headers?.["x-forwarded-for"])?.split(",")[0]?.trim();
   const identity = `${scope}:${forwarded || request.socket?.remoteAddress || "unknown"}`;
   const now = Date.now();
@@ -183,7 +88,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function sanitizeToolCalls(value: unknown): ChatMessage["tool_calls"] {
+function sanitizeAvailableToolNames(value: unknown): Set<string> | null {
+  if (value === undefined) return new Set(ALLOWED_TOOL_NAMES);
+  if (!Array.isArray(value) || value.length > ALLOWED_TOOL_NAMES.size) return null;
+  const names = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || !ALLOWED_TOOL_NAMES.has(item)) return null;
+    names.add(item);
+  }
+  return names;
+}
+
+function sanitizeToolCalls(value: unknown, availableTools: ReadonlySet<string>): ChatMessage["tool_calls"] {
   if (!Array.isArray(value) || value.length > 3) return undefined;
   const calls: NonNullable<ChatMessage["tool_calls"]> = [];
   for (const item of value) {
@@ -191,13 +107,13 @@ function sanitizeToolCalls(value: unknown): ChatMessage["tool_calls"] {
     const id = typeof item.id === "string" ? item.id.slice(0, 200) : "";
     const name = typeof item.function.name === "string" ? item.function.name : "";
     const args = typeof item.function.arguments === "string" ? item.function.arguments : "";
-    if (!id || !ALLOWED_TOOL_NAMES.has(name) || args.length > 4_000) return undefined;
+    if (!id || !availableTools.has(name) || args.length > 4_000) return undefined;
     calls.push({ id, type: "function", function: { name, arguments: args } });
   }
   return calls.length ? calls : undefined;
 }
 
-function sanitizeMessages(value: unknown): ChatMessage[] | null {
+function sanitizeMessages(value: unknown, availableTools: ReadonlySet<string>): ChatMessage[] | null {
   if (!Array.isArray(value) || !value.length || value.length > MAX_MESSAGES) return null;
   let totalContent = 0;
   const messages: ChatMessage[] = [];
@@ -216,7 +132,7 @@ function sanitizeMessages(value: unknown): ChatMessage[] | null {
       continue;
     }
     if (role === "assistant") {
-      const toolCalls = sanitizeToolCalls(item.tool_calls);
+      const toolCalls = sanitizeToolCalls(item.tool_calls, availableTools);
       const reasoningDetails = Array.isArray(item.reasoning_details)
         && JSON.stringify(item.reasoning_details).length <= 16_000
         ? item.reasoning_details
@@ -233,6 +149,31 @@ function sanitizeMessages(value: unknown): ChatMessage[] | null {
     messages.push({ role, content });
   }
   return messages;
+}
+
+function sanitizeChatResponseMessage(
+  value: Record<string, unknown>,
+  availableTools: ReadonlySet<string>,
+): ChatMessage | null {
+  const content = value.content === null
+    ? null
+    : typeof value.content === "string"
+      ? value.content.trim()
+      : null;
+  if (content && content.length > 16_000) return null;
+  const toolCalls = sanitizeToolCalls(value.tool_calls, availableTools);
+  if (Array.isArray(value.tool_calls) && !toolCalls) return null;
+  const reasoningDetails = Array.isArray(value.reasoning_details)
+    && JSON.stringify(value.reasoning_details).length <= 16_000
+    ? value.reasoning_details
+    : undefined;
+  if (!content && !toolCalls) return null;
+  return {
+    role: "assistant",
+    content,
+    ...(toolCalls ? { tool_calls: toolCalls } : {}),
+    ...(reasoningDetails ? { reasoning_details: reasoningDetails } : {}),
+  };
 }
 
 type VisionRequest = {
@@ -351,6 +292,10 @@ class UpstreamError extends Error {
   }
 }
 
+function isTimeoutError(error: unknown) {
+  return error instanceof Error && (error.name === "TimeoutError" || error.message.toLowerCase().includes("timed out"));
+}
+
 /** Same-origin Vercel gateway. The OpenRouter credential remains server-only. */
 export default async function handler(request: RequestLike, response: ResponseLike) {
   response.setHeader("Cache-Control", "no-store");
@@ -366,8 +311,14 @@ export default async function handler(request: RequestLike, response: ResponseLi
   }
   const body = isRecord(request.body) ? request.body : {};
   const isVisionRequest = body.mode === "vision";
-  const rateLimit = isVisionRequest ? VISION_RATE_LIMIT : RATE_LIMIT;
-  if (!consumeRateLimit(request, isVisionRequest ? "vision" : "chat", rateLimit)) {
+  const isAgentContinuation = !isVisionRequest
+    && Array.isArray(body.messages)
+    && body.messages.some((message) => isRecord(message) && message.role === "tool");
+  const withinRateLimit = isVisionRequest
+    ? consumeRateLimit(request, "vision", VISION_RATE_LIMIT)
+    : (isAgentContinuation || consumeRateLimit(request, "chat_start", CHAT_START_RATE_LIMIT))
+      && consumeRateLimit(request, "chat_total", CHAT_TOTAL_RATE_LIMIT);
+  if (!withinRateLimit) {
     response.setHeader("Retry-After", "60");
     response.status(429).json({ error: "AI request limit exceeded", kind: "rate_limit" });
     return;
@@ -388,6 +339,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
   }
 
   let upstreamRequestBody: Record<string, unknown>;
+  let chatAvailableTools: ReadonlySet<string> = new Set();
   if (isVisionRequest) {
     const validation = sanitizeVisionRequest(body, bodyBytes);
     if (!validation.ok) {
@@ -409,17 +361,25 @@ export default async function handler(request: RequestLike, response: ResponseLi
       max_tokens: MAX_VISION_OUTPUT_TOKENS,
     };
   } else {
-    const messages = bodyBytes <= MAX_BODY_BYTES ? sanitizeMessages(body.messages) : null;
+    const availableTools = sanitizeAvailableToolNames(body.availableTools);
+    if (!availableTools) {
+      response.status(400).json({ error: "Invalid tool configuration" });
+      return;
+    }
+    chatAvailableTools = availableTools;
+    const messages = bodyBytes <= MAX_BODY_BYTES ? sanitizeMessages(body.messages, availableTools) : null;
     const toolChoice = body.toolChoice === "none" ? "none" : "auto";
     if (!messages) {
       response.status(400).json({ error: "Invalid chat request" });
       return;
     }
+    const tools = selectAgentToolSpecs(availableTools);
     upstreamRequestBody = {
       model: MODEL,
       messages,
-      tools: TOOLS,
-      tool_choice: toolChoice,
+      ...(toolChoice === "auto" && tools.length
+        ? { tools, tool_choice: "auto" }
+        : { tool_choice: "none" }),
       temperature: 0.2,
       reasoning: FAST_REASONING,
       max_tokens: MAX_OUTPUT_TOKENS,
@@ -447,8 +407,14 @@ export default async function handler(request: RequestLike, response: ResponseLi
     };
     const message = payload.choices?.[0]?.message;
     if (!isRecord(message)) throw new Error("OpenRouter response was incomplete");
-    const responseMessage = isVisionRequest ? sanitizeVisionResponseMessage(message) : message;
-    if (!responseMessage) throw new Error("OpenRouter vision response was incomplete");
+    const responseMessage = isVisionRequest
+      ? sanitizeVisionResponseMessage(message)
+      : sanitizeChatResponseMessage(message, chatAvailableTools);
+    if (!responseMessage) throw new Error(
+      isVisionRequest
+        ? "OpenRouter vision response was incomplete"
+        : "OpenRouter chat response was incomplete",
+    );
     response.status(200).json({
       id: payload.id,
       model: payload.model ?? MODEL,
@@ -457,6 +423,10 @@ export default async function handler(request: RequestLike, response: ResponseLi
       usage: payload.usage,
     });
   } catch (error) {
+    if (isTimeoutError(error)) {
+      response.status(504).json({ error: "Hosted AI timed out", kind: "timeout" });
+      return;
+    }
     if (error instanceof UpstreamError) {
       if (error.retryAfter) response.setHeader("Retry-After", error.retryAfter);
       if (error.status === 429) {

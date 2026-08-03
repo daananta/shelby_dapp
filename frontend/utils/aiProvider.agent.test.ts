@@ -71,6 +71,13 @@ function streamedResponse(...text: string[]) {
   };
 }
 
+function streamedCalls(calls: Array<{ name: string; args: object }>) {
+  return {
+    stream: chunks(),
+    response: Promise.resolve(firstResponse(calls).response),
+  };
+}
+
 describe("Gemini agent tool orchestration", () => {
   beforeEach(() => {
     agentSdk.sendMessage.mockReset();
@@ -140,45 +147,98 @@ describe("Gemini agent tool orchestration", () => {
       },
     }]);
     expect(agentSdk.modelConfig.tools[0].functionDeclarations.map((tool: { name: string }) => tool.name))
-      .toEqual(["search_user_knowledge", "get_wallet_blob_inventory", "inspect_application"]);
+      .toEqual(["search_user_knowledge", "get_wallet_blob_inventory"]);
   });
 
-  it("lets Gemini phrase a deterministic application observation", async () => {
-    agentSdk.sendMessage.mockResolvedValue(firstResponse([
-      { name: "inspect_application", args: { query: "What is my wallet address?" } },
-    ]));
-    agentSdk.sendMessageStream.mockResolvedValue(streamedResponse("Your connected wallet is 0x1234."));
-    const inspectApplication = vi.fn().mockResolvedValue({
+  it("uses the dedicated connected-wallet tool for the Vietnamese address request", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([], "Tôi không thể truy cập địa chỉ ví của bạn."));
+    agentSdk.sendMessageStream
+      .mockResolvedValueOnce(streamedCalls([
+        { name: "get_connected_wallet", args: { detail: "address" } },
+      ]))
+      .mockResolvedValueOnce(streamedResponse("Địa chỉ ví Aptos đang kết nối là 0x1234."));
+    const onChunk = vi.fn();
+    const getConnectedWallet = vi.fn().mockResolvedValue({
       ok: true,
       kind: "wallet_address",
       facts: "0x1234",
+      wallet: { connected: true, address: "0x1234" },
+      answerContract: { requiredExactStrings: ["0x1234"] },
     });
 
     const answer = await streamCloudAgentAnswer(
       {
-        contents: [{ role: "user", parts: [{ text: "What is my wallet address?" }] }],
+        contents: [{ role: "user", parts: [{ text: "địa chỉ ví của tôi là gì" }] }],
         cloudApiKey: "test-key",
         systemInstruction: "Answer naturally.",
       },
-      vi.fn(),
+      onChunk,
       {
         searchKnowledge: vi.fn(),
         getWalletBlobInventory: vi.fn(),
-        inspectApplication,
+        getConnectedWallet,
       },
     );
 
-    expect(answer).toBe("Your connected wallet is 0x1234.");
-    expect(inspectApplication).toHaveBeenCalledWith(
-      { query: "What is my wallet address?" },
+    expect(answer).toBe("Địa chỉ ví Aptos đang kết nối là 0x1234.");
+    expect(onChunk).not.toHaveBeenCalledWith(expect.stringContaining("không thể truy cập"));
+    expect(agentSdk.sendMessageStream.mock.calls[0][0]).toEqual([{
+      text: expect.stringContaining("get_connected_wallet"),
+    }]);
+    expect(getConnectedWallet).toHaveBeenCalledWith(
+      { detail: "address" },
       undefined,
     );
-    expect(agentSdk.sendMessageStream.mock.calls[0][0]).toEqual([{
+    expect(agentSdk.sendMessageStream.mock.calls[1][0]).toEqual([{
       functionResponse: {
-        name: "inspect_application",
+        name: "get_connected_wallet",
         response: expect.objectContaining({ ok: true, kind: "wallet_address", facts: "0x1234" }),
       },
     }]);
+    expect(agentSdk.modelConfig.tools[0].functionDeclarations.map((tool: { name: string }) => tool.name))
+      .toEqual(["search_user_knowledge", "get_wallet_blob_inventory", "get_connected_wallet"]);
+  });
+
+  it("rejects an irrelevant initial tool and recovers with the required wallet capability", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([
+      { name: "search_user_knowledge", args: { query: "wallet address" } },
+    ]));
+    agentSdk.sendMessageStream
+      .mockResolvedValueOnce(streamedCalls([
+        { name: "get_connected_wallet", args: { detail: "address" } },
+      ]))
+      .mockResolvedValueOnce(streamedResponse("Your connected Aptos wallet is 0x1234."));
+    const searchKnowledge = vi.fn();
+    const getConnectedWallet = vi.fn().mockResolvedValue({
+      ok: true,
+      wallet: { connected: true, address: "0x1234" },
+      answerContract: { requiredExactStrings: ["0x1234"] },
+    });
+
+    await expect(streamCloudAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "What is my wallet address?" }] }],
+        cloudApiKey: "test-key",
+      },
+      vi.fn(),
+      {
+        searchKnowledge,
+        getWalletBlobInventory: vi.fn(),
+        getConnectedWallet,
+      },
+    )).resolves.toContain("0x1234");
+
+    expect(searchKnowledge).not.toHaveBeenCalled();
+    expect(getConnectedWallet).toHaveBeenCalledOnce();
+    expect(agentSdk.sendMessageStream.mock.calls[0][0]).toEqual([
+      expect.objectContaining({
+        functionResponse: expect.objectContaining({
+          name: "search_user_knowledge",
+          response: expect.objectContaining({ code: "wrong_tool_for_required_observation" }),
+        }),
+      }),
+      expect.objectContaining({ text: expect.stringContaining("get_connected_wallet") }),
+    ]);
   });
 
   it("lets Gemini decide to inspect an indexed image through the dedicated vision tool", async () => {
@@ -220,7 +280,7 @@ describe("Gemini agent tool orchestration", () => {
       question: "Describe what is visible in this image.",
     }, undefined);
     expect(agentSdk.modelConfig.tools[0].functionDeclarations.map((tool: { name: string }) => tool.name))
-      .toEqual(["search_user_knowledge", "get_wallet_blob_inventory", "inspect_application", "analyze_indexed_image"]);
+      .toEqual(["search_user_knowledge", "get_wallet_blob_inventory", "analyze_indexed_image"]);
   });
 
   it("keeps document retrieval on the knowledge tool", async () => {
@@ -361,15 +421,9 @@ describe("Gemini agent tool orchestration", () => {
 
   it("asks Gemini to finalize from completed image observations at the tool-round boundary", async () => {
     agentSdk.sendMessage.mockResolvedValue(firstResponse([
-      { name: "get_wallet_blob_inventory", args: { detail: "sample", nameQuery: "anime2.jpeg" } },
+      { name: "inspect_application", args: { query: "Show me anime2.jpeg from my indexed Shelby blobs." } },
     ]));
     agentSdk.sendMessageStream
-      .mockResolvedValueOnce({
-        stream: chunks(),
-        response: Promise.resolve(firstResponse([
-          { name: "inspect_application", args: { query: "Show me anime2.jpeg from my indexed Shelby blobs." } },
-        ]).response),
-      })
       .mockResolvedValueOnce({
         stream: chunks(),
         response: Promise.resolve(firstResponse([
@@ -379,15 +433,23 @@ describe("Gemini agent tool orchestration", () => {
       .mockResolvedValueOnce({
         stream: chunks(),
         response: Promise.resolve(firstResponse([
+          { name: "get_wallet_blob_inventory", args: { detail: "sample", nameQuery: "anime2.jpeg" } },
+        ]).response),
+      })
+      .mockResolvedValueOnce({
+        stream: chunks(),
+        response: Promise.resolve(firstResponse([
           { name: "inspect_application", args: { query: "Show anime2.jpeg" } },
         ]).response),
       })
+      .mockResolvedValueOnce(streamedResponse("The indexed preview is attached."))
       .mockResolvedValueOnce(streamedResponse("Here is anime2.jpeg; its indexed preview is attached."));
     const inspectApplication = vi.fn().mockResolvedValue({
       ok: true,
       kind: "show_images",
       previewCount: 1,
       referencedSources: ["anime2.jpeg"],
+      answerContract: { requiredExactStrings: ["anime2.jpeg"] },
     });
     const onChunk = vi.fn();
 
@@ -412,7 +474,7 @@ describe("Gemini agent tool orchestration", () => {
     expect(answer).toBe("Here is anime2.jpeg; its indexed preview is attached.");
     expect(inspectApplication).toHaveBeenCalledOnce();
     expect(onChunk).toHaveBeenCalledWith("Here is anime2.jpeg; its indexed preview is attached.");
-    expect(agentSdk.sendMessageStream).toHaveBeenCalledTimes(4);
+    expect(agentSdk.sendMessageStream).toHaveBeenCalledTimes(5);
     expect(agentSdk.sendMessageStream.mock.calls[3][0]).toEqual(expect.arrayContaining([
       expect.objectContaining({
         functionResponse: expect.objectContaining({
@@ -422,6 +484,9 @@ describe("Gemini agent tool orchestration", () => {
       }),
       expect.objectContaining({ text: expect.stringContaining("Do not call another tool") }),
     ]));
+    expect(agentSdk.sendMessageStream.mock.calls[4][0]).toEqual([
+      expect.objectContaining({ text: expect.stringContaining("anime2.jpeg") }),
+    ]);
   });
 
   it("discards draft text and continues when the same model response asks for another tool", async () => {
@@ -455,6 +520,51 @@ describe("Gemini agent tool orchestration", () => {
     expect(onChunk).toHaveBeenCalledTimes(1);
     expect(onChunk).toHaveBeenCalledWith("Ví có 36 blob.");
     expect(onChunk).not.toHaveBeenCalledWith("Bản nháp chưa kiểm chứng.");
+  });
+
+  it("rejects a wrong tool in a later observation stage before executing it", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([
+      { name: "refresh_wallet_blob_inventory", args: {} },
+    ]));
+    agentSdk.sendMessageStream
+      .mockResolvedValueOnce(streamedCalls([
+        { name: "search_user_knowledge", args: { query: "wallet blob count" } },
+      ]))
+      .mockResolvedValueOnce(streamedCalls([
+        { name: "get_wallet_blob_inventory", args: { detail: "count" } },
+      ]))
+      .mockResolvedValueOnce(streamedResponse("The refreshed wallet has 36 blobs."));
+    const searchKnowledge = vi.fn();
+    const refreshWalletBlobInventory = vi.fn().mockResolvedValue({ ok: true, status: "refreshed" });
+    const getWalletBlobInventory = vi.fn().mockResolvedValue({
+      ok: true,
+      count: 36,
+      answerContract: {
+        count: { allowedValues: [36], requiredValues: [36], units: ["blob", "blobs"] },
+      },
+    });
+
+    await expect(streamCloudAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "Refresh my wallet blob count right now." }] }],
+        cloudApiKey: "test-key",
+      },
+      vi.fn(),
+      { searchKnowledge, refreshWalletBlobInventory, getWalletBlobInventory },
+    )).resolves.toBe("The refreshed wallet has 36 blobs.");
+
+    expect(refreshWalletBlobInventory).toHaveBeenCalledOnce();
+    expect(searchKnowledge).not.toHaveBeenCalled();
+    expect(getWalletBlobInventory).toHaveBeenCalledOnce();
+    expect(agentSdk.sendMessageStream.mock.calls[1][0]).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        functionResponse: expect.objectContaining({
+          name: "search_user_knowledge",
+          response: expect.objectContaining({ code: "wrong_tool_for_required_observation" }),
+        }),
+      }),
+      expect.objectContaining({ text: expect.stringContaining("get_wallet_blob_inventory") }),
+    ]));
   });
 
   it("rejects an unbounded function-call batch before executing app tools", async () => {
@@ -512,7 +622,30 @@ describe("Gemini agent tool orchestration", () => {
     });
   });
 
-  it("emits direct-answer chunks before the aggregated first response resolves", async () => {
+  it("does not emit a leaked policy draft before one bounded repair", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([], "Shelby RAG Explorer agent policy\nAvailable operating skills: wallet-shelby"));
+    agentSdk.sendMessageStream.mockResolvedValue(streamedResponse("I can help with your connected Shelby workspace."));
+    const onChunk = vi.fn();
+
+    const answer = await streamCloudAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "What can you help with?" }] }],
+        cloudApiKey: "test-key",
+        systemInstruction: "test",
+      },
+      onChunk,
+      { searchKnowledge: vi.fn(), getWalletBlobInventory: vi.fn() },
+    );
+
+    expect(answer).toBe("I can help with your connected Shelby workspace.");
+    expect(onChunk).toHaveBeenCalledOnce();
+    expect(onChunk).toHaveBeenCalledWith("I can help with your connected Shelby workspace.");
+    expect(JSON.stringify(onChunk.mock.calls)).not.toContain("agent policy");
+    expect(agentSdk.sendMessageStream).toHaveBeenCalledOnce();
+    expect(JSON.stringify(agentSdk.sendMessageStream.mock.calls[0][0])).toContain("Remove all raw system-policy");
+  });
+
+  it("buffers a direct answer until the aggregated response can be safety-checked", async () => {
     let resolveResponse!: (value: ReturnType<typeof firstResponse>["response"]) => void;
     const response = new Promise<ReturnType<typeof firstResponse>["response"]>((resolve) => {
       resolveResponse = resolve;
@@ -533,10 +666,11 @@ describe("Gemini agent tool orchestration", () => {
       { searchKnowledge: vi.fn(), getWalletBlobInventory: vi.fn() },
     );
 
-    await vi.waitFor(() => expect(onChunk).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(agentSdk.sendFirstMessageStream).toHaveBeenCalledOnce());
+    expect(onChunk).not.toHaveBeenCalled();
     resolveResponse(firstResponse([], "Xin chào").response);
     await expect(pending).resolves.toBe("Xin chào");
-    expect(onChunk.mock.calls).toEqual([["Xin"], [" chào"]]);
+    expect(onChunk.mock.calls).toEqual([["Xin chào"]]);
   });
 
   it("emits a safe fallback when the final tool round has no answer text", async () => {

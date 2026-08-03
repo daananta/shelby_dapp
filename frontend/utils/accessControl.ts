@@ -86,6 +86,7 @@ export function parseAccessPolicyQuery(hex: string): AccessPolicyInfo {
     if (!reader.readBool()) {
       const hasCanAccess = reader.readBool();
       const policy: AccessPolicyInfo = { type: "none", canAccess: hasCanAccess ? reader.readBool() : null };
+      reader.readBool(); // receipt_collection_initialized
       reader.assertDone();
       return policy;
     }
@@ -111,6 +112,7 @@ export function parseAccessPolicyQuery(hex: string): AccessPolicyInfo {
     }
     const hasCanAccess = reader.readBool();
     policy.canAccess = hasCanAccess ? reader.readBool() : null;
+    reader.readBool(); // receipt_collection_initialized
     if (greenBoxScheme !== 0 || greenBoxBytes.byteLength > 0) {
       policy.greenBoxScheme = greenBoxScheme;
       policy.greenBoxBytes = greenBoxBytes;

@@ -1,9 +1,27 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
 import { invalidateShelbyBlobInventory, replaceDocument, setActiveRagOwner, setShelbyBlobInventory } from "@/utils/ragOrama";
-import { analyzeIndexedImage, asksForLiveBlobInventoryRefresh, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, readBlobInventoryForAgent, runChatTool } from "@/utils/chatTools";
+import { analyzeIndexedImage, asksForLiveBlobInventoryRefresh, isBlobInventoryAnswerConsistent, isBlobInventoryConfirmationFollowUp, readBlobInventory, readBlobInventoryForAgent, readConnectedWallet, runChatTool } from "@/utils/chatTools";
 
 describe("chat tools", () => {
+  it("returns the exact connected Aptos address without treating it as a secret", async () => {
+    const address = "0x1234567890abcdef";
+    await expect(readConnectedWallet("address", address)).resolves.toMatchObject({
+      name: "wallet_address",
+      text: expect.stringContaining(address),
+      walletData: {
+        kind: "connected_wallet",
+        detail: "address",
+        connected: true,
+        address,
+      },
+    });
+    await expect(readConnectedWallet("address")).resolves.toMatchObject({
+      name: "wallet_address",
+      walletData: { connected: false },
+    });
+  });
+
   it("recognizes only narrow inventory confirmation follow-ups", () => {
     expect(isBlobInventoryConfirmationFollowUp("chắc chưa?")).toBe(true);
     expect(isBlobInventoryConfirmationFollowUp("Kiểm tra lại đi")).toBe(true);
@@ -96,6 +114,42 @@ describe("chat tools", () => {
     });
     expect(JSON.stringify(payload)).not.toContain("Snapshot Shelby");
     expect(JSON.stringify(payload)).not.toContain("select Refresh");
+  });
+
+  it("reports the full filtered count when the returned name list is bounded", async () => {
+    const owner = "0xinventory-agent-bounded-filter";
+    await setActiveRagOwner(owner);
+    await setShelbyBlobInventory(owner, Array.from({ length: 105 }, (_, index) => `anime-${index}.png`));
+
+    const payload = readBlobInventoryForAgent({ detail: "all", nameQuery: "anime" });
+
+    expect(payload).toMatchObject({
+      matchedCount: 105,
+      truncated: true,
+      answerContract: {
+        count: { allowedValues: [105], requiredValues: [105] },
+      },
+    });
+    expect(payload.matches).toHaveLength(100);
+  });
+
+  it("does not force the model to spell a zero-result count as a digit", async () => {
+    const owner = "0xinventory-agent-empty-filter";
+    await setActiveRagOwner(owner);
+    await setShelbyBlobInventory(owner, ["invoice.pdf"]);
+
+    const payload = readBlobInventoryForAgent({ detail: "sample", nameQuery: "anime" });
+
+    expect(payload).toMatchObject({
+      matchedCount: 0,
+      answerContract: {
+        requiredExactStrings: [],
+        count: {
+          allowedValues: [1, 0],
+          requiredValues: [],
+        },
+      },
+    });
   });
 
   it("rejects model phrasing that changes a verified inventory count or examples", async () => {

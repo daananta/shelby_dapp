@@ -6,6 +6,8 @@ test("renders the Shelby product without boilerplate copy", async ({ page }) => 
   await page.goto("/");
   expect(pageErrors).toEqual([]);
   await expect(page.locator("html")).toHaveAttribute("lang", "en");
+  await expect(page.locator("html")).toHaveAttribute("translate", "no");
+  await expect(page.locator('meta[name="google"]')).toHaveAttribute("content", "notranslate");
   await expect(page.getByText("Shelby RAG Explorer", { exact: false }).first()).toBeVisible();
   await expect(page.getByRole("heading", { name: "Ask your Shelby data. Get evidence back." })).toBeVisible();
   await expect(page.getByText("Boilerplate Template", { exact: true })).toHaveCount(0);

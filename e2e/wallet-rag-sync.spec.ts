@@ -334,6 +334,48 @@ test("lets hosted AI phrase inventory observations without requiring a Gemini ke
   expect(hostedTurns).toBe(4);
 });
 
+test("lets the agent read the exact Aptos wallet connected to the app", async ({ page }) => {
+  const expectedAddress = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+  const walletPayloads: any[] = [];
+  await page.route("**/api/ai/v1/chat", async (route) => {
+    const body = route.request().postDataJSON() as any;
+    const latestTool = [...(body?.messages ?? [])].reverse().find((message: any) => message?.role === "tool");
+    if (latestTool) walletPayloads.push(JSON.parse(latestTool.content));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        message: latestTool
+          ? { role: "assistant", content: `Địa chỉ ví Aptos đang kết nối là ${expectedAddress}.` }
+          : {
+              role: "assistant",
+              content: null,
+              tool_calls: [{
+                id: "wallet-address-call",
+                type: "function",
+                function: { name: "get_connected_wallet", arguments: "{\"detail\":\"address\"}" },
+              }],
+            },
+      }),
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
+  const chatInput = page.getByLabel("Nhập câu hỏi");
+  await chatInput.fill("địa chỉ ví của tôi là gì");
+  await chatInput.press("Enter");
+
+  await expect(page.getByText(`Địa chỉ ví Aptos đang kết nối là ${expectedAddress}.`, { exact: true })).toBeVisible();
+  expect(walletPayloads).toEqual([
+    expect.objectContaining({
+      ok: true,
+      kind: "wallet_address",
+      wallet: expect.objectContaining({ connected: true, address: expectedAddress }),
+    }),
+  ]);
+});
+
 test("lets the agent refresh Shelby live and reread the bounded inventory payload", async ({ page }) => {
   const refreshPayloads: any[] = [];
   const inventoryPayloads: any[] = [];

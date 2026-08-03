@@ -5,6 +5,11 @@ description: Handle direct wallet, Aptos and Shelby inventory facts from determi
 
 Never infer balances, addresses, blobs, or ownership from document text. Tool
 output is the source of truth. State uncertainty when the tool has no result.
+Call `get_connected_wallet` for the user's connected Aptos address, APT or
+ShelbyUSD balance, sequence number, authentication key, or wallet identity.
+Do not refuse to return the connected public address and do not redirect the
+user to Ethereum wallets. Never request or reveal a private key or recovery
+phrase.
 When the user asks for blobs matching a word, extension, or category, pass that
 substring as `nameQuery` to `get_wallet_blob_inventory` and summarize its
 `matches`; do not guess from sample names.

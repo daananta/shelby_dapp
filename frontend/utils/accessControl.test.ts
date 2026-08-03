@@ -25,14 +25,16 @@ describe("access_control query3 BCS", () => {
   });
 
   it("parses a timelock and its contract access decision", () => {
-    // Option<Metadata>=Some; owner; scheme; empty greenbox; TimeLock; canAccess=Some(true)
-    const response = `01${"00".repeat(32)}000001${u64le(1_800_000_000_000_000n)}0101`;
+    // Option<Metadata>=Some; owner; scheme; empty greenbox; TimeLock;
+    // canAccess=Some(true); receiptCollectionInitialized=false.
+    const response = `01${"00".repeat(32)}000001${u64le(1_800_000_000_000_000n)}010100`;
     expect(parseAccessPolicyQuery(response)).toEqual({ type: "timelock", lockedUntilMicros: 1_800_000_000_000_000, canAccess: true });
   });
 
   it("preserves GreenBox metadata required for protected blob decryption", () => {
-    // Option<Metadata>=Some; owner; scheme=2; greenbox=aabbcc; TimeLock; canAccess=Some(true)
-    const response = `01${"00".repeat(32)}0203aabbcc01${u64le(1_800_000_000_000_000n)}0101`;
+    // Option<Metadata>=Some; owner; scheme=2; greenbox=aabbcc; TimeLock;
+    // canAccess=Some(true); receiptCollectionInitialized=true.
+    const response = `01${"00".repeat(32)}0203aabbcc01${u64le(1_800_000_000_000_000n)}010101`;
     expect(parseAccessPolicyQuery(response)).toEqual({
       type: "timelock",
       lockedUntilMicros: 1_800_000_000_000_000,
@@ -42,11 +44,16 @@ describe("access_control query3 BCS", () => {
     });
   });
 
+  it("accepts the current Query3Result layout for a public blob", () => {
+    // metadata=None; canAccess=None; receiptCollectionInitialized=false.
+    expect(parseAccessPolicyQuery("000000")).toEqual({ type: "none", canAccess: null });
+  });
+
   it("fails closed for truncated or non-canonical BCS values", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const overlongEmptyVector = `01${"00".repeat(32)}008000000000`;
-      for (const response of ["", "00", "0001", "02", "01", "0002", "000000", overlongEmptyVector]) {
+      for (const response of ["", "00", "0001", "02", "01", "0002", "0000", "00000000", overlongEmptyVector]) {
         expect(parseAccessPolicyQuery(response)).toEqual({ type: "unknown", canAccess: null });
       }
     } finally {
@@ -63,7 +70,7 @@ describe("access_control query3 BCS", () => {
     accessControlMocks.view.mockImplementation(async ({ payload }: any) => {
       const fullName = String(payload.functionArguments[1]);
       if (fullName.endsWith("/offline.pdf")) throw new Error("temporary RPC failure");
-      return ["0000"];
+      return ["000000"];
     });
     try {
       const snapshot = await queryAccessPolicies("0xabc", ["public.pdf", "offline.pdf"]);

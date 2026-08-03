@@ -6,10 +6,19 @@ import {
   createToolBudgetFinalizationInstruction,
   createAgentHarnessState,
   executeAgentToolCalls,
+  nextRequiredObservationTools,
+  validateAgentFinalAnswer,
   type AgentFunctionCall,
-  type AgentToolDefinition,
 } from "@/utils/agentHarness";
-import type { AgentToolHandlers, AiRequest } from "@/utils/aiProvider";
+import {
+  availableAgentToolNames,
+  createMissingObservationInstruction,
+  createAgentToolRegistry,
+  requiredObservationPlan,
+  type AgentToolHandlers,
+  type AiRequest,
+} from "@/utils/agentRuntime";
+import type { AgentToolName } from "../../shared/agentTools";
 import { localize } from "@/i18n";
 
 type OpenRouterToolCall = {
@@ -44,7 +53,7 @@ const SUPPORTED_HOSTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/
 
 export class HostedAiError extends Error {
   constructor(
-    readonly kind: "rate_limit" | "unavailable" | "invalid_response",
+    readonly kind: "rate_limit" | "timeout" | "unavailable" | "invalid_response",
     message: string,
     readonly status?: number,
   ) {
@@ -123,6 +132,15 @@ function hostedGatewayFailure(
   payload: HostedGatewayPayload,
   mode: "chat" | "vision",
 ): HostedAiError {
+  if (response.status === 504 || payload.kind === "timeout") {
+    return new HostedAiError(
+      "timeout",
+      mode === "vision"
+        ? localize("Image analysis took too long. Please try again.", "Phân tích ảnh mất quá nhiều thời gian. Hãy thử lại.")
+        : localize("The AI response took too long. Please try again.", "AI phản hồi quá lâu. Hãy thử lại."),
+      response.status,
+    );
+  }
   if (response.status === 429 || payload.kind === "rate_limit") {
     return new HostedAiError(
       "rate_limit",
@@ -402,9 +420,10 @@ async function requestHostedChat(
   messages: OpenRouterMessage[],
   signal?: AbortSignal,
   toolChoice: "auto" | "none" = "auto",
+  availableTools: AgentToolName[] = [],
 ): Promise<HostedChatResponse["message"]> {
   signal?.throwIfAborted();
-  const { response, payload } = await requestHostedGateway({ messages, toolChoice }, signal);
+  const { response, payload } = await requestHostedGateway({ messages, toolChoice, availableTools }, signal);
   if (!response.ok) throw hostedGatewayFailure(response, payload, "chat");
   if (!payload.message) {
     throw new HostedAiError(
@@ -500,89 +519,87 @@ export async function streamHostedAgentAnswer(
   }
 
   const latestText = messages.at(-1)?.content?.slice(0, 1_000) ?? "";
-  const toolRegistry = new Map<string, AgentToolDefinition>([
-    ["search_user_knowledge", {
-      name: "search_user_knowledge",
-      maxExecutions: 1,
-      unavailableCode: "knowledge_search_unavailable",
-      execute: async (args, requestSignal) => {
-        const query = typeof args.query === "string" && args.query.trim()
-          ? args.query.trim().slice(0, 1_000)
-          : latestText;
-        return { ...await handlers.searchKnowledge({ query }, requestSignal) };
-      },
-    }],
-    ["get_wallet_blob_inventory", {
-      name: "get_wallet_blob_inventory",
-      maxExecutions: 2,
-      allowRepeatedSignature: true,
-      unavailableCode: "blob_inventory_unavailable",
-      execute: async (args, requestSignal) => {
-        const nameQuery = typeof args.nameQuery === "string" && args.nameQuery.trim()
-          ? args.nameQuery.trim().slice(0, 200)
-          : undefined;
-        return handlers.getWalletBlobInventory({
-          detail: args.detail === "all" || args.detail === "sample" ? args.detail : "count",
-          nameQuery,
-        }, requestSignal);
-      },
-    }],
-    ["refresh_wallet_blob_inventory", {
-      name: "refresh_wallet_blob_inventory",
-      maxExecutions: 1,
-      unavailableCode: "blob_inventory_refresh_unavailable",
-      execute: async (_args, requestSignal) => handlers.refreshWalletBlobInventory
-        ? handlers.refreshWalletBlobInventory(requestSignal)
-        : { ok: false, code: "blob_inventory_refresh_unavailable" },
-    }],
-    ["inspect_application", {
-      name: "inspect_application",
-      maxExecutions: 1,
-      unavailableCode: "application_inspection_unavailable",
-      execute: async (args, requestSignal) => {
-        const query = typeof args.query === "string" && args.query.trim()
-          ? args.query.trim().slice(0, 1_000)
-          : latestText;
-        return handlers.inspectApplication
-          ? handlers.inspectApplication({ query }, requestSignal)
-          : { ok: false, code: "application_inspection_unavailable" };
-      },
-    }],
-    ["analyze_indexed_image", {
-      name: "analyze_indexed_image",
-      maxExecutions: 1,
-      unavailableCode: "image_analysis_unavailable",
-      execute: async (args, requestSignal) => {
-        const source = typeof args.source === "string" && args.source.trim()
-          ? args.source.trim().slice(0, 200)
-          : undefined;
-        const question = typeof args.question === "string" && args.question.trim()
-          ? args.question.trim().slice(0, 1_000)
-          : latestText;
-        return handlers.analyzeIndexedImage
-          ? handlers.analyzeIndexedImage({ source, question }, requestSignal)
-          : { ok: false, code: "image_analysis_unavailable" };
-      },
-    }],
-  ]);
+  const toolRegistry = createAgentToolRegistry(handlers, latestText);
+  const availableTools = availableAgentToolNames(toolRegistry);
+  const observationPlan = requiredObservationPlan(latestText, availableTools);
 
   const harnessState = createAgentHarnessState();
   let toolRound = 0;
   let repairOnly = false;
+  const recoveredObservationStages = new Set<string>();
   while (toolRound <= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
     signal?.throwIfAborted();
     const response = await requestHostedChat(
       messages,
       signal,
       repairOnly || toolRound >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds ? "none" : "auto",
+      availableTools,
     );
     const calls = parseToolCalls(response?.tool_calls);
+    const requiredTools = nextRequiredObservationTools(harnessState, observationPlan);
+    const recoveryStageKey = requiredTools.join("|");
+    if (
+      calls.length
+      && requiredTools.length
+      && !calls.some((call) => requiredTools.some((name) => name === call.name))
+    ) {
+      if (recoveredObservationStages.has(recoveryStageKey)) {
+        throw new HostedAiError(
+          "invalid_response",
+          localize(
+            "The AI did not use the required app data for this request. Please try again.",
+            "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
+          ),
+        );
+      }
+      messages.push({
+        role: "assistant",
+        content: typeof response?.content === "string" ? response.content : null,
+        ...(Array.isArray(response?.reasoning_details) ? { reasoning_details: response.reasoning_details } : {}),
+        tool_calls: calls.map((call) => ({
+          id: call.id,
+          type: "function",
+          function: { name: call.name, arguments: JSON.stringify(call.args ?? {}) },
+        })),
+      });
+      calls.forEach((call) => messages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify({
+          ok: false,
+          code: "wrong_tool_for_required_observation",
+          message: "Choose the relevant application capability from the correction that follows.",
+        }),
+      }));
+      messages.push({ role: "user", content: createMissingObservationInstruction(requiredTools) });
+      recoveredObservationStages.add(recoveryStageKey);
+      continue;
+    }
     if (!calls.length) {
       const answer = typeof response?.content === "string" ? response.content.trim() : "";
       const finalAnswer = answer || localize(
         "There is not enough information for a confident answer.",
         "Không tìm thấy đủ thông tin để trả lời chắc chắn.",
       );
+      if (requiredTools.length) {
+        if (recoveredObservationStages.has(recoveryStageKey)) {
+          throw new HostedAiError(
+            "invalid_response",
+            localize(
+              "The AI did not use the required app data for this request. Please try again.",
+              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
+            ),
+          );
+        }
+        messages.push({
+          role: "assistant",
+          content: finalAnswer,
+          ...(Array.isArray(response?.reasoning_details) ? { reasoning_details: response.reasoning_details } : {}),
+        });
+        messages.push({ role: "user", content: createMissingObservationInstruction(requiredTools) });
+        recoveredObservationStages.add(recoveryStageKey);
+        continue;
+      }
       const repairInstruction = createFinalAnswerRepairInstruction(harnessState, finalAnswer);
       if (repairInstruction) {
         messages.push({
@@ -594,11 +611,29 @@ export async function streamHostedAgentAnswer(
         repairOnly = true;
         continue;
       }
+      if (!validateAgentFinalAnswer(harnessState, finalAnswer).valid) {
+        throw new HostedAiError(
+          "invalid_response",
+          localize(
+            "The AI could not preserve the verified app facts in its final answer. Please try again.",
+            "AI chưa giữ đúng dữ kiện đã được ứng dụng xác minh trong câu trả lời cuối. Hãy thử lại.",
+          ),
+        );
+      }
       signal?.throwIfAborted();
       onChunk(finalAnswer);
       return finalAnswer;
     }
     if (toolRound >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
+      if (requiredTools.length) {
+        throw new HostedAiError(
+          "invalid_response",
+          localize(
+            "The AI did not use the required app data for this request. Please try again.",
+            "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
+          ),
+        );
+      }
       messages.push({
         role: "assistant",
         content: typeof response?.content === "string" ? response.content : null,
@@ -618,14 +653,41 @@ export async function streamHostedAgentAnswer(
         });
       });
       messages.push({ role: "user", content: createToolBudgetFinalizationInstruction() });
-      const finalResponse = await requestHostedChat(messages, signal, "none");
-      const finalAnswer = typeof finalResponse?.content === "string" ? finalResponse.content.trim() : "";
+      const finalResponse = await requestHostedChat(messages, signal, "none", availableTools);
+      let finalAnswer = typeof finalResponse?.content === "string" ? finalResponse.content.trim() : "";
       if (!finalAnswer || parseToolCalls(finalResponse?.tool_calls).length) {
         throw new HostedAiError(
           "invalid_response",
           localize(
             "The AI could not finish this request from the available app data. Please try a more specific request.",
             "AI chưa thể hoàn tất yêu cầu từ dữ liệu ứng dụng hiện có. Hãy thử nêu yêu cầu cụ thể hơn.",
+          ),
+        );
+      }
+      let repairInstruction = createFinalAnswerRepairInstruction(harnessState, finalAnswer);
+      let finalReasoningDetails = finalResponse?.reasoning_details;
+      while (repairInstruction) {
+        messages.push({
+          role: "assistant",
+          content: finalAnswer,
+          ...(Array.isArray(finalReasoningDetails)
+            ? { reasoning_details: finalReasoningDetails }
+            : {}),
+        });
+        messages.push({ role: "user", content: repairInstruction });
+        const repaired = await requestHostedChat(messages, signal, "none", availableTools);
+        const repairedAnswer = typeof repaired?.content === "string" ? repaired.content.trim() : "";
+        if (!repairedAnswer || parseToolCalls(repaired?.tool_calls).length) break;
+        finalAnswer = repairedAnswer;
+        finalReasoningDetails = repaired?.reasoning_details;
+        repairInstruction = createFinalAnswerRepairInstruction(harnessState, finalAnswer);
+      }
+      if (!validateAgentFinalAnswer(harnessState, finalAnswer).valid) {
+        throw new HostedAiError(
+          "invalid_response",
+          localize(
+            "The AI could not preserve the verified app facts in its final answer. Please try again.",
+            "AI chưa giữ đúng dữ kiện đã được ứng dụng xác minh trong câu trả lời cuối. Hãy thử lại.",
           ),
         );
       }

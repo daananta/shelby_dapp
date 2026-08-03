@@ -1,6 +1,6 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
-import { clearActiveRagWorkspace, deactivateActiveRagOwner, exportPortableRagPackage, findExactQuoteInPages, getRagSources, getShelbyBlobInventory, hasRemoteRagProvider, importPortableRagPackage, invalidateShelbyBlobInventory, lookupExactQuote, recordSourceFailure, replaceDocument, searchDocuments, setActiveRagOwner, setRemoteRagProvider, setShelbyBlobInventory } from "@/utils/ragOrama";
+import { clearActiveRagWorkspace, deactivateActiveRagOwner, exportPortableRagPackage, findExactQuoteInPages, getRagSources, getShelbyBlobInventory, hasRemoteRagProvider, importPortableRagPackage, invalidateShelbyBlobInventory, lookupExactQuote, recordSourceFailure, recordSourceSkipped, replaceDocument, searchDocuments, setActiveRagOwner, setRemoteRagProvider, setShelbyBlobInventory } from "@/utils/ragOrama";
 import type { DocumentReplacement, PageRecord } from "@/utils/ragTypes";
 
 const quote = "Người ấy thấy Dương Bố ướt cả cho mượn cái áo thâm";
@@ -14,6 +14,43 @@ function replacement(owner: string, text = quote): DocumentReplacement {
     chunks: [{ id: `${documentId}:chunk:0`, owner, documentId, source: "sach.pdf", displayName: "sach.pdf", type: "text", text: page.rawText, normalizedText: page.normalizedText, pageNumber: 12, totalPages: 351 }],
     stories: [],
   };
+}
+
+function replacementForSource(owner: string, source: string, text: string): DocumentReplacement {
+  const value = replacement(owner, text);
+  const documentId = `${owner}:${source}`;
+  value.manifest = { ...value.manifest, id: documentId, source, displayName: source };
+  value.pages = value.pages.map((page) => ({ ...page, id: `${documentId}:page:${page.pageNumber}`, documentId, source, displayName: source }));
+  value.chunks = value.chunks.map((chunk, index) => ({ ...chunk, id: `${documentId}:chunk:${index}`, documentId, source, displayName: source }));
+  return value;
+}
+
+async function writeWorkspaceStoryFromAnotherTab(owner: string, source: string) {
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open("shelby-rag-explorer-v4", 1);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  try {
+    const transaction = db.transaction("workspace", "readwrite");
+    const store = transaction.objectStore("workspace");
+    const current = await new Promise<any>((resolve, reject) => {
+      const request = store.get(owner);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    store.put({
+      ...current,
+      stories: [{ source, number: 1, title: "Persisted in another tab", pageNumber: 12 }],
+    });
+    await new Promise<void>((resolve, reject) => {
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+  } finally {
+    db.close();
+  }
 }
 
 describe("v4 page store", () => {
@@ -78,6 +115,51 @@ describe("v4 page store", () => {
     expect(await searchDocuments("Dương Bố áo thâm", 4)).toHaveLength(0);
   });
 
+  it("keeps last-good evidence searchable when only a rebuild pipeline attempt fails", async () => {
+    const owner = "0xretry-last-good";
+    const fixture = replacement(owner);
+    fixture.manifest.revision = "100:123:public:v10:chunk-1200";
+    await setActiveRagOwner(owner);
+    await replaceDocument(fixture);
+
+    await recordSourceFailure({
+      source: "sach.pdf",
+      displayName: "sach.pdf",
+      type: "text",
+      revision: "100:123:public:v11:chunk-1200",
+    }, new Error("OCR worker crashed"));
+
+    expect(getRagSources()[0]).toMatchObject({
+      status: "indexed",
+      revision: "100:123:public:v10:chunk-1200",
+      lastAttemptRevision: "100:123:public:v11:chunk-1200",
+      lastAttemptError: "Latest processing attempt failed: OCR worker crashed",
+    });
+    expect(await searchDocuments("Dương Bố áo thâm", 4)).toHaveLength(1);
+  });
+
+  it("keeps last-good evidence when a same-content retry lacks a parser", async () => {
+    const owner = "0xretry-skipped-last-good";
+    const fixture = replacement(owner);
+    fixture.manifest.revision = "100:123:public:v10:chunk-1200";
+    await setActiveRagOwner(owner);
+    await replaceDocument(fixture);
+
+    await recordSourceSkipped({
+      source: "sach.pdf",
+      displayName: "sach.pdf",
+      type: "text",
+      revision: "100:123:public:v11:chunk-1200",
+    }, "Parser is temporarily unavailable");
+
+    expect(getRagSources()[0]).toMatchObject({
+      status: "indexed",
+      revision: "100:123:public:v10:chunk-1200",
+      lastAttemptRevision: "100:123:public:v11:chunk-1200",
+    });
+    expect(await searchDocuments("Dương Bố áo thâm", 4)).toHaveLength(1);
+  });
+
   it("retrieves lexical evidence without starting an embedding provider when the index has no vectors", async () => {
     await setActiveRagOwner("0xlexical-only");
     await replaceDocument(replacement("0xlexical-only"));
@@ -134,6 +216,18 @@ describe("v4 page store", () => {
     expect((await searchDocuments("dữ liệu ví B", 2))[0]?.excerpt).toContain("ví B");
   });
 
+  it("does not let a stale Shelby request reactivate the previous wallet", async () => {
+    await setActiveRagOwner("0xstale-owner-a");
+    await replaceDocument(replacement("0xstale-owner-a", "alpha confidential archive"));
+    await setActiveRagOwner("0xcurrent-owner-b");
+    await replaceDocument(replacement("0xcurrent-owner-b", "beta current evidence"));
+
+    expect(await setActiveRagOwner("0xstale-owner-a", () => false)).toBe(false);
+    expect(await setShelbyBlobInventory("0xstale-owner-a", ["sach.pdf"], ["sach.pdf"], [], () => false)).toBe(false);
+    expect((await searchDocuments("beta current evidence", 1))[0]?.excerpt).toContain("beta current evidence");
+    expect(await searchDocuments("alpha confidential archive", 1)).toHaveLength(0);
+  });
+
   it("serializes rapid wallet switches and keeps the last requested owner active", async () => {
     await setActiveRagOwner("0xrace-a");
     await replaceDocument(replacement("0xrace-a", "nội dung ví A"));
@@ -161,6 +255,33 @@ describe("v4 page store", () => {
     expect(getRagSources()).toMatchObject([{ source: "sach.pdf", chunks: 1, revision: "fixture-v4", indexedAt: 1 }]);
   });
 
+  it("validates the entire portable package before writing any document", async () => {
+    await setActiveRagOwner("0xpackage-atomic-source");
+    await replaceDocument(replacementForSource("0xpackage-atomic-source", "first.pdf", "first valid document"));
+    await replaceDocument(replacementForSource("0xpackage-atomic-source", "second.pdf", "second document"));
+    const portable = await exportPortableRagPackage();
+    const malformed = structuredClone(portable) as any;
+    malformed.documents[1].pages[0].rawText = 42;
+
+    await setActiveRagOwner("0xpackage-atomic-target");
+    await expect(importPortableRagPackage(malformed)).rejects.toThrow(/malformed|lỗi cấu trúc/i);
+    expect(getRagSources()).toHaveLength(0);
+  });
+
+  it("preserves a newer workspace story written by another browser tab", async () => {
+    const owner = "0xmulti-tab-story";
+    await setActiveRagOwner(owner);
+    await replaceDocument(replacementForSource(owner, "first.pdf", "first document"));
+    await writeWorkspaceStoryFromAnotherTab(owner, "first.pdf");
+
+    await replaceDocument(replacementForSource(owner, "second.pdf", "second document"));
+    await setShelbyBlobInventory(owner, ["first.pdf", "second.pdf"], ["first.pdf", "second.pdf"]);
+
+    const portable = await exportPortableRagPackage();
+    expect(portable.documents.find((document) => document.manifest.source === "first.pdf")?.stories)
+      .toMatchObject([{ source: "first.pdf", title: "Persisted in another tab" }]);
+  });
+
   it("exports deterministic bytes for the same local revision so upload can resume", async () => {
     await setActiveRagOwner("0xdeterministic-export");
     await replaceDocument(replacement("0xdeterministic-export"));
@@ -183,7 +304,7 @@ describe("v4 page store", () => {
     expect((await exportPortableRagPackage({ exportedAt: 10 })).documents).toHaveLength(0);
   });
 
-  it("fails closed during an unverified policy refresh without deleting local evidence", async () => {
+  it("keeps the last positively verified sources searchable when a full refresh is unavailable", async () => {
     await setActiveRagOwner("0xpolicy-offline");
     await replaceDocument(replacement("0xpolicy-offline"));
     await setShelbyBlobInventory("0xpolicy-offline", ["sach.pdf"], ["sach.pdf"]);
@@ -192,14 +313,34 @@ describe("v4 page store", () => {
       verified: false,
       eligibleNames: ["sach.pdf"],
     });
-    expect(await searchDocuments("Dương Bố", 2)).toHaveLength(0);
+    expect(await searchDocuments("Dương Bố", 2)).toHaveLength(1);
 
     await setActiveRagOwner("0xpolicy-offline-other-wallet");
     await setActiveRagOwner("0xpolicy-offline");
-    expect(await searchDocuments("Dương Bố", 2)).toHaveLength(0);
+    expect(await searchDocuments("Dương Bố", 2)).toHaveLength(1);
 
     await setShelbyBlobInventory("0xpolicy-offline", ["sach.pdf"], ["sach.pdf"]);
     expect(await searchDocuments("Dương Bố", 2)).toHaveLength(1);
+  });
+
+  it("fails closed only for unresolved blobs while keeping resolved public evidence available", async () => {
+    const owner = "0xpolicy-partial";
+    await setActiveRagOwner(owner);
+    await replaceDocument(replacementForSource(owner, "public.pdf", "verified public evidence"));
+    await replaceDocument(replacementForSource(owner, "offline.pdf", "unresolved private evidence"));
+    await setShelbyBlobInventory(owner, ["public.pdf", "offline.pdf"], ["public.pdf"], ["offline.pdf"]);
+
+    expect(getShelbyBlobInventory()).toMatchObject({
+      verified: false,
+      eligibleNames: ["public.pdf"],
+      unresolvedNames: ["offline.pdf"],
+    });
+    expect(getRagSources()).toHaveLength(2);
+    expect(await searchDocuments("verified public evidence", 2)).toMatchObject([{ source: "public.pdf" }]);
+    expect((await searchDocuments("unresolved private evidence", 2)).map((item) => item.source)).not.toContain("offline.pdf");
+
+    await setShelbyBlobInventory(owner, ["public.pdf", "offline.pdf"], ["public.pdf", "offline.pdf"]);
+    expect((await searchDocuments("unresolved private evidence", 2)).map((item) => item.source)).toContain("offline.pdf");
   });
 
   it("searches a Shelby snapshot on demand without restoring it to IndexedDB", async () => {

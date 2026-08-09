@@ -1,4 +1,4 @@
-import { AGENT_TOOL_NAMES, selectAgentToolSpecs } from "../../../shared/agentTools";
+import { AGENT_TOOL_NAMES, selectAgentToolSpecs } from "../../../shared/agentTools.js";
 
 type HeaderValue = string | string[] | undefined;
 type RequestLike = {

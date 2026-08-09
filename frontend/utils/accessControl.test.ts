@@ -2,13 +2,24 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const accessControlMocks = vi.hoisted(() => ({
   view: vi.fn(),
+  getFullObjectMetadata: vi.fn(),
 }));
 
 vi.mock("@/utils/aptosClient", () => ({
   aptosClient: () => ({ view: accessControlMocks.view }),
 }));
 
-import { createAccessControlBlobName, parseAccessPolicyQuery, queryAccessPolicies } from "@/utils/accessControl";
+vi.mock("@/utils/shelbyConfig", () => ({
+  getShelbyRuntime: () => ({ blobClient: { getFullObjectMetadata: accessControlMocks.getFullObjectMetadata } }),
+}));
+
+import {
+  accessPolicyQueryKey,
+  createAccessControlBlobName,
+  getAccessControlModuleAddress,
+  parseAccessPolicyQuery,
+  queryAccessPolicies,
+} from "@/utils/accessControl";
 
 function u64le(value: bigint): string {
   let result = "";
@@ -22,6 +33,15 @@ function u64le(value: bigint): string {
 describe("access_control query3 BCS", () => {
   beforeEach(() => {
     accessControlMocks.view.mockReset();
+    accessControlMocks.getFullObjectMetadata.mockReset();
+  });
+
+  it("isolates and normalizes access-policy query keys by network and wallet", () => {
+    const shelbyNet = accessPolicyQueryKey("shelbynet", "0xABC", ["b.txt", "a.txt", "a.txt"]);
+    const testnet = accessPolicyQueryKey("testnet", "0xABC", ["a.txt", "b.txt"]);
+
+    expect(shelbyNet).toEqual(["shelby", "access-policies", "shelbynet", "0xabc", ["a.txt", "b.txt"]]);
+    expect(testnet).not.toEqual(shelbyNet);
   });
 
   it("parses a timelock and its contract access decision", () => {
@@ -73,7 +93,7 @@ describe("access_control query3 BCS", () => {
       return ["000000"];
     });
     try {
-      const snapshot = await queryAccessPolicies("0xabc", ["public.pdf", "offline.pdf"]);
+      const snapshot = await queryAccessPolicies("0xabc", ["public.pdf", "offline.pdf"], undefined, "testnet");
 
       expect(snapshot.verified).toBe(false);
       expect(snapshot.unresolvedNames).toEqual(["offline.pdf"]);
@@ -82,5 +102,17 @@ describe("access_control query3 BCS", () => {
     } finally {
       warning.mockRestore();
     }
+  });
+
+  it("uses ShelbyNet object encryption without reusing the Testnet access contract", async () => {
+    expect(getAccessControlModuleAddress("shelbynet")).toBeNull();
+    accessControlMocks.getFullObjectMetadata.mockImplementation(async ({ name }: { name: string }) => ({
+      encryption: name === "public.pdf" ? "Unencrypted" : "AES_GCM_V1",
+    }));
+    const snapshot = await queryAccessPolicies("0xabc", ["public.pdf", "private.pdf"], undefined, "shelbynet");
+    expect(snapshot).toMatchObject({ verified: false, unresolvedNames: ["private.pdf"] });
+    expect(snapshot.policies.get("public.pdf")).toEqual({ type: "none", canAccess: true });
+    expect(snapshot.policies.get("private.pdf")).toEqual({ type: "unknown", canAccess: null });
+    expect(accessControlMocks.view).not.toHaveBeenCalled();
   });
 });

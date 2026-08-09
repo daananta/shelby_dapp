@@ -15,7 +15,7 @@ import {
   HardDrive,
   ScanText,
   Upload,
-  Trash2
+  Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/ui/use-toast";
@@ -23,20 +23,27 @@ import { getBlobAccessDecision, isRagSourceEligible } from "@/utils/blobAccess";
 import { embedTexts } from "@/utils/embeddingClient";
 import { buildHotRagPack, HOT_RAG_PACK_HEADER_BYTES, HotRagRuntime, hotRagManifestToPortableCatalog, isHotRagManifest, isHotRagManifestName, isHotRagPackName, isRagArtifactName, parseHotRagPackHeader, parseHotRagPackManifest, type HotRagManifest, type HotRagShardDescriptor } from "@/utils/hotRag";
 import { summarizeRagSources } from "@/utils/ragMetrics";
-import { clearActiveRagWorkspace, estimateActiveRagStorageBytes, exportPortableRagPackage, importPortableRagPackage, isPortableRagPackage, primeRemoteRagPackage, setRemoteRagProvider } from "@/utils/ragOrama";
+import { clearActiveRagWorkspace, estimateActiveRagStorageBytes, exportPortableRagPackage, hasPersistedRagWorkspace, importPortableRagPackage, isPortableRagPackage, primeRemoteRagPackage, setRemoteRagProvider } from "@/utils/ragOrama";
 import type { PortableRagPackage } from "@/utils/ragTypes";
 import { assessRemoteSnapshot, blobContentIdentity, blobPipelineRevision, needsLocalIndex } from "@/utils/ragLifecycle";
-import { rpcClient } from "@/utils/shelbyConfig";
+import { getShelbyRuntime } from "@/utils/shelbyConfig";
 import { getGeminiUsagePreferences } from "@/utils/geminiUsage";
 import { localize, useLanguage } from "@/i18n";
 import type { RegisterBlobInventoryRefresh } from "@/utils/agentCapabilities";
 import { getShelbyRefreshErrorCopy } from "@/utils/shelbyErrors";
+import { useShelbyNetwork, useShelbyNetworkOperation } from "@/network/ShelbyNetworkProvider";
+import { createShelbyWorkspaceKey, type SupportedShelbyNetwork } from "@/utils/shelbyNetwork";
 
 const isPortableRagBlobName = (name: string) => /\.shelby-rag\.json$/i.test(name);
 const LOCAL_RAG_RECOMMEND_BYTES = 8 * 1024 * 1024;
 const MAX_REMOTE_RAG_BYTES = 96 * 1024 * 1024;
 const MAX_HOT_RAG_PART_BYTES = 2 * 1024 * 1024;
 const formatStorage = (bytes: number) => bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+const artifactNetwork = (artifact: PortableRagPackage | HotRagManifest): SupportedShelbyNetwork => {
+  if (artifact.format === "shelby-rag-package" && artifact.version === 2) return artifact.sourceNetwork ?? "testnet";
+  if (artifact.format === "shelby-hot-rag-manifest" && artifact.version === 3) return artifact.sourceNetwork ?? "testnet";
+  return "testnet";
+};
 
 const merkleRootHex = (value: unknown) => {
   if (typeof value === "string") return value;
@@ -57,11 +64,15 @@ interface ShelbyExplorerProps {
 export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerProps) {
   const { language, t } = useLanguage();
   const { toast } = useToast();
+  const { network } = useShelbyNetwork();
+  const rpcClient = useMemo(() => getShelbyRuntime(network).rpcClient, [network]);
   const [activeTab, setActiveTab] = useState<"library" | "upload" | "capsule" | "config">("library");
   const [remoteSnapshot, setRemoteSnapshot] = useState<{ status: "idle" | "loading" | "ready" | "error"; packageData?: PortableRagPackage; hotManifest?: HotRagManifest; hotRuntime?: HotRagRuntime; error?: string }>({ status: "idle" });
   const [syncingRag, setSyncingRag] = useState(false);
   const [restoringRag, setRestoringRag] = useState(false);
   const [localRagBytes, setLocalRagBytes] = useState(0);
+  const [hasTestnetLocalRag, setHasTestnetLocalRag] = useState(false);
+  useShelbyNetworkOperation("rag-sync-or-restore", syncingRag || restoringRag);
 
   const {
     account,
@@ -107,8 +118,9 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
     refreshRagStatus,
     handleIndexBlobs,
   } = useRag(account, signMessage);
-  const activeOwnerRef = useRef(account?.address?.toString().toLowerCase() ?? "");
-  activeOwnerRef.current = account?.address?.toString().toLowerCase() ?? "";
+  const workspaceOwner = account ? createShelbyWorkspaceKey({ network, owner: account.address.toString() }) : "";
+  const activeOwnerRef = useRef(workspaceOwner);
+  activeOwnerRef.current = workspaceOwner;
 
   const statusBySource = new Map(ragSources.map((source) => [source.source, source]));
   const ragEligibleBlobs = blobs.filter((blob) => {
@@ -172,6 +184,19 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
   const remoteArtifactsFingerprint = blobs.filter((blob) => isRagArtifactName(getBlobName(blob))).map((blob) => `${getBlobName(blob)}:${blob.creationMicros ?? 0}:${blob.isWritten ?? false}`).sort().join("|");
 
   useEffect(() => {
+    let cancelled = false;
+    if (network !== "shelbynet" || !accountAddress) {
+      setHasTestnetLocalRag(false);
+      return;
+    }
+    const testnetOwner = createShelbyWorkspaceKey({ network: "testnet", owner: accountAddress });
+    void hasPersistedRagWorkspace(testnetOwner).then((exists) => {
+      if (!cancelled) setHasTestnetLocalRag(exists);
+    });
+    return () => { cancelled = true; };
+  }, [accountAddress, network, ragSources.length]);
+
+  useEffect(() => {
     const openConfig = () => setActiveTab("config");
     window.addEventListener("shelby:open-rag-config", openConfig);
     return () => window.removeEventListener("shelby:open-rag-config", openConfig);
@@ -203,7 +228,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
     }
     void estimateActiveRagStorageBytes().then((bytes) => { if (!cancelled) setLocalRagBytes(bytes); });
     return () => { cancelled = true; };
-  }, [accountAddress, hasLocalRag, localRagFingerprint]);
+  }, [accountAddress, hasLocalRag, localRagFingerprint, network]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -213,7 +238,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
       setRemoteRagProvider(null);
       return () => { cancelled = true; controller.abort(); };
     }
-    const providerId = `${accountAddress.toLowerCase()}:${remoteBlobName}:${remoteBlobCreation}`;
+    const providerId = `${network}:${accountAddress.toLowerCase()}:${remoteBlobName}:${remoteBlobCreation}`;
     setRemoteSnapshot({ status: "loading" });
 
     const loadBlobBytes = async (blobName: string, maxBytes: number, signal?: AbortSignal, range?: { start: number; end: number }): Promise<{ bytes: Uint8Array; bytesRead: number }> => {
@@ -296,6 +321,15 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
         if (cancelled) return;
         if (isHotRagManifest(first.value)) {
           const manifest = first.value;
+          const sourceNetwork = artifactNetwork(manifest);
+          if (sourceNetwork !== network) throw new Error(t(
+            sourceNetwork === "testnet"
+              ? "This Testnet backup is preserved, but it cannot be used until Testnet reopens."
+              : "This backup belongs to ShelbyNet and cannot be used in the current workspace.",
+            sourceNetwork === "testnet"
+              ? "Bản sao Testnet vẫn được giữ, nhưng chưa thể sử dụng đến khi Testnet mở lại."
+              : "Bản sao này thuộc ShelbyNet và không thể dùng trong workspace hiện tại.",
+          ));
           const runtime = new HotRagRuntime({
             manifest,
             loadShard: (descriptor: HotRagShardDescriptor, signal) => {
@@ -315,10 +349,10 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
               return embedding;
             },
             proofContext: {
-              // A v2 pack is one Shelby blob, so its metadata is the truthful
-              // denominator for the range-read ratio. A v1 snapshot spans
+              // A packed artifact is one Shelby blob, so its metadata is the truthful
+              // denominator for the range-read ratio. A multi-blob snapshot spans
               // several blobs and is measured from its serialized layout.
-              capsuleBytes: manifest.version === 2 && Number.isSafeInteger(Number(newestRemoteRagBlob.size))
+              capsuleBytes: manifest.shards.every((descriptor) => descriptor.byteOffset !== undefined) && Number.isSafeInteger(Number(newestRemoteRagBlob.size))
                 ? Number(newestRemoteRagBlob.size)
                 : undefined,
               manifestBytes: proofManifestBytes,
@@ -342,10 +376,23 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
         }
         if (!isPortableRagPackage(first.value)) throw new Error(localize("The Shelby backup has an unsupported format.", "Bản sao trên Shelby không đúng định dạng."));
         const packageData = first.value;
+        const sourceNetwork = artifactNetwork(packageData);
+        if (sourceNetwork !== network) throw new Error(t(
+          sourceNetwork === "testnet"
+            ? "This Testnet backup is preserved, but it cannot be used until Testnet reopens."
+            : "This backup belongs to ShelbyNet and cannot be used in the current workspace.",
+          sourceNetwork === "testnet"
+            ? "Bản sao Testnet vẫn được giữ, nhưng chưa thể sử dụng đến khi Testnet mở lại."
+            : "Bản sao này thuộc ShelbyNet và không thể dùng trong workspace hiện tại.",
+        ));
         const loadRemotePackage = async (signal?: AbortSignal) => {
           signal?.throwIfAborted();
           const loaded = await loadJsonArtifact(remoteBlobName, MAX_REMOTE_RAG_BYTES, signal);
           if (!isPortableRagPackage(loaded.value)) throw new Error(localize("The backup is not a valid Shelby RAG package.", "Bản sao không phải gói Shelby RAG hợp lệ."));
+          if (artifactNetwork(loaded.value) !== network) throw new Error(t(
+            "The backup changed and now belongs to another Shelby network.",
+            "Bản sao đã thay đổi và hiện thuộc một mạng Shelby khác.",
+          ));
           return loaded.value;
         };
         setRemoteRagProvider({ id: providerId, mode: "legacy", load: loadRemotePackage, cacheTtlMs: 60_000 });
@@ -356,7 +403,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
       }
     })();
     return () => { cancelled = true; controller.abort(); setRemoteRagProvider(null); };
-  }, [accountAddress, remoteBlobName, remoteBlobCreation, remoteArtifactsFingerprint]);
+  }, [accountAddress, network, remoteBlobName, remoteBlobCreation, remoteArtifactsFingerprint]);
 
   const handleUploadRagSnapshot = async () => {
     if (!account || !localComplete || syncingRag) return;
@@ -408,16 +455,15 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
   };
 
   const handleRestoreRemoteRag = async () => {
-    if (!newestRemoteRagBlob) return;
-    if (!remoteSnapshot.hotRuntime) {
-      await handleIndexBlobs([newestRemoteRagBlob], { force: true });
-      return;
-    }
-    const restoreOwner = account?.address?.toString().toLowerCase() ?? "";
+    if (!newestRemoteRagBlob || remoteSnapshot.status !== "ready") return;
+    const restoreOwner = workspaceOwner;
     if (!restoreOwner) return;
     try {
       setRestoringRag(true);
-      const packageData = await remoteSnapshot.hotRuntime.reconstruct();
+      const packageData = remoteSnapshot.hotRuntime
+        ? await remoteSnapshot.hotRuntime.reconstruct()
+        : remoteSnapshot.packageData;
+      if (!packageData) throw new Error(t("The Shelby backup is not ready yet.", "Bản sao trên Shelby chưa sẵn sàng."));
       if (activeOwnerRef.current !== restoreOwner) throw new DOMException(t("The wallet changed, so saving RAG to this device was stopped.", "Ví đã thay đổi; dừng lưu RAG về máy."), "AbortError");
       const imported = await importPortableRagPackage(packageData, restoreOwner);
       await refreshRagStatus();
@@ -431,11 +477,11 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
 
   const handleReleaseLocalRag = async () => {
     if (!hasLocalRag || !window.confirm(t("Remove all RAG data from this device? Original blobs and the Shelby backup will not be deleted.", "Giải phóng toàn bộ RAG trên thiết bị này? Blob gốc và bản sao trên Shelby không bị xoá."))) return;
-    const releaseOwner = accountAddress.toLowerCase();
+    const releaseOwner = workspaceOwner;
     const cleared = await clearActiveRagWorkspace(releaseOwner);
     if (!cleared || activeOwnerRef.current !== releaseOwner) return;
     if (accountAddress) {
-      try { localStorage.removeItem(`shelby-rag-explorer.chat-v1:${accountAddress.toLowerCase()}`); } catch { /* local cleanup is best-effort */ }
+      try { localStorage.removeItem(`shelby-rag-explorer.chat-v1:${workspaceOwner}`); } catch { /* local cleanup is best-effort */ }
     }
     window.dispatchEvent(new Event("shelby:clear-chat"));
     await refreshRagStatus();
@@ -444,6 +490,8 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
 
   const lifecycleTitle = loadErrorCopy
     ? loadErrorCopy.title
+    : !hasLocalRag && hasTestnetLocalRag
+      ? t("Your on-device knowledge base is on Shelby Testnet", "Kho trên thiết bị đang ở Shelby Testnet")
     : remoteSnapshot.status === "loading"
       ? t("Checking the Shelby knowledge base…", "Đang kiểm tra kho tri thức trên Shelby…")
     : !hasLocalRag && hasRemoteRag
@@ -465,6 +513,8 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
   const pendingPreview = pendingLocalBlobs.slice(0, 3).map((blob) => getBlobName(blob)).join(", ");
   const lifecycleDescription = loadErrorCopy
     ? loadErrorCopy.description
+    : !hasLocalRag && hasTestnetLocalRag
+      ? t("This Testnet knowledge base is preserved in this browser and will be available when the network reopens.", "Kho Testnet này vẫn được giữ trong trình duyệt và sẽ dùng lại được khi mạng mở lại.")
     : remoteSnapshot.status === "error"
       ? t("The Shelby backup could not be read. Refresh the page or try again later.", "Không đọc được bản sao trên Shelby. Hãy làm mới trang hoặc thử lại sau.")
     : !hasLocalRag && hasRemoteRag
@@ -543,6 +593,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
                 </div>
               </div>
               <div className="flex shrink-0 flex-wrap gap-2 sm:justify-end">
+                {!hasLocalRag && hasTestnetLocalRag && <span className="inline-flex h-8 items-center rounded-lg border border-amber-200 bg-amber-50 px-3 text-[11px] font-bold text-amber-800 dark:border-amber-300/15 dark:bg-amber-300/[0.06] dark:text-amber-200">{t("Testnet data preserved", "Đã giữ dữ liệu Testnet")}</span>}
                 {!hasLocalRag && hasRemoteRag && <Button size="sm" disabled={indexingAll || restoringRag || remoteSnapshot.status === "loading"} className="h-8 rounded-lg bg-slate-950 px-3.5 text-[11px] font-extrabold text-white shadow-sm hover:bg-slate-800 transition-all hover:-translate-y-0.5 dark:bg-white dark:text-slate-950 dark:hover:bg-slate-200" onClick={() => void handleRestoreRemoteRag()}><Cloud className="mr-1.5 h-3.5 w-3.5" />{restoringRag ? t("Saving to device…", "Đang lưu về máy…") : t("Save to device (optional)", "Lưu về máy (tuỳ chọn)")}</Button>}
                 {pendingLocalBlobs.length > 0 && <Button size="sm" className="h-8 rounded-lg bg-[#172019] px-3.5 text-[11px] font-bold text-[#c5fb7e] shadow-sm hover:-translate-y-0.5 transition-all hover:bg-[#263029] dark:bg-lime-300 dark:text-slate-950" onClick={() => void handleIndexBlobs(pendingLocalBlobs)}><ScanText className="mr-1.5 h-3.5 w-3.5" />{t("Build RAG", "Tạo RAG")}</Button>}
                 <Button size="sm" disabled={!needsRemoteUpload || syncingRag || uploading} className="h-8 rounded-lg bg-[#172019] px-3.5 text-[11px] font-bold text-[#c5fb7e] shadow-sm hover:-translate-y-0.5 transition-all hover:bg-[#263029] disabled:bg-transparent disabled:text-slate-400 disabled:hover:translate-y-0 dark:bg-lime-300 dark:text-slate-950 dark:disabled:bg-transparent dark:disabled:text-slate-600" onClick={() => void handleUploadRagSnapshot()}><Upload className="mr-1.5 h-3.5 w-3.5" />{syncingRag || uploading ? t("Saving…", "Đang lưu…") : !hasLocalRag || pendingLocalBlobs.length ? t("Sync", "Đồng bộ") : remoteFresh ? t("Synced", "Đã đồng bộ") : t("Save backup to Shelby", "Lưu bản sao lên Shelby")}</Button>

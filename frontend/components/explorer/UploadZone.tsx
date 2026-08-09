@@ -30,6 +30,7 @@ export function UploadZone({
     registering: t("Registering the file on Aptos", "Đang đăng ký tệp trên Aptos"),
     confirming: t("Confirming the transaction", "Đang xác nhận giao dịch"),
     uploading: t("Uploading content to Shelby", "Đang tải nội dung lên Shelby"),
+    committing: t("Finalizing this blob", "Đang hoàn tất blob này"),
     done: t("Complete", "Hoàn tất"),
   } as const)[uploadProgress.phase] : "";
 
@@ -151,6 +152,12 @@ export function UploadZone({
               </div>
             ))}
           </div>
+          <p className="mt-2.5 rounded-lg border border-amber-200/70 bg-amber-50/70 px-2.5 py-2 text-[11px] leading-5 text-amber-900 dark:border-amber-300/10 dark:bg-amber-300/[0.05] dark:text-amber-100">
+            {t(
+              `Your wallet will ask once to register this batch, then once per new blob to finalize it (${selectedFiles.length + 1} signatures at most).`,
+              `Ví sẽ yêu cầu ký 1 lần để đăng ký cả lượt, sau đó 1 lần cho mỗi blob mới để hoàn tất (tối đa ${selectedFiles.length + 1} chữ ký).`,
+            )}
+          </p>
         </div>
       )}
 

@@ -1,17 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  getBlobMetadata: vi.fn(),
+  getFullObjectMetadata: vi.fn(),
   generateCommitments: vi.fn(),
 }));
 
 vi.mock("@/utils/shelbyConfig", () => ({
-  blobClient: { getBlobMetadata: mocks.getBlobMetadata },
-  getShelbyBlobUrl: (_owner: string, name: string) => `https://api.testnet.shelby.xyz/${name}`,
+  getShelbyRuntime: () => ({ blobClient: { getFullObjectMetadata: mocks.getFullObjectMetadata } }),
+  getShelbyBlobUrl: (_owner: string, name: string) => `https://api.shelbynet.shelby.xyz/${name}`,
 }));
 
 vi.mock("@/utils/geomiClientKey", () => ({
-  SHELBY_CLIENT_API_KEY: "AG-test-client",
+  getShelbyClientKeyResult: () => ({ key: "AG-test-client", issue: null }),
 }));
 
 vi.mock("@/utils/shelbyErasure", () => ({
@@ -35,7 +35,7 @@ afterEach(() => {
 
 describe("Answer Receipt Shelby authentication", () => {
   it("uses the configured public client key when rereading registered source bytes", async () => {
-    mocks.getBlobMetadata.mockResolvedValue({
+    mocks.getFullObjectMetadata.mockResolvedValue({
       blobMerkleRoot: ROOT,
       expirationMicros: Date.now() * 1_000 + 60_000_000,
       isDeleted: false,
@@ -66,6 +66,7 @@ describe("Answer Receipt Shelby authentication", () => {
       excerpt: "An indexed image description.",
       score: 0.9,
       provenance: {
+        network: "shelbynet",
         owner: "0x1",
         accessTag: "public",
         blobMerkleRoot: ROOT,
@@ -78,6 +79,7 @@ describe("Answer Receipt Shelby authentication", () => {
     };
 
     const receipt = await createAnswerReceipt({
+      network: "shelbynet",
       wallet: "0x1",
       question: "What is visible?",
       answer: "An indexed image [S1].",

@@ -31,7 +31,8 @@ function document(source: string, keyword: string, index: number): PortableRagDo
 function fixture(): PortableRagPackage {
   return {
     format: "shelby-rag-package",
-    version: 1,
+    version: 2,
+    sourceNetwork: "shelbynet",
     exportedAt: 1_700_000_123_456,
     sourceOwner: "0xhot-source",
     inventory: { names: ["alpha.txt", "beta.txt", "orion.txt", "delta.txt"], fetchedAt: 1_700_000_123_000 },
@@ -47,7 +48,8 @@ describe("Shelby Hot RAG snapshots", () => {
     const manifest = parseHotRagPackManifest(pack.bytes.slice(header.manifestStart, header.payloadStart));
 
     expect(isHotRagManifest(manifest)).toBe(true);
-    expect(manifest.version).toBe(2);
+    expect(manifest.version).toBe(3);
+    expect(manifest.sourceNetwork).toBe("shelbynet");
     expect(pack.parts.length).toBeGreaterThan(1);
     expect(manifest.totals.chunks).toBe(4);
     expect(new Set(manifest.shards.map((descriptor) => descriptor.blobName))).toEqual(new Set([pack.blobName]));
@@ -99,6 +101,7 @@ describe("Shelby Hot RAG snapshots", () => {
     expect(loadedRanges.reduce((sum, [start, end]) => sum + end - start + 1, 0)).toBeLessThan(pack.bytes.byteLength);
 
     const restored = await runtime.reconstruct();
+    expect(restored).toMatchObject({ version: 2, sourceNetwork: "shelbynet" });
     expect(restored.documents).toHaveLength(4);
     expect(restored.documents.reduce((sum, item) => sum + item.chunks.length, 0)).toBe(4);
   });

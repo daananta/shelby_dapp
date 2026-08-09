@@ -8,6 +8,7 @@ that can use retrieved evidence when a question requires it.
 ## Highlights
 
 - Lists blobs owned by the connected Aptos wallet.
+- Runs on ShelbyNet while preserving isolated Testnet workspaces for the network's future reopening.
 - Verifies access policy before downloading content for indexing.
 - Detects supported file formats locally, extracts document text in the browser,
   and uses optional cloud analysis for image and video content.
@@ -65,10 +66,13 @@ The most relevant environment variables are:
 
 | Variable | Scope | Purpose |
 | --- | --- | --- |
-| `VITE_APP_NETWORK` | Browser | Shelby and Aptos network |
-| `VITE_SHELBY_CLIENT_API_KEY` | Browser | Origin-restricted Geomi client key |
-| `VITE_SHELBY_BLOB_API_URL` | Browser | Shelby blob endpoint |
-| `VITE_ACCESS_CONTROL_MODULE_ADDRESS` | Browser | Access-policy module |
+| `VITE_DEFAULT_SHELBY_NETWORK` | Browser | First-visit network (`shelbynet` by default) |
+| `VITE_SHELBYNET_CLIENT_API_KEY` | Browser | ShelbyNet origin-restricted Geomi client key |
+| `VITE_TESTNET_CLIENT_API_KEY` | Browser | Reserved Testnet key; dormant while Testnet is unavailable |
+| `VITE_SHELBYNET_BLOB_API_URL` | Browser | ShelbyNet blob endpoint |
+| `VITE_TESTNET_BLOB_API_URL` | Browser | Reserved Testnet endpoint; not contacted in this release |
+| `VITE_SHELBYNET_ACCESS_CONTROL_MODULE_ADDRESS` | Browser | Optional ShelbyNet access-policy module |
+| `VITE_TESTNET_ACCESS_CONTROL_MODULE_ADDRESS` | Browser | Testnet access-policy module |
 | `VITE_RAG_PIPELINE_API_URL` | Browser | Optional hosted embedding endpoint |
 | `OPENROUTER_API_KEY` | Server | Default AI gateway credential |
 | `GEMINI_API_KEY` | Server | Optional hosted embedding credential |
@@ -83,7 +87,7 @@ See [.env.example](.env.example) for the complete template and
   `VITE_*` variable.
 - User-provided Gemini keys are stored in `sessionStorage`, are not written to a
   RAG snapshot, and are not uploaded to Shelby.
-- Local indexes and chat history are isolated by wallet address.
+- Local indexes, chat history, remote caches, and upload journals are isolated by network and wallet address.
 - Unknown or unverifiable access policies fail closed.
 - Access metadata does not encrypt raw blob bytes; sensitive content still
   requires end-to-end encryption.

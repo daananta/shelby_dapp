@@ -1,7 +1,7 @@
 import type { AppLanguage } from "@/i18n";
 import type { GeomiClientKeyIssue } from "@/utils/geomiClientKey";
 
-export type ShelbyServiceErrorKind = "configuration" | "authentication" | "rate_limit" | "network" | "unknown";
+export type ShelbyServiceErrorKind = "configuration" | "authentication" | "rate_limit" | "server" | "network" | "unknown";
 
 export class ShelbyClientConfigurationError extends Error {
   constructor(readonly issue: Exclude<GeomiClientKeyIssue, null>) {
@@ -24,8 +24,15 @@ export function classifyShelbyServiceError(error: unknown): ShelbyServiceErrorKi
   const message = raw.toLowerCase();
   if (status === 429 || /\b429\b|rate.?limit|too many requests/.test(message)) return "rate_limit";
   if (status === 401 || status === 403 || /unauthorized|anonymous requests are not allowed|authentication|authorization.*bearer/.test(message)) return "authentication";
+  if ((status !== undefined && status >= 500 && status <= 599) || /(?:^|\D)5\d{2}(?:\D|$)/.test(message)) return "server";
   if (/failed to fetch|network|load failed|fetch failed|timeout|timed out/.test(message)) return "network";
   return "unknown";
+}
+
+/** Inventory retries only transient transport failures and upstream 5xx responses. */
+export function isRetriableShelbyServiceError(error: unknown): boolean {
+  const kind = classifyShelbyServiceError(error);
+  return kind === "network" || kind === "server";
 }
 
 export function getShelbyRefreshErrorCopy(kind: ShelbyServiceErrorKind, language: AppLanguage) {
@@ -58,6 +65,16 @@ export function getShelbyRefreshErrorCopy(kind: ShelbyServiceErrorKind, language
       vi: {
         title: "Shelby đang bận",
         description: "Đã có quá nhiều yêu cầu. Hãy chờ một lúc rồi làm mới; dữ liệu hiện có của bạn không bị thay đổi.",
+      },
+    },
+    server: {
+      en: {
+        title: "Shelby is temporarily unavailable",
+        description: "The Shelby service returned an error. Wait a moment, then refresh; your existing data is unchanged.",
+      },
+      vi: {
+        title: "Shelby tạm thời chưa khả dụng",
+        description: "Dịch vụ Shelby đang trả về lỗi. Hãy chờ một lúc rồi làm mới; dữ liệu hiện có của bạn không bị thay đổi.",
       },
     },
     network: {

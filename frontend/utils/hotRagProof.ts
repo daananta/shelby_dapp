@@ -1,5 +1,5 @@
 export interface HotRagProofManifest {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   snapshotId: string;
   shards: Array<{
     index: number;
@@ -107,8 +107,9 @@ export function createHotRagCapsuleLayout(
   manifest: HotRagProofManifest,
   context: Pick<HotRagProofContext, "capsuleBytes" | "manifestBytes"> = {},
 ): HotRagCapsuleLayout {
-  const container = manifest.version === 2 ? "single_blob_pack" : "multi_blob_snapshot";
-  const headerBytes = manifest.version === 2 ? 16 : 0;
+  const isPacked = manifest.shards.every((shard) => shard.byteOffset !== undefined);
+  const container = isPacked ? "single_blob_pack" : "multi_blob_snapshot";
+  const headerBytes = isPacked ? 16 : 0;
   const manifestBytes = nonNegativeInteger(context.manifestBytes)
     ? context.manifestBytes
     : encoder.encode(JSON.stringify(manifest)).byteLength;

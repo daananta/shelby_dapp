@@ -13,6 +13,9 @@ import {
   type BlobInventoryRefreshCapability,
   type RegisterBlobInventoryRefresh,
 } from "@/utils/agentCapabilities";
+import { useShelbyNetwork } from "@/network/ShelbyNetworkProvider";
+import { useWalletNetworkReady } from "@/hooks/useWalletNetworkReady";
+import { createShelbyWorkspaceKey } from "@/utils/shelbyNetwork";
 
 // Lazy-loaded heavy components
 const ShelbyExplorer = lazy(() => import("@/components/ShelbyExplorer").then((module) => ({ default: module.ShelbyExplorer })));
@@ -25,9 +28,12 @@ interface AppProps {
 function App({ onOpenDemo }: AppProps) {
   const { t } = useLanguage();
   const { connected: realConnected, account } = useWallet();
+  const { network } = useShelbyNetwork();
+  const walletNetworkReady = useWalletNetworkReady();
   const isTestMode = isE2EWalletConnected();
-  const connected = isTestMode ? true : realConnected;
-  const readinessOwner = isMockWorkspace() ? "mock-workspace" : isTestMode ? "e2e-remote-error" : account?.address.toString().toLowerCase() ?? "";
+  const connected = isTestMode ? true : realConnected && walletNetworkReady;
+  const rawOwner = isMockWorkspace() ? "mock-workspace" : isTestMode ? "e2e-remote-error" : account?.address.toString().toLowerCase() ?? "";
+  const readinessOwner = rawOwner ? createShelbyWorkspaceKey({ network, owner: rawOwner }) : "";
   const [mobileView, setMobileView] = useState<"library" | "chat">("library");
   const [productTourOpen, setProductTourOpen] = useState(false);
   const [tourReadiness, setTourReadiness] = useState<ProductTourReadiness>({ walletConnected: connected });

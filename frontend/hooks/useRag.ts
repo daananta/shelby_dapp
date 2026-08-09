@@ -16,6 +16,8 @@ import { getCloudErrorKind } from "@/utils/aiProvider";
 import { useGeminiUsage } from "@/hooks/useGeminiUsage";
 import { localize } from "@/i18n";
 import type { RagIndexLog, RagIndexProgress, RagIndexStage } from "@/utils/ragProgress";
+import { useShelbyNetwork, useShelbyNetworkOperation } from "@/network/ShelbyNetworkProvider";
+import { createShelbyWorkspaceKey } from "@/utils/shelbyNetwork";
 
 const RAG_OPTIONS_STORAGE_KEY = "shelby-rag-explorer.rag-options-v1";
 
@@ -38,11 +40,13 @@ function loadRagOptions() {
 
 export function useRag(account: any, signMessage: any) {
   const { toast } = useToast();
+  const { network } = useShelbyNetwork();
   const { preferences: geminiUsage } = useGeminiUsage();
   const [ragSources, setRagSources] = useState<RagSource[]>([]);
   const [indexingAll, setIndexingAll] = useState(false);
   const [indexProgress, setIndexProgress] = useState<RagIndexProgress | null>(null);
   const [indexLogs, setIndexLogs] = useState<RagIndexLog[]>([]);
+  useShelbyNetworkOperation("rag-indexing", indexingAll);
 
   const options = loadRagOptions();
   const [fullPdfOcr, setFullPdfOcr] = useState(options.fullPdfOcr);
@@ -53,7 +57,8 @@ export function useRag(account: any, signMessage: any) {
   const indexControllerRef = useRef<AbortController | null>(null);
   const indexGenerationRef = useRef(0);
   const semanticUnavailableRef = useRef(false);
-  const ownerKey = account?.address?.toString().toLowerCase() ?? "";
+  const ownerAddress = account?.address?.toString().toLowerCase() ?? "";
+  const ownerKey = ownerAddress ? createShelbyWorkspaceKey({ network, owner: ownerAddress }) : "";
   const ownerKeyRef = useRef(ownerKey);
   ownerKeyRef.current = ownerKey;
   const MAX_INDEX_FILE_BYTES = 25 * 1024 * 1024;
@@ -142,9 +147,10 @@ export function useRag(account: any, signMessage: any) {
   };
 
   const handleIndexBlobs = async (targetBlobs: any[], options: { force?: boolean } = {}) => {
-    if (!account || !ownerKey) return;
+    if (!account || !ownerKey || !ownerAddress) return;
     const runOwner = ownerKey;
-    const eligibleTargets = targetBlobs.filter((blob) => isRagSourceEligible(blob, runOwner));
+    const runAddress = ownerAddress;
+    const eligibleTargets = targetBlobs.filter((blob) => isRagSourceEligible(blob, runAddress));
     if (!eligibleTargets.length) {
       toast({
         title: localize("No eligible blobs to process", "Không có blob phù hợp để tạo RAG"),
@@ -199,8 +205,8 @@ export function useRag(account: any, signMessage: any) {
         }
         const b = eligibleTargets[i];
         const blobName = getBlobName(b);
-        const ownerAddress = runOwner;
-        const publicUrl = getShelbyBlobUrl(ownerAddress, blobName);
+        const sourceOwnerAddress = runAddress;
+        const publicUrl = getShelbyBlobUrl(sourceOwnerAddress, blobName, network);
         const displayName = getDisplayName(blobName, b);
 
         const setStage = (detail: string, stage: RagIndexStage) => {
@@ -212,9 +218,9 @@ export function useRag(account: any, signMessage: any) {
         setStage(localize("Checking access", "Kiểm tra quyền truy cập"), "access");
 
         try {
-          const access = getBlobAccessDecision(b, ownerAddress);
+          const access = getBlobAccessDecision(b, sourceOwnerAddress);
           const revision = blobPipelineRevision(b, access.info.tag, activePipelineRevision);
-          if (!isRagSourceEligible(b, ownerAddress)) {
+          if (!isRagSourceEligible(b, sourceOwnerAddress)) {
             await recordSourceSkipped(
               { source: blobName, displayName, blobUrl: access.info.tag === "public" ? publicUrl : undefined, type: sourceType(blobName), revision },
               access.reason ?? localize("This blob is not eligible for RAG.", "Blob không đủ điều kiện để tạo RAG."),
@@ -275,7 +281,7 @@ export function useRag(account: any, signMessage: any) {
               : localize("Downloading blob", "Tải blob"),
             "download",
           );
-          const downloaded = await downloadBlobForRag({ owner: ownerAddress, blobName, blob: b, walletAddress: ownerAddress, signMessage, signal: controller.signal });
+          const downloaded = await downloadBlobForRag({ owner: sourceOwnerAddress, blobName, blob: b, walletAddress: sourceOwnerAddress, signMessage, signal: controller.signal, network });
           throwIfStale();
           const url = downloaded.url;
 
@@ -470,7 +476,7 @@ export function useRag(account: any, signMessage: any) {
             break;
           }
           failed += 1;
-          const failedAccess = getBlobAccessDecision(b, ownerAddress);
+          const failedAccess = getBlobAccessDecision(b, sourceOwnerAddress);
           await recordSourceFailure({ source: blobName, displayName, blobUrl: failedAccess.info.tag === "public" ? publicUrl : undefined, type: sourceType(blobName), revision: blobPipelineRevision(b, failedAccess.info.tag, activePipelineRevision) }, err, runOwner);
           toast({
             title: localize(`Could not process ${displayName}`, `Không thể nạp ${displayName}`),

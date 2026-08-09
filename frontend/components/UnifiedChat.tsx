@@ -23,6 +23,8 @@ import type { HotRagProofSnapshot } from "@/utils/hotRagProof";
 import { normalizeGeminiApiKey } from "@/utils/geminiApiKey";
 import { useLanguage } from "@/i18n";
 import type { BlobInventoryRefreshCapability } from "@/utils/agentCapabilities";
+import { useShelbyNetwork } from "@/network/ShelbyNetworkProvider";
+import { createShelbyWorkspaceKey } from "@/utils/shelbyNetwork";
 const MOCK_ACCOUNT = { address: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef" };
 
 const shortProof = (value: string | undefined, unavailable: string) => value ? (value.length > 24 ? `${value.slice(0, 12)}…${value.slice(-8)}` : value) : unavailable;
@@ -34,6 +36,7 @@ interface UnifiedChatProps {
 
 export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
   const { language, t } = useLanguage();
+  const { network } = useShelbyNetwork();
   const unavailable = t("Unavailable", "Chưa có");
   const accessLabel = (value?: NonNullable<RetrievalResult["provenance"]>["accessTag"]) => ({
     public: t("Public", "Công khai"),
@@ -63,7 +66,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
   const account = isE2EWalletConnected()
     ? MOCK_ACCOUNT
     : realAccount;
-  const ownerKey = account?.address.toString().toLowerCase() ?? "disconnected";
+  const ownerKey = createShelbyWorkspaceKey({ network, owner: account?.address.toString() ?? "disconnected" });
   const { query, setQuery, messages, setMessages, loading, status, setStatus, beginRequest, isRequestCurrent, finishRequest, abortRequest, clearMessages } = useChatManager(ownerKey);
   const [cloudApiKey, setCloudApiKey] = useState("");
   const [cloudKeyState, setCloudKeyState] = useState<"empty" | "checking" | "ready" | "limited" | "unverified" | "invalid">("empty");
@@ -211,9 +214,9 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
   }, []);
 
   useEffect(() => {
-    const effectOwner = account?.address.toString().toLowerCase() ?? "";
+    const effectOwner = account ? ownerKey : "";
     const refresh = async () => {
-      if (account) await setActiveRagOwner(account.address.toString());
+      if (account) await setActiveRagOwner(ownerKey);
       const hasLocal = getRagSources().some((source) => source.status === "indexed");
       setRagReady(hasLocal || hasRemoteRagProvider());
       setRagMode(hasLocal ? "local" : isHotRemoteRagProvider() ? "hot" : "none");
@@ -224,7 +227,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       window.removeEventListener("shelby:rag-state", refresh);
       if (effectOwner) void deactivateActiveRagOwner(effectOwner);
     };
-  }, [account]);
+  }, [account, ownerKey]);
 
   const saveCloudKey = async () => {
     const candidate = normalizeGeminiApiKey(cloudApiKey);
@@ -316,7 +319,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
     window.addEventListener("shelby:hot-rag-read", captureHotReadProof);
     try {
       setStatus("");
-      if (account) await setActiveRagOwner(account.address.toString());
+      if (account) await setActiveRagOwner(ownerKey);
       assertRequestCurrent();
       const recentImageMessage = [...messages.slice(-4)].reverse().find((message) => (
         message.role === "ai"
@@ -398,7 +401,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             const result = await readConnectedWallet(
               detail,
               account?.address.toString(),
-              { language },
+              { language, network },
               activeSignal,
             );
             activeSignal.throwIfAborted();
@@ -425,6 +428,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
             const toolContext = {
               preferredSources: preferredImageSources,
               language,
+              network,
             };
             let result = await runChatTool(applicationQuery, account?.address.toString(), toolContext, activeSignal);
             if (
@@ -615,6 +619,7 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
     setStatus(t("Creating Answer Receipt…", "Đang tạo Phiếu kiểm chứng…"));
     try {
       const receipt = await createAnswerReceipt({
+        network,
         wallet: account.address.toString(),
         question,
         answer: message.text,

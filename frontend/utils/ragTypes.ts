@@ -1,3 +1,5 @@
+import type { SupportedShelbyNetwork } from "@/utils/shelbyNetwork";
+
 export type MetadataProvenance = "user" | "cloud_vision" | "local_ocr" | "pdf_metadata" | "filename" | "heuristic";
 
 export interface MetadataValue {
@@ -92,6 +94,7 @@ export interface RetrievalResult {
   link?: string;
   imageUrl?: string;
   provenance?: {
+    network?: SupportedShelbyNetwork;
     owner: string;
     accessTag?: DocumentManifest["accessTag"];
     blobId?: string;
@@ -134,7 +137,9 @@ export interface AnswerReceiptSource {
 
 export interface AnswerReceipt {
   format: "shelby-answer-receipt";
-  version: 1;
+  version: 1 | 2;
+  /** Required for v2; absent v1 receipts are interpreted as legacy Testnet. */
+  network?: SupportedShelbyNetwork;
   id: string;
   createdAt: number;
   wallet: string;
@@ -176,7 +181,9 @@ export interface PortableRagDocument {
 /** A portable, unencrypted RAG backup. New snapshots may include embeddings for hot retrieval. */
 export interface PortableRagPackage {
   format: "shelby-rag-package";
-  version: 1;
+  version: 1 | 2;
+  /** Required for v2; v1 packages are legacy Testnet artifacts. */
+  sourceNetwork?: SupportedShelbyNetwork;
   exportedAt: number;
   sourceOwner: string;
   /** Shelby inventory observed when this snapshot was created. */

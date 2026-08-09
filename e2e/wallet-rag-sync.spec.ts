@@ -592,7 +592,7 @@ test("lets Qwen choose runtime vision for a follow-up while RAG image processing
   const indexedImages = await page.evaluate(async () => {
     // @ts-expect-error Vite serves this browser-only module during E2E.
     const rag = await import("/frontend/utils/ragOrama.ts");
-    const owner = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    const owner = "shelbynet:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     const source = "anime2.jpeg";
     const documentId = `${owner}:${source}`;
     const imageUrl = `${window.location.origin}/runtime-vision-anime.gif`;

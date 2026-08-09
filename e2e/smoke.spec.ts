@@ -15,9 +15,12 @@ test("renders the Shelby product without boilerplate copy", async ({ page }) => 
 });
 
 test("loads the wallet runtime only after the visitor asks to connect", async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
   await page.goto("/");
   await expect(page.getByTestId("wallet-runtime")).toHaveCount(0);
   await page.getByRole("button", { name: "Connect wallet to start", exact: true }).first().click();
+  await expect.poll(() => pageErrors).toEqual([]);
   await expect(page.getByTestId("wallet-runtime")).toBeVisible();
 });
 
@@ -66,4 +69,18 @@ test("keeps the bilingual landing page readable at 320px", async ({ page }) => {
 
   expect(layout.hasHorizontalOverflow).toBe(false);
   expect(layout.quoteCardRight).toBeLessThanOrEqual(layout.viewportWidth);
+});
+
+test("defaults to ShelbyNet and preserves dormant Testnet data without enabling the network", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("shelby-rag-explorer.network-v1", "testnet");
+    localStorage.setItem("shelby-rag-explorer.testnet-preservation-proof", "keep-me");
+  });
+  await page.goto("/");
+  const selector = page.getByLabel("Shelby network").first();
+  await expect(selector).toHaveValue("shelbynet");
+  await expect(page.getByText("ShelbyNet is a developer network; its data may be reset.", { exact: true })).toBeVisible();
+  expect(await selector.getByRole("option", { name: "Shelby Testnet · Temporarily unavailable" }).evaluate((option) => (option as HTMLOptionElement).disabled)).toBe(true);
+  expect(await page.evaluate(() => localStorage.getItem("shelby-rag-explorer.network-v1"))).toBe("shelbynet");
+  expect(await page.evaluate(() => localStorage.getItem("shelby-rag-explorer.testnet-preservation-proof"))).toBe("keep-me");
 });

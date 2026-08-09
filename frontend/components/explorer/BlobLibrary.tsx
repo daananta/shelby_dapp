@@ -15,8 +15,10 @@ import {
   Check,
   Gauge,
   BrainCircuit,
-  CloudOff
+  CloudOff,
+  Info,
 } from "lucide-react";
+import { useFullObjectMetadata } from "@shelby-protocol/react";
 import { getBlobAccessDecision, isRagSourceEligible } from "@/utils/blobAccess";
 import { getShelbyBlobUrl } from "@/utils/shelbyConfig";
 import { updateUserDocumentMetadata, type RagSource } from "@/utils/ragOrama";
@@ -26,6 +28,40 @@ import { estimateRagGeminiCalls } from "@/utils/ragCallEstimate";
 import type { EmbeddingProvider } from "@/utils/embeddingClient";
 import { useLanguage } from "@/i18n";
 import { getShelbyRefreshErrorCopy, type ShelbyServiceErrorKind } from "@/utils/shelbyErrors";
+import { useShelbyNetwork } from "@/network/ShelbyNetworkProvider";
+import { getShelbyRuntime } from "@/utils/shelbyConfig";
+import { bytesToHex } from "@/utils/contentIntegrity";
+import { isBlockingGeomiClientKeyIssue } from "@/utils/geomiClientKey";
+
+function BlobMetadataDetail({ account, blobName }: { account: string; blobName: string }) {
+  const { network } = useShelbyNetwork();
+  const { t } = useLanguage();
+  const runtime = getShelbyRuntime(network);
+  const clientKeyBlocksRequests = isBlockingGeomiClientKeyIssue(runtime.clientKeyIssue);
+  const metadata = useFullObjectMetadata({
+    client: runtime.client,
+    account,
+    name: blobName,
+    enabled: Boolean(account && blobName && !clientKeyBlocksRequests),
+    staleTime: 10_000,
+    retry: false,
+  });
+
+  if (clientKeyBlocksRequests) return <p className="w-full rounded-lg bg-amber-50 px-3 py-2 text-[10px] text-amber-800 dark:bg-amber-300/[0.06] dark:text-amber-200">{t("The configured Shelby client key is not safe for a browser app.", "Client key Shelby đã cấu hình không an toàn cho ứng dụng trình duyệt.")}</p>;
+  if (metadata.isPending) return <p className="w-full px-3 py-2 text-[10px] text-slate-400">{t("Checking on-chain metadata…", "Đang kiểm tra metadata on-chain…")}</p>;
+  if (metadata.isError || !metadata.data) return <p className="w-full rounded-lg bg-rose-50 px-3 py-2 text-[10px] text-rose-700 dark:bg-rose-300/[0.06] dark:text-rose-200">{t("Metadata could not be verified on this network.", "Không thể xác minh metadata trên mạng này.")}</p>;
+
+  const value = metadata.data;
+  const root = bytesToHex(value.blobMerkleRoot);
+  return (
+    <div className="grid w-full grid-cols-2 gap-x-4 gap-y-1.5 rounded-lg border border-emerald-100 bg-emerald-50/45 px-3 py-2 text-[10px] dark:border-lime-300/10 dark:bg-lime-300/[0.025] sm:grid-cols-4">
+      <span><span className="text-slate-400">{t("State", "Trạng thái")}</span><strong className="ml-1 text-slate-700 dark:text-slate-200">{value.isWritten ? t("Committed", "Đã hoàn tất") : t("Pending", "Chưa hoàn tất")}</strong></span>
+      <span><span className="text-slate-400">UID</span><strong className="ml-1 text-slate-700 dark:text-slate-200">{value.uid?.toString() ?? "—"}</strong></span>
+      <span className="truncate" title={`0x${root}`}><span className="text-slate-400">Merkle</span><strong className="ml-1 text-slate-700 dark:text-slate-200">{root ? `${root.slice(0, 8)}…` : "—"}</strong></span>
+      <span><span className="text-slate-400">{t("Expires", "Hết hạn")}</span><strong className="ml-1 text-slate-700 dark:text-slate-200">{new Date(value.expirationMicros / 1_000).toLocaleDateString()}</strong></span>
+    </div>
+  );
+}
 
 interface BlobLibraryProps {
   account: any;
@@ -73,10 +109,12 @@ export function BlobLibrary({
   effectiveEmbeddingMode,
 }: BlobLibraryProps) {
   const { language, t } = useLanguage();
+  const { network } = useShelbyNetwork();
   const { preferences: geminiUsage } = useGeminiUsage();
   const [editingSource, setEditingSource] = useState("");
   const [editingTitle, setEditingTitle] = useState("");
   const [editingAliases, setEditingAliases] = useState("");
+  const [detailsSource, setDetailsSource] = useState("");
   const [hasCloudKey, setHasCloudKey] = useState(() => Boolean(getStoredCloudApiKey()));
   const loadErrorCopy = loadError ? getShelbyRefreshErrorCopy(loadError, language) : null;
 
@@ -90,7 +128,8 @@ export function BlobLibrary({
     setEditingSource("");
     setEditingTitle("");
     setEditingAliases("");
-  }, [account?.address?.toString()]);
+    setDetailsSource("");
+  }, [account?.address?.toString(), network]);
 
   const getBlobName = (blob: any) => blob.blobNameSuffix ?? blob.name;
 
@@ -355,7 +394,7 @@ export function BlobLibrary({
               return (
                 <div
                   key={blobName}
-                  className={`transition-all duration-200 hover:bg-lime-50/45 dark:hover:bg-lime-300/[0.025] group hover-lift ${isEditing ? "p-3.5 flex flex-col gap-3" : "min-h-[58px] px-3.5 py-2.5 flex items-center justify-between gap-3"} ${isPending ? "bg-lime-50/55 dark:bg-lime-300/[0.035]" : isLocked ? "bg-slate-500/[0.012]" : ""}`}
+                  className={`transition-all duration-200 hover:bg-lime-50/45 dark:hover:bg-lime-300/[0.025] group hover-lift ${isEditing ? "p-3.5 flex flex-col gap-3" : `min-h-[58px] px-3.5 py-2.5 flex items-center justify-between gap-3 ${detailsSource === blobName ? "flex-wrap" : ""}`} ${isPending ? "bg-lime-50/55 dark:bg-lime-300/[0.035]" : isLocked ? "bg-slate-500/[0.012]" : ""}`}
                 >
                   {isEditing ? (
                     <div className="grid gap-2.5 p-3.5 bg-white/60 dark:bg-slate-900/40 rounded-xl border border-slate-200/60 dark:border-white/10 w-full backdrop-blur-md shadow-sm">
@@ -457,7 +496,7 @@ export function BlobLibrary({
                             size="icon"
                             className="h-10 w-10 text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition-colors opacity-100 sm:h-7 sm:w-7 sm:opacity-0 sm:group-hover:opacity-100 sm:focus:opacity-100"
                             onClick={() => {
-                              window.open(getShelbyBlobUrl(account!.address.toString(), blobName), "_blank", "noopener,noreferrer");
+                              window.open(getShelbyBlobUrl(account!.address.toString(), blobName, network), "_blank", "noopener,noreferrer");
                             }}
                             title={t("Open direct link", "Mở liên kết trực tiếp")}
                             aria-label={t(`Open ${getDisplayName(blobName, b)} on Shelby`, `Mở ${getDisplayName(blobName, b)} trên Shelby`)}
@@ -465,7 +504,19 @@ export function BlobLibrary({
                             <Link className="w-3.5 h-3.5" />
                           </Button>
                         )}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-10 w-10 text-slate-400 hover:bg-emerald-50 hover:text-emerald-700 dark:hover:bg-lime-300/[0.05] dark:hover:text-lime-300 sm:h-7 sm:w-7"
+                          onClick={() => setDetailsSource((current) => current === blobName ? "" : blobName)}
+                          title={t("Verify blob details", "Xác minh chi tiết blob")}
+                          aria-expanded={detailsSource === blobName}
+                          aria-label={t(`Verify details for ${getDisplayName(blobName, b)}`, `Xác minh chi tiết ${getDisplayName(blobName, b)}`)}
+                        >
+                          <Info className="h-3.5 w-3.5" />
+                        </Button>
                       </div>
+                      {detailsSource === blobName && <BlobMetadataDetail account={ownerAddress} blobName={blobName} />}
                     </>
                   )}
                 </div>

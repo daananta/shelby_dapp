@@ -3,6 +3,7 @@ import {
   classifyShelbyServiceError,
   getShelbyErrorDiagnostic,
   getShelbyRefreshErrorCopy,
+  isRetriableShelbyServiceError,
   ShelbyClientConfigurationError,
 } from "@/utils/shelbyErrors";
 
@@ -26,7 +27,16 @@ describe("Shelby service errors", () => {
   it("distinguishes deployment configuration, rate limits and network failures", () => {
     expect(classifyShelbyServiceError(new ShelbyClientConfigurationError("missing"))).toBe("configuration");
     expect(classifyShelbyServiceError({ status: 429 })).toBe("rate_limit");
+    expect(classifyShelbyServiceError({ response: { status: 503 } })).toBe("server");
     expect(classifyShelbyServiceError(new Error("Failed to fetch"))).toBe("network");
+  });
+
+  it("retries only transport and upstream server failures", () => {
+    expect(isRetriableShelbyServiceError(new Error("Failed to fetch"))).toBe(true);
+    expect(isRetriableShelbyServiceError({ status: 503 })).toBe(true);
+    expect(isRetriableShelbyServiceError({ status: 401 })).toBe(false);
+    expect(isRetriableShelbyServiceError({ status: 400 })).toBe(false);
+    expect(isRetriableShelbyServiceError(new Error("invalid response shape"))).toBe(false);
   });
 
   it("never repeats an unknown upstream message", () => {

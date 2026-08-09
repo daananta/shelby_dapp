@@ -71,16 +71,51 @@ describe("Answer Receipt grounding", () => {
   });
 
   it("creates an indexed-only receipt for a legacy source without a Shelby root", async () => {
-    const receipt = await createAnswerReceipt({ wallet: "0xABC", question: "Tệp nói gì?", answer: "Một câu trả lời [S1].", sources: assignCitationIds([source("legacy.txt")]) });
-    expect(receipt).toMatchObject({ format: "shelby-answer-receipt", version: 1, wallet: "0xabc", level: "indexed_only" });
+    const receipt = await createAnswerReceipt({ network: "shelbynet", wallet: "0xABC", question: "Tệp nói gì?", answer: "Một câu trả lời [S1].", sources: assignCitationIds([source("legacy.txt")]) });
+    expect(receipt).toMatchObject({ format: "shelby-answer-receipt", version: 2, network: "shelbynet", wallet: "0xabc", level: "indexed_only" });
     expect(receipt.id).toMatch(/^0x[0-9a-f]{64}$/);
     expect(receipt.sources[0].explanation).toContain("does not contain the original file fingerprint");
     const envelope = await createAnswerReceiptEnvelope(receipt);
     expect((await verifyAnswerReceipt(envelope)).valid).toBe(true);
   });
 
+  it("does not create a new receipt on the dormant Testnet network", async () => {
+    await expect(createAnswerReceipt({
+      network: "testnet",
+      wallet: "0xABC",
+      question: "Tệp nói gì?",
+      answer: "Một câu trả lời [S1].",
+      sources: assignCitationIds([source("legacy.txt")]),
+    })).rejects.toThrow(/temporarily unavailable/i);
+  });
+
+  it("fails closed when evidence belongs to another Shelby network", async () => {
+    const crossNetworkSource: RetrievalResult = {
+      ...source("testnet-only.txt"),
+      provenance: {
+        network: "testnet",
+        owner: "0xabc",
+        accessTag: "public",
+        blobMerkleRoot: HASH,
+        indexedAt: 1,
+        sourceRevision: "testnet-revision",
+      },
+    };
+    const receipt = await createAnswerReceipt({
+      network: "shelbynet",
+      wallet: "0xABC",
+      question: "Tệp nói gì?",
+      answer: "Một câu trả lời [S1].",
+      sources: assignCitationIds([crossNetworkSource]),
+    });
+
+    expect(receipt.level).toBe("failed");
+    expect(receipt.sources[0].explanation).toMatch(/Testnet workspace/i);
+  });
+
   it("preserves a filtered source id so the receipt stays bound to the answer", async () => {
     const receipt = await createAnswerReceipt({
+      network: "shelbynet",
       wallet: "0xABC",
       question: "Nguồn thứ ba nói gì?",
       answer: "Câu trả lời chỉ dùng nguồn thứ ba [S3].",
@@ -97,6 +132,7 @@ describe("Answer Receipt grounding", () => {
 
   it("verifies compact citations without changing their source ids", async () => {
     const receipt = await createAnswerReceipt({
+      network: "shelbynet",
       wallet: "0xABC",
       question: "Hai nguồn nói gì?",
       answer: "Câu trả lời kết hợp hai nguồn [S1, S3].",
@@ -115,6 +151,7 @@ describe("Answer Receipt grounding", () => {
 
   it("rejects ambiguous preassigned citation ids", async () => {
     await expect(createAnswerReceipt({
+      network: "shelbynet",
       wallet: "0xABC",
       question: "Tệp nói gì?",
       answer: "Không thể biết nguồn nào [S1].",
@@ -224,7 +261,7 @@ describe("Answer Receipt grounding", () => {
     const report = await verifyAnswerReceipt(await portableReceipt());
     expect(report).toMatchObject({ valid: true, compatible: true, inputVersion: 1, integrityVerified: false });
     expect(report.checks.envelopeDigest).toBe("unavailable");
-    expect(report.warnings.join(" ")).toContain("export lại thành v2");
+    expect(report.warnings.join(" ")).toContain("export thành envelope v2");
   });
 
   it("rejects a cryptographic content claim for OCR without independently reproducible text", async () => {

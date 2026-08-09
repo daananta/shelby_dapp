@@ -1,12 +1,13 @@
 import { AccountAddress } from "@aptos-labs/ts-sdk";
 import { BlobNameSchema, generateCommitments } from "@shelby-protocol/sdk/browser";
-import { blobClient, getShelbyBlobUrl } from "@/utils/shelbyConfig";
-import { SHELBY_CLIENT_API_KEY } from "@/utils/geomiClientKey";
+import { getShelbyBlobUrl, getShelbyRuntime } from "@/utils/shelbyConfig";
+import { getShelbyClientKeyResult } from "@/utils/geomiClientKey";
 import { getErasureProvider } from "@/utils/shelbyErasure";
 import { normalizeHex, sha256Text } from "@/utils/contentIntegrity";
 import { extractSinglePageFromUrl, normalizeSearchText } from "@/utils/textExtractor";
 import type { AnswerReceipt, AnswerReceiptSource, AnswerVerificationLevel, RetrievalResult } from "@/utils/ragTypes";
 import { localize } from "@/i18n";
+import { assertShelbyNetworkAvailable, isSupportedShelbyNetwork, type SupportedShelbyNetwork } from "@/utils/shelbyNetwork";
 
 const MAX_VERIFY_BYTES = 25 * 1024 * 1024;
 const RECEIPT_ENVELOPE_FORMAT = "shelby-answer-receipt-envelope" as const;
@@ -169,6 +170,7 @@ export async function computeAnswerReceiptId(receipt: AnswerReceipt | Omit<Answe
   const payload = {
     format: receipt.format,
     version: receipt.version,
+    ...(receipt.version === 2 ? { network: receipt.network } : {}),
     createdAt: receipt.createdAt,
     wallet: receipt.wallet,
     question: receipt.question,
@@ -218,7 +220,8 @@ function validateReceiptSchema(value: unknown, errors: string[]): value is Answe
     return false;
   }
   if (value.format !== "shelby-answer-receipt") errors.push("Receipt format không được hỗ trợ.");
-  if (value.version !== 1) errors.push("Receipt version không được hỗ trợ.");
+  if (value.version !== 1 && value.version !== 2) errors.push("Receipt version không được hỗ trợ.");
+  if (value.version === 2 && !isSupportedShelbyNetwork(value.network)) errors.push("Mạng của receipt không hợp lệ.");
   if (typeof value.id !== "string" || !SHA256_PATTERN.test(value.id)) errors.push("Mã receipt phải là SHA-256 hợp lệ.");
   if (!Number.isSafeInteger(value.createdAt) || Number(value.createdAt) < 0) errors.push("createdAt không hợp lệ.");
   for (const field of ["wallet", "question", "answer", "note"] as const) {
@@ -375,14 +378,14 @@ export async function verifyAnswerReceipt(input: string | unknown): Promise<Answ
     return report;
   }
 
-  if (isRecord(parsed) && parsed.format === "shelby-answer-receipt" && parsed.version === 1) {
+  if (isRecord(parsed) && parsed.format === "shelby-answer-receipt" && (parsed.version === 1 || parsed.version === 2)) {
     const schemaErrors: string[] = [];
     if (!validateReceiptSchema(parsed, schemaErrors)) {
       report.errors.push(...schemaErrors);
       return report;
     }
     report.compatible = true;
-    report.inputVersion = 1;
+    report.inputVersion = parsed.version;
     report.receipt = parsed;
     report.checks.schema = "pass";
     const expectedReceiptId = await computeAnswerReceiptId(parsed);
@@ -394,7 +397,7 @@ export async function verifyAnswerReceipt(input: string | unknown): Promise<Answ
     report.checks.citations = semanticErrors.some((error) => /trích dẫn|tham chiếu|Nguồn S\d+ không được dùng|liên kết tới nguồn/.test(error)) ? "fail" : "pass";
     report.checks.declaredContentHashes = semanticErrors.some((error) => /hash|mã đối chiếu/.test(error)) ? "fail" : parsed.sources.some((source) => source.pageContentHash || source.chunkContentHash) ? "declared_only" : "unavailable";
     report.valid = report.errors.length === 0;
-    report.warnings.push("Receipt v1 tương thích nhưng chưa có checksum canonical cho toàn payload; hãy export lại thành v2 để kiểm tra cấu trúc nội bộ đầy đủ hơn.");
+    report.warnings.push(`Receipt v${parsed.version} tương thích nhưng chưa có checksum canonical cho toàn payload; hãy export thành envelope v2 để kiểm tra cấu trúc nội bộ đầy đủ hơn.`);
     return report;
   }
 
@@ -568,7 +571,11 @@ export function receiptLevel(sources: Pick<AnswerReceiptSource, "level">[]): Ans
   return "indexed_only";
 }
 
-async function verifySource(source: RetrievalResult, signal?: AbortSignal): Promise<AnswerReceiptSource> {
+async function verifySource(
+  source: RetrievalResult,
+  expectedNetwork: SupportedShelbyNetwork,
+  signal?: AbortSignal,
+): Promise<AnswerReceiptSource> {
   const checkedAt = Date.now();
   const base = {
     citationId: source.citationId ?? "S?",
@@ -583,6 +590,17 @@ async function verifySource(source: RetrievalResult, signal?: AbortSignal): Prom
     extractionMethod: source.provenance?.extractionMethod,
   };
   const provenance = source.provenance;
+  const sourceNetwork = provenance ? provenance.network ?? "testnet" : undefined;
+  if (sourceNetwork && sourceNetwork !== expectedNetwork) {
+    return { ...base, level: "failed", explanation: localize(
+      sourceNetwork === "testnet"
+        ? "This evidence belongs to the preserved Testnet workspace and cannot be rechecked until Testnet reopens."
+        : `This evidence belongs to ${sourceNetwork}, not the active ${expectedNetwork} workspace.`,
+      sourceNetwork === "testnet"
+        ? "Bằng chứng này thuộc workspace Testnet đã lưu và chưa thể đối chiếu lại đến khi Testnet mở lại."
+        : `Bằng chứng này thuộc mạng ${sourceNetwork}, không phải workspace ${expectedNetwork} đang mở.`,
+    ) };
+  }
   if (!provenance?.owner || !provenance.blobMerkleRoot) {
     return { ...base, level: "indexed_only", explanation: localize(
       "This index does not contain the original file fingerprint. Rebuild RAG to enable stronger verification.",
@@ -598,8 +616,9 @@ async function verifySource(source: RetrievalResult, signal?: AbortSignal): Prom
 
   try {
     signal?.throwIfAborted();
+    const runtime = getShelbyRuntime(expectedNetwork);
     const blobName = BlobNameSchema.parse(source.source);
-    const metadata = await blobClient.getBlobMetadata({ account: AccountAddress.fromString(provenance.owner), name: blobName });
+    const metadata = await runtime.blobClient.getFullObjectMetadata({ account: AccountAddress.fromString(provenance.owner), name: blobName });
     signal?.throwIfAborted();
     if (!metadata || metadata.isDeleted) return { ...base, level: "failed", explanation: localize("The file registration is no longer available on Shelby.", "Không còn tìm thấy đăng ký tệp này trên Shelby.") };
     if (metadata.isWritten !== true) return { ...base, level: "failed", explanation: localize("The file is registered, but its data has not finished uploading to Shelby.", "Tệp đã đăng ký nhưng dữ liệu chưa được ghi hoàn tất lên Shelby.") };
@@ -620,9 +639,10 @@ async function verifySource(source: RetrievalResult, signal?: AbortSignal): Prom
       return { ...base, currentBlobMerkleRoot: currentRootDisplay, level: "indexed_only", explanation: localize("The file exceeds 25 MB, so the browser did not repeat the verification.", "Tệp lớn hơn giới hạn 25 MB nên trình duyệt không tự chạy lại phép đối chiếu.") };
     }
 
-    const url = getShelbyBlobUrl(provenance.owner, source.source);
-    const requestHeaders = SHELBY_CLIENT_API_KEY
-      ? { Authorization: `Bearer ${SHELBY_CLIENT_API_KEY}` }
+    const url = getShelbyBlobUrl(provenance.owner, source.source, expectedNetwork);
+    const clientKey = getShelbyClientKeyResult(expectedNetwork).key;
+    const requestHeaders = clientKey
+      ? { Authorization: `Bearer ${clientKey}` }
       : undefined;
     const response = await fetch(url, { headers: requestHeaders, signal });
     if (!response.ok || !response.body) throw new Error(localize(`Unable to download the source file (${response.status}).`, `Không tải được tệp nguồn (${response.status}).`));
@@ -676,6 +696,7 @@ async function verifySource(source: RetrievalResult, signal?: AbortSignal): Prom
 }
 
 export async function createAnswerReceipt(input: {
+  network: SupportedShelbyNetwork;
   wallet: string;
   question: string;
   answer: string;
@@ -683,6 +704,7 @@ export async function createAnswerReceipt(input: {
   signal?: AbortSignal;
   onProgress?: (message: string) => void;
 }): Promise<AnswerReceipt> {
+  assertShelbyNetworkAvailable(input.network);
   const labeledSources = ensureCitationIds(input.sources);
   const verifiedSources: AnswerReceiptSource[] = [];
   for (let index = 0; index < labeledSources.length; index += 1) {
@@ -691,12 +713,13 @@ export async function createAnswerReceipt(input: {
       `Checking source ${index + 1}/${labeledSources.length}…`,
       `Đang đối chiếu nguồn ${index + 1}/${labeledSources.length}…`,
     ));
-    verifiedSources.push(await verifySource(labeledSources[index], input.signal));
+    verifiedSources.push(await verifySource(labeledSources[index], input.network, input.signal));
   }
   const createdAt = Date.now();
   const payload = {
     format: "shelby-answer-receipt" as const,
-    version: 1 as const,
+    version: 2 as const,
+    network: input.network,
     createdAt,
     wallet: input.wallet.toLowerCase(),
     question: input.question,

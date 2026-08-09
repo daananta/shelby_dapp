@@ -8,6 +8,7 @@ import { isRagArtifactName } from "@/utils/hotRag";
 import { sha256Text } from "@/utils/contentIntegrity";
 import { localize } from "@/i18n";
 import { sourceContentIdentity } from "@/utils/ragLifecycle";
+import { createShelbyWorkspaceKey, isSupportedShelbyNetwork, parseShelbyWorkspaceKey } from "@/utils/shelbyNetwork";
 
 export type { MetadataValue, DocumentManifest, PageRecord, PortableRagPackage, RetrievalResult, StoryEntry } from "@/utils/ragTypes";
 
@@ -52,8 +53,10 @@ interface WorkspaceRecord {
   stories: StoryEntry[];
 }
 
-const DB_NAME = "shelby-rag-explorer-v4";
+const DB_NAME = "shelby-rag-explorer-v5";
 const DB_VERSION = 1;
+const LEGACY_V4_DB_NAME = "shelby-rag-explorer-v4";
+const LEGACY_V4_MIGRATION_MARKER = "__migration_v4_to_testnet__";
 let databasePromise: Promise<IDBDatabase | null> | null = null;
 let activeOwner: string | null = null;
 const manifests = new Map<string, DocumentManifest>();
@@ -144,10 +147,89 @@ function transactionDone(transaction: IDBTransaction): Promise<void> {
   });
 }
 
+async function openExistingDatabase(name: string): Promise<IDBDatabase | null> {
+  return new Promise((resolve) => {
+    const request = indexedDB.open(name);
+    request.onupgradeneeded = () => request.transaction?.abort();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve(null);
+    request.onblocked = () => resolve(null);
+  });
+}
+
+function legacyTestnetOwner(owner: string): string {
+  const parsed = parseShelbyWorkspaceKey(owner);
+  return createShelbyWorkspaceKey({ network: "testnet", owner: parsed.owner });
+}
+
+function migrateLegacyId(value: unknown, previousOwner: string, nextOwner: string): unknown {
+  if (typeof value !== "string") return value;
+  return value.startsWith(`${previousOwner}:`) ? `${nextOwner}${value.slice(previousOwner.length)}` : value;
+}
+
+async function migrateV4IntoTestnet(db: IDBDatabase) {
+  const marker = await requestValue(db.transaction("workspace", "readonly").objectStore("workspace").get(LEGACY_V4_MIGRATION_MARKER));
+  if (marker) return;
+  const legacy = await openExistingDatabase(LEGACY_V4_DB_NAME);
+  if (!legacy || !["manifests", "pages", "chunks", "workspace"].every((store) => legacy.objectStoreNames.contains(store))) {
+    legacy?.close();
+    const tx = db.transaction("workspace", "readwrite");
+    tx.objectStore("workspace").put({ id: LEGACY_V4_MIGRATION_MARKER, migratedAt: Date.now() });
+    await transactionDone(tx);
+    return;
+  }
+  try {
+    const read = legacy.transaction(["manifests", "pages", "chunks", "workspace"], "readonly");
+    const readDone = transactionDone(read);
+    const [legacyManifests, legacyPages, legacyChunks, legacyWorkspaces] = await Promise.all([
+      requestValue(read.objectStore("manifests").getAll()) as Promise<any[]>,
+      requestValue(read.objectStore("pages").getAll()) as Promise<any[]>,
+      requestValue(read.objectStore("chunks").getAll()) as Promise<any[]>,
+      requestValue(read.objectStore("workspace").getAll()) as Promise<any[]>,
+    ]);
+    await readDone;
+    const write = db.transaction(["manifests", "pages", "chunks", "workspace"], "readwrite");
+    for (const record of legacyManifests) {
+      if (!record?.owner) continue;
+      const nextOwner = legacyTestnetOwner(record.owner);
+      write.objectStore("manifests").put({ ...record, owner: nextOwner, id: migrateLegacyId(record.id, record.owner, nextOwner) });
+    }
+    for (const record of legacyPages) {
+      if (!record?.owner) continue;
+      const nextOwner = legacyTestnetOwner(record.owner);
+      write.objectStore("pages").put({
+        ...record,
+        owner: nextOwner,
+        id: migrateLegacyId(record.id, record.owner, nextOwner),
+        documentId: migrateLegacyId(record.documentId, record.owner, nextOwner),
+      });
+    }
+    for (const record of legacyChunks) {
+      if (!record?.owner) continue;
+      const nextOwner = legacyTestnetOwner(record.owner);
+      write.objectStore("chunks").put({
+        ...record,
+        owner: nextOwner,
+        id: migrateLegacyId(record.id, record.owner, nextOwner),
+        documentId: migrateLegacyId(record.documentId, record.owner, nextOwner),
+      });
+    }
+    for (const record of legacyWorkspaces) {
+      if (!record?.owner || record.id === LEGACY_V4_MIGRATION_MARKER) continue;
+      const nextOwner = legacyTestnetOwner(record.owner);
+      write.objectStore("workspace").put({ ...record, owner: nextOwner, id: nextOwner });
+    }
+    write.objectStore("workspace").put({ id: LEGACY_V4_MIGRATION_MARKER, migratedAt: Date.now() });
+    await transactionDone(write);
+  } finally {
+    legacy.close();
+  }
+}
+
 function openDatabase(): Promise<IDBDatabase | null> {
   if (typeof indexedDB === "undefined") return Promise.resolve(null);
   if (databasePromise) return databasePromise;
-  databasePromise = new Promise((resolve, reject) => {
+  databasePromise = new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
@@ -164,6 +246,16 @@ function openDatabase(): Promise<IDBDatabase | null> {
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+  }).then(async (db) => {
+    try {
+      await migrateV4IntoTestnet(db);
+    } catch (error) {
+      // A damaged legacy database must not make the current v5 workspace
+      // unusable. The marker is written only after a successful transaction,
+      // so the migration can be retried on the next page load.
+      console.warn("Could not migrate the legacy Testnet RAG database.", error);
+    }
+    return db;
   });
   return databasePromise;
 }
@@ -175,18 +267,32 @@ async function readOwnerRecords<T>(storeName: "manifests" | "pages" | "chunks", 
   return requestValue(transaction.objectStore(storeName).index("owner").getAll(owner)) as Promise<T[]>;
 }
 
+/** Checks persisted records without activating or hydrating another network workspace. */
+export async function hasPersistedRagWorkspace(owner: string): Promise<boolean> {
+  const normalized = owner.toLowerCase();
+  if (!normalized) return false;
+  const db = await openDatabase();
+  if (!db) return false;
+  const transaction = db.transaction("manifests", "readonly");
+  const count = await requestValue(transaction.objectStore("manifests").index("owner").count(normalized));
+  return count > 0;
+}
+
 async function migrateLegacyState(owner: string) {
   if (typeof indexedDB === "undefined" || manifests.size) return;
-  const legacy = await new Promise<IDBDatabase | null>((resolve) => {
-    const request = indexedDB.open("shelby-rag-explorer", 1);
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => resolve(null);
-  });
-  if (!legacy || !legacy.objectStoreNames.contains("state")) return;
+  const identity = parseShelbyWorkspaceKey(owner);
+  if (identity.network !== "testnet") return;
+  const legacy = await openExistingDatabase("shelby-rag-explorer");
+  if (!legacy) return;
+  if (!legacy.objectStoreNames.contains("state")) {
+    legacy.close();
+    return;
+  }
   try {
     const transaction = legacy.transaction("state", "readonly");
     const state: any = await requestValue(transaction.objectStore("state").get("orama-v2"));
-    if (!state || state.activeRagOwner?.toLowerCase() !== owner) return;
+    const legacyOwner = state?.activeRagOwner?.toLowerCase();
+    if (!state || legacyOwner !== identity.owner) return;
     const migrated: DocumentManifest[] = (state.sources ?? []).map((source: any) => ({
       id: `${owner}:${source.source}`,
       owner,
@@ -213,7 +319,7 @@ async function migrateLegacyState(owner: string) {
     const migratedWorkspace: WorkspaceRecord = {
       id: owner,
       owner,
-      inventory: state.blobInventory?.owner?.toLowerCase() === owner ? { names: state.blobInventory.names ?? [], fetchedAt: state.blobInventory.fetchedAt ?? Date.now() } : null,
+      inventory: state.blobInventory?.owner?.toLowerCase() === identity.owner ? { names: state.blobInventory.names ?? [], fetchedAt: state.blobInventory.fetchedAt ?? Date.now() } : null,
       stories: [],
     };
     write.objectStore("workspace").put(migratedWorkspace);
@@ -366,6 +472,7 @@ export function getDocumentManifests(): DocumentManifest[] {
 export async function exportPortableRagPackage(options: { includeEmbeddings?: boolean; exportedAt?: number } = {}): Promise<PortableRagPackage> {
   if (!activeOwner) throw new Error(localize("Connect a wallet before creating a RAG backup.", "Hãy kết nối ví trước khi đóng gói RAG."));
   await ensureContentLoaded();
+  const sourceIdentity = parseShelbyWorkspaceKey(activeOwner);
   const documents = Array.from(manifests.values()).filter(isSearchableManifest).map((manifest) => {
     const documentPages = Array.from(pages.values()).filter((page) => page.documentId === manifest.id).map(({ owner: _owner, id: _id, documentId: _documentId, ...page }) => page);
     const documentChunks = Array.from(chunks.values()).filter((chunk) => chunk.documentId === manifest.id).map(({ owner: _owner, id: _id, documentId: _documentId, ...chunk }) => {
@@ -375,7 +482,7 @@ export async function exportPortableRagPackage(options: { includeEmbeddings?: bo
     });
     const documentStories = (workspace?.stories ?? []).filter((story) => story.source === manifest.source);
     const { owner, id: _id, revision, embeddingStatus: _embeddingStatus, indexedAt, ...portableManifest } = manifest;
-    return { manifest: { ...portableManifest, originalSourceOwner: owner, sourceRevision: revision, sourceIndexedAt: indexedAt }, pages: documentPages, chunks: documentChunks, stories: documentStories };
+    return { manifest: { ...portableManifest, originalSourceOwner: parseShelbyWorkspaceKey(owner).owner, sourceRevision: revision, sourceIndexedAt: indexedAt }, pages: documentPages, chunks: documentChunks, stories: documentStories };
   });
   const inventory = workspace?.inventory
     ? {
@@ -384,14 +491,23 @@ export async function exportPortableRagPackage(options: { includeEmbeddings?: bo
       }
     : undefined;
   const exportedAt = Number.isSafeInteger(options.exportedAt) && Number(options.exportedAt) > 0 ? Number(options.exportedAt) : Date.now();
-  return { format: "shelby-rag-package", version: 1, exportedAt, sourceOwner: activeOwner, inventory, documents };
+  return {
+    format: "shelby-rag-package",
+    version: 2,
+    sourceNetwork: sourceIdentity.network,
+    exportedAt,
+    sourceOwner: sourceIdentity.owner,
+    inventory,
+    documents,
+  };
 }
 
 export function isPortableRagPackage(value: unknown): value is PortableRagPackage {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<PortableRagPackage>;
   return candidate.format === "shelby-rag-package"
-    && candidate.version === 1
+    && (candidate.version === 1 || candidate.version === 2)
+    && (candidate.version === 1 || isSupportedShelbyNetwork(candidate.sourceNetwork))
     && Number.isSafeInteger(candidate.exportedAt)
     && Number(candidate.exportedAt) > 0
     && typeof candidate.sourceOwner === "string"
@@ -527,7 +643,19 @@ export async function importPortableRagPackage(value: unknown, expectedOwner?: s
   if (!activeOwner) throw new Error(localize("Connect a wallet before importing a RAG backup.", "Hãy kết nối ví trước khi nhập gói RAG."));
   const importOwner = (expectedOwner ?? activeOwner).toLowerCase();
   if (activeOwner !== importOwner) throw new DOMException(localize("The wallet changed; RAG import stopped.", "Ví đã thay đổi; dừng nhập RAG."), "AbortError");
-  if (!isPortableRagPackage(value)) throw new Error(localize("This is not a valid Shelby RAG v1 backup.", "Đây không phải gói Shelby RAG v1 hợp lệ."));
+  if (!isPortableRagPackage(value)) throw new Error(localize("This is not a valid Shelby RAG backup.", "Đây không phải gói Shelby RAG hợp lệ."));
+  const activeIdentity = parseShelbyWorkspaceKey(importOwner);
+  const sourceNetwork = value.version === 2 ? value.sourceNetwork : "testnet";
+  if (sourceNetwork !== activeIdentity.network) {
+    throw new Error(localize(
+      sourceNetwork === "testnet"
+        ? "This Testnet backup is preserved, but it cannot be restored until Testnet reopens."
+        : "This backup belongs to ShelbyNet and cannot be restored in the current workspace.",
+      sourceNetwork === "testnet"
+        ? "Bản sao Testnet vẫn được giữ, nhưng chưa thể khôi phục đến khi Testnet mở lại."
+        : "Bản sao này thuộc ShelbyNet và không thể khôi phục trong workspace hiện tại.",
+    ));
+  }
   const replacements = preparePortableReplacements(value, importOwner)
     // A remote capsule can outlive or predate its source policy. Never restore
     // a document that the latest authoritative Shelby refresh no longer allows.
@@ -906,10 +1034,12 @@ export function findExactQuoteInPages(inputPages: PageRecord[], quote: string): 
 
 function withProvenance(result: RetrievalResult, manifest?: DocumentManifest, chunk?: ChunkRecord, page?: PageRecord): RetrievalResult {
   if (!manifest) return result;
+  const identity = parseShelbyWorkspaceKey(manifest.owner);
   return {
     ...result,
     provenance: {
-      owner: manifest.owner,
+      network: identity.network,
+      owner: identity.owner,
       accessTag: manifest.accessTag,
       blobId: manifest.blobId,
       blobMerkleRoot: manifest.blobMerkleRoot,
@@ -1006,14 +1136,15 @@ async function cachedQueryEmbedding(query: string, provider: EmbeddingProvider, 
   return embedding;
 }
 
-function remoteDocumentId(owner: string, source: string) {
-  return `shelby:${owner.toLowerCase()}:${source}`;
+function remoteDocumentId(owner: string, source: string, network: "shelbynet" | "testnet" = "testnet") {
+  return `shelby:${network}:${owner.toLowerCase()}:${source}`;
 }
 
 function remotePageRecord(packageData: PortableRagPackage, documentId: string, pageNumber: number): PageRecord | undefined {
+  const network = packageData.version === 2 ? packageData.sourceNetwork : "testnet";
   for (const document of packageData.documents) {
     const owner = document.manifest.originalSourceOwner || packageData.sourceOwner;
-    if (remoteDocumentId(owner, document.manifest.source) !== documentId) continue;
+    if (remoteDocumentId(owner, document.manifest.source, network) !== documentId) continue;
     const page = document.pages.find((candidate) => candidate.pageNumber === pageNumber);
     if (!page) return undefined;
     return { ...page, id: `${documentId}:page:${page.pageNumber}`, owner, documentId };
@@ -1024,10 +1155,11 @@ function remotePageRecord(packageData: PortableRagPackage, documentId: string, p
 async function lookupRemoteExactQuote(quote: string, signal?: AbortSignal): Promise<RetrievalResult | null> {
   const packageData = await getRemoteRagPackage(signal);
   if (!packageData) return null;
+  const network = packageData.version === 2 ? packageData.sourceNetwork : "testnet";
   const normalizedQuote = normalizeSearchText(quote);
   for (const document of packageData.documents) {
     const owner = document.manifest.originalSourceOwner || packageData.sourceOwner;
-    const documentId = remoteDocumentId(owner, document.manifest.source);
+    const documentId = remoteDocumentId(owner, document.manifest.source, network);
     for (const page of document.pages) {
       signal?.throwIfAborted();
       if (!page.normalizedText.includes(normalizedQuote)) continue;
@@ -1037,9 +1169,9 @@ async function lookupRemoteExactQuote(quote: string, signal?: AbortSignal): Prom
       return {
         method: "exact", documentId, source: document.manifest.source, displayName: document.manifest.displayName,
         pageNumber: page.pageNumber, totalPages: page.totalPages, excerpt: excerptAround(page.rawText, quote), score: 1,
-        link: isPublic ? `${getShelbyBlobUrl(owner, document.manifest.source)}${page.pageNumber ? `#page=${page.pageNumber}` : ""}` : undefined,
+        link: isPublic ? `${getShelbyBlobUrl(owner, document.manifest.source, network)}${page.pageNumber ? `#page=${page.pageNumber}` : ""}` : undefined,
         provenance: {
-          owner, accessTag: document.manifest.accessTag, blobId: document.manifest.blobId,
+          network, owner, accessTag: document.manifest.accessTag, blobId: document.manifest.blobId,
           blobMerkleRoot: document.manifest.blobMerkleRoot, blobSize: document.manifest.blobSize,
           blobCreatedAtMicros: document.manifest.blobCreatedAtMicros,
           indexedAt: document.manifest.sourceIndexedAt ?? packageData.exportedAt,
@@ -1057,6 +1189,7 @@ async function lookupRemoteExactQuote(quote: string, signal?: AbortSignal): Prom
 async function searchRemotePortablePackage(query: string, limit: number, signal?: AbortSignal, excludeSources = new Set<string>()): Promise<RetrievalResult[]> {
   const packageData = await getRemoteRagPackage(signal);
   if (!packageData) return [];
+  const network = packageData.version === 2 ? packageData.sourceNetwork : "testnet";
   const queryTokens = searchTokens(query);
   const normalizedQuery = normalizeSearchText(query);
   const providers = new Set<EmbeddingProvider>();
@@ -1078,7 +1211,7 @@ async function searchRemotePortablePackage(query: string, limit: number, signal?
   for (const document of packageData.documents) {
     if (excludeSources.has(document.manifest.source) || document.manifest.status !== "indexed") continue;
     const owner = document.manifest.originalSourceOwner || packageData.sourceOwner;
-    const documentId = remoteDocumentId(owner, document.manifest.source);
+    const documentId = remoteDocumentId(owner, document.manifest.source, network);
     document.chunks.forEach((chunk, chunkIndex) => {
       const coverage = tokenCoverage(queryTokens, chunk.text);
       const exact = Boolean(normalizedQuery && chunk.normalizedText.includes(normalizedQuery));
@@ -1096,9 +1229,9 @@ async function searchRemotePortablePackage(query: string, limit: number, signal?
           method: semantic !== undefined && (coverage > 0 || exact) ? "hybrid" : semantic !== undefined ? "semantic" : "lexical",
           documentId, source: document.manifest.source, displayName: document.manifest.displayName,
           pageNumber: chunk.pageNumber, totalPages: chunk.totalPages, excerpt: chunk.text, score,
-          link: isPublic ? `${getShelbyBlobUrl(owner, document.manifest.source)}${chunk.pageNumber ? `#page=${chunk.pageNumber}` : ""}` : undefined,
+          link: isPublic ? `${getShelbyBlobUrl(owner, document.manifest.source, network)}${chunk.pageNumber ? `#page=${chunk.pageNumber}` : ""}` : undefined,
           provenance: {
-            owner, accessTag: document.manifest.accessTag, blobId: document.manifest.blobId,
+            network, owner, accessTag: document.manifest.accessTag, blobId: document.manifest.blobId,
             blobMerkleRoot: document.manifest.blobMerkleRoot, blobSize: document.manifest.blobSize,
             blobCreatedAtMicros: document.manifest.blobCreatedAtMicros,
             indexedAt: document.manifest.sourceIndexedAt ?? packageData.exportedAt,
@@ -1210,7 +1343,8 @@ export async function searchDocuments(query: string, limit = 8, signal?: AbortSi
     // Resolve permanent Shelby URL if blob is public, fallback to chunk's stored image URL
     let imageUrl = chunk.imageUrl;
     if (chunk.type === "image" && manifest && manifest.accessTag === "public" && activeOwner) {
-      imageUrl = getShelbyBlobUrl(activeOwner, chunk.source);
+      const identity = parseShelbyWorkspaceKey(activeOwner);
+      imageUrl = getShelbyBlobUrl(identity.owner, chunk.source, identity.network);
     }
 
     const page = pages.get(`${chunk.documentId}:page:${chunk.pageNumber}`);
@@ -1242,11 +1376,12 @@ export async function searchDocuments(query: string, limit = 8, signal?: AbortSi
 }
 
 export function getImageUrls(): { source: string; url: string }[] {
+  const identity = activeOwner ? parseShelbyWorkspaceKey(activeOwner) : null;
   return Array.from(manifests.values())
     .filter((manifest) => manifest.type === "image" && isSearchableManifest(manifest))
     .map((manifest) => {
-      const url = (manifest.accessTag === "public" && activeOwner)
-        ? getShelbyBlobUrl(activeOwner, manifest.source)
+      const url = (manifest.accessTag === "public" && identity)
+        ? getShelbyBlobUrl(identity.owner, manifest.source, identity.network)
         : manifest.blobUrl;
       return { source: manifest.source, url: url || "" };
     })
@@ -1264,14 +1399,15 @@ export interface ImageDocument {
 
 export async function getImageDocuments(): Promise<ImageDocument[]> {
   await ensureContentLoaded();
+  const identity = activeOwner ? parseShelbyWorkspaceKey(activeOwner) : null;
   return Array.from(manifests.values())
     .filter((manifest) => manifest.type === "image" && isSearchableManifest(manifest))
     .map((manifest) => {
       const chunk = Array.from(chunks.values()).find((item) => item.documentId === manifest.id && item.type === "image");
       const text = chunk?.text ?? "";
       const description = text.match(/(?:AI description|Mô tả AI):\s*([\s\S]+)/i)?.[1]?.trim();
-      const url = (manifest.accessTag === "public" && activeOwner)
-        ? getShelbyBlobUrl(activeOwner, manifest.source)
+      const url = (manifest.accessTag === "public" && identity)
+        ? getShelbyBlobUrl(identity.owner, manifest.source, identity.network)
         : manifest.blobUrl;
       return { owner: manifest.owner, source: manifest.source, displayName: manifest.displayName, url: url || "", revision: manifest.revision, description };
     })

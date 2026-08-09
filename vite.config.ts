@@ -10,9 +10,12 @@ export default defineConfig(({ mode }) => {
   if (forbiddenClientSecrets.length) {
     throw new Error(`Từ chối build: secret không được dùng tiền tố VITE_: ${forbiddenClientSecrets.join(", ")}`);
   }
-  const shelbyClientKey = env.VITE_SHELBY_CLIENT_API_KEY?.trim().replace(/^["']|["']$/g, "") ?? "";
-  if (shelbyClientKey && !/^AG-\S+$/i.test(shelbyClientKey)) {
-    throw new Error("Từ chối build: VITE_SHELBY_CLIENT_API_KEY chỉ nhận Geomi client key công khai có prefix AG-. Không dùng server key aptoslabs_ trong frontend.");
+  const shelbyClientKeyVariables = ["VITE_SHELBYNET_CLIENT_API_KEY", "VITE_TESTNET_CLIENT_API_KEY", "VITE_SHELBY_CLIENT_API_KEY"];
+  for (const variable of shelbyClientKeyVariables) {
+    const shelbyClientKey = env[variable]?.trim().replace(/^["']|["']$/g, "") ?? "";
+    if (shelbyClientKey && !/^AG-\S+$/i.test(shelbyClientKey)) {
+      throw new Error(`Từ chối build: ${variable} chỉ nhận Geomi client key công khai có prefix AG-. Không dùng server key aptoslabs_ trong frontend.`);
+    }
   }
 
   return ({

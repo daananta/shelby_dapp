@@ -5,6 +5,8 @@ export interface GeomiClientKeyResult {
   issue: GeomiClientKeyIssue;
 }
 
+import type { SupportedShelbyNetwork } from "@/utils/shelbyNetwork";
+
 /**
  * Only Geomi client keys (`AG-…`) are safe to ship in a public Vite bundle.
  * Server keys use a different format and must never be accepted here.
@@ -26,7 +28,24 @@ export function parseGeomiClientKey(value: string | null | undefined): GeomiClie
   return { key: candidate, issue: null };
 }
 
-const configuredClientKey = parseGeomiClientKey(import.meta.env.VITE_SHELBY_CLIENT_API_KEY);
+/** Missing keys use ShelbyNet's lower-limit anonymous read path. */
+export function isBlockingGeomiClientKeyIssue(issue: GeomiClientKeyIssue): boolean {
+  return issue === "unsafe_key_type";
+}
 
-export const SHELBY_CLIENT_API_KEY = configuredClientKey.key;
-export const SHELBY_CLIENT_KEY_ISSUE = configuredClientKey.issue;
+const legacyClientKey = import.meta.env.VITE_SHELBY_CLIENT_API_KEY;
+const configuredClientKeys: Record<SupportedShelbyNetwork, GeomiClientKeyResult> = {
+  shelbynet: parseGeomiClientKey(import.meta.env.VITE_SHELBYNET_CLIENT_API_KEY),
+  // The legacy key belonged to the old Testnet-only runtime. Never silently
+  // reuse it for ShelbyNet, where a 401/403 must remain network-local.
+  testnet: parseGeomiClientKey(import.meta.env.VITE_TESTNET_CLIENT_API_KEY || legacyClientKey),
+};
+
+export function getShelbyClientKeyResult(network: SupportedShelbyNetwork): GeomiClientKeyResult {
+  return configuredClientKeys[network];
+}
+
+/** @deprecated Use getShelbyClientKeyResult(activeNetwork). */
+export const SHELBY_CLIENT_API_KEY = configuredClientKeys.testnet.key;
+/** @deprecated Use getShelbyClientKeyResult(activeNetwork). */
+export const SHELBY_CLIENT_KEY_ISSUE = configuredClientKeys.testnet.issue;

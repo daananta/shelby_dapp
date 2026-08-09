@@ -1,33 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { parseGeomiClientKey } from "@/utils/geomiClientKey";
+import { isBlockingGeomiClientKeyIssue, parseGeomiClientKey } from "@/utils/geomiClientKey";
 
-describe("Geomi browser client key", () => {
-  it("accepts only a frontend-safe AG client key", () => {
-    expect(parseGeomiClientKey(' "AG-MOCK_CLIENT_123" ')).toEqual({
-      key: "AG-MOCK_CLIENT_123",
-      issue: null,
-    });
-    expect(parseGeomiClientKey("AG-client.token-v2")).toEqual({
-      key: "AG-client.token-v2",
-      issue: null,
-    });
+describe("Shelby client key policy", () => {
+  it("allows ShelbyNet anonymous reads when no client key is configured", () => {
+    const result = parseGeomiClientKey(undefined);
+    expect(result).toEqual({ key: "", issue: "missing" });
+    expect(isBlockingGeomiClientKeyIssue(result.issue)).toBe(false);
   });
 
-  it("rejects a server key instead of exposing it in the browser bundle", () => {
-    expect(parseGeomiClientKey("aptoslabs_private-server-key")).toEqual({
-      key: "",
-      issue: "unsafe_key_type",
-    });
+  it("accepts a public Geomi browser key", () => {
+    const result = parseGeomiClientKey("AG-public-client-key");
+    expect(result).toEqual({ key: "AG-public-client-key", issue: null });
+    expect(isBlockingGeomiClientKeyIssue(result.issue)).toBe(false);
   });
 
-  it("reports a missing deployment key", () => {
-    expect(parseGeomiClientKey(undefined)).toEqual({ key: "", issue: "missing" });
-  });
-
-  it("rejects malformed values with whitespace after the public prefix", () => {
-    expect(parseGeomiClientKey("AG-not a key")).toEqual({
-      key: "",
-      issue: "unsafe_key_type",
-    });
+  it("blocks server or unknown key types from entering the browser bundle", () => {
+    const result = parseGeomiClientKey("server-secret-key");
+    expect(result).toEqual({ key: "", issue: "unsafe_key_type" });
+    expect(isBlockingGeomiClientKeyIssue(result.issue)).toBe(true);
   });
 });

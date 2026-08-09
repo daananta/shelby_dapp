@@ -11,7 +11,7 @@ export function isMockWorkspace() {
   return import.meta.env.DEV && (window as any).__SHELBY_E2E__ === true;
 }
 
-/** Deterministic missing-key state used by the auth error regression test. */
+/** Deterministic unsafe-client-key state used by the configuration error regression test. */
 export function isE2EShelbyConfigurationError() {
   if (typeof window === "undefined") return false;
   return import.meta.env.DEV && (window as any).__SHELBY_E2E__ === "remote-error";

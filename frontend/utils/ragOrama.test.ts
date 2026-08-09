@@ -27,7 +27,7 @@ function replacementForSource(owner: string, source: string, text: string): Docu
 
 async function writeWorkspaceStoryFromAnotherTab(owner: string, source: string) {
   const db = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open("shelby-rag-explorer-v4", 1);
+    const request = indexedDB.open("shelby-rag-explorer-v5", 1);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
@@ -53,7 +53,7 @@ async function writeWorkspaceStoryFromAnotherTab(owner: string, source: string) 
   }
 }
 
-describe("v4 page store", () => {
+describe("v5 network-scoped page store", () => {
   it("does not return late search results after Stop", async () => {
     const controller = new AbortController();
     controller.abort();
@@ -344,10 +344,10 @@ describe("v4 page store", () => {
   });
 
   it("searches a Shelby snapshot on demand without restoring it to IndexedDB", async () => {
-    await setActiveRagOwner("0xremote-source");
-    await replaceDocument(replacement("0xremote-source", "Shelby hot storage cho phép đọc kho tri thức theo nhu cầu"));
+    await setActiveRagOwner("shelbynet:0xremote-source");
+    await replaceDocument(replacement("shelbynet:0xremote-source", "Shelby hot storage cho phép đọc kho tri thức theo nhu cầu"));
     const portable = await exportPortableRagPackage();
-    await setActiveRagOwner("0xremote-reader");
+    await setActiveRagOwner("shelbynet:0xremote-reader");
     setRemoteRagProvider({ id: "remote-fixture", load: async () => portable });
     try {
       expect(getRagSources()).toHaveLength(0);

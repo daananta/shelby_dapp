@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("shows a safe recovery state when the Shelby client key is missing", async ({ page }) => {
+test("shows a safe recovery state when the Shelby client key is unsafe", async ({ page }) => {
   await page.addInitScript(() => {
     (window as any).__SHELBY_E2E__ = "remote-error";
   });

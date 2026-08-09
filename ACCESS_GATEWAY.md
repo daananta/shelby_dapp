@@ -1,12 +1,12 @@
 # Access policy used by Tạo RAG
 
-`BlobMetadata` of Shelby SDK does not contain the product-level tags. This app reads them from the configured on-chain access-control module:
+`BlobMetadata` of Shelby SDK does not contain the product-level tags. This app reads them from the access-control module configured for the active network:
 
 ```text
-{VITE_ACCESS_CONTROL_MODULE_ADDRESS}::access_control::query3_bcs
+{VITE_SHELBYNET_ACCESS_CONTROL_MODULE_ADDRESS or VITE_TESTNET_ACCESS_CONTROL_MODULE_ADDRESS}::access_control::query3_bcs
 ```
 
-The app includes a testnet default. Set `VITE_ACCESS_CONTROL_MODULE_ADDRESS` whenever the access-control contract is deployed at a different address or network.
+The app includes the existing Testnet deployment as a compatibility default. ShelbyNet has no implicit contract fallback: when no ShelbyNet access module is configured, the app reads object-v2 metadata on-chain and treats only an explicit `Unencrypted` object as Public. Encrypted, missing, or unreadable metadata fails closed. `VITE_ACCESS_CONTROL_MODULE_ADDRESS` remains a one-release fallback for Testnet only.
 
 For each Shelby blob, the app constructs `@{owner-padded-to-64-hex}/{blobNameSuffix}`, calls `query3_bcs(owner, fullBlobName)`, and parses its BCS result. It recognizes:
 

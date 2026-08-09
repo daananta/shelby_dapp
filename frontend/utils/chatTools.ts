@@ -3,6 +3,7 @@ import { getImageDocuments, getRagSources, getShelbyBlobInventory, getVectorDB, 
 import { asksForLiveInventoryRefresh } from "@/utils/queryRouter";
 import { SHELBYUSD_FA_METADATA_ADDRESS } from "@shelby-protocol/sdk/browser";
 import type { ConnectedWalletDetail } from "../../shared/agentTools";
+import { getStoredShelbyNetwork, type SupportedShelbyNetwork } from "@/utils/shelbyNetwork";
 
 export interface ChatToolResult {
   name: "wallet_address" | "apt_balance" | "shelbyusd_balance" | "account_info" | "blob_inventory" | "document_inventory" | "document_lookup" | "show_images" | "identity" | "calculator";
@@ -19,6 +20,8 @@ export interface ChatToolContext {
   preferredSources?: string[];
   /** Defaults to Vietnamese to preserve existing callers and deterministic tests. */
   language?: "en" | "vi";
+  /** Pins Aptos reads to the same Shelby workspace selected by the user. */
+  network?: SupportedShelbyNetwork;
 }
 
 export interface IndexedImageAnalysisContext {
@@ -380,7 +383,7 @@ function formatAssetAmount(raw: number, decimals: number): string {
 export async function readConnectedWallet(
   detail: ConnectedWalletDetail,
   address?: string,
-  context: Pick<ChatToolContext, "language"> = {},
+  context: Pick<ChatToolContext, "language" | "network"> = {},
   signal?: AbortSignal,
 ): Promise<ChatToolResult> {
   signal?.throwIfAborted();
@@ -404,7 +407,7 @@ export async function readConnectedWallet(
     };
   }
 
-  const aptos = aptosClient();
+  const aptos = aptosClient(context.network ?? getStoredShelbyNetwork());
   if (detail === "apt_balance") {
     const rawBalance = await aptos.getBalance({ accountAddress: address, asset: "0x1::aptos_coin::AptosCoin" });
     signal?.throwIfAborted();

@@ -1,15 +1,31 @@
-import { NETWORK } from "@/constants";
 import { useLanguage } from "@/i18n";
 import { useWallet } from "@aptos-labs/wallet-adapter-react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { Button } from "@/components/ui/button";
-import { LogOut, Network } from "lucide-react";
+import { LogOut, Network, RefreshCw } from "lucide-react";
+import { useShelbyNetwork } from "@/network/ShelbyNetworkProvider";
+import { isWalletNetworkMatch, shelbyNetworkLabel, toAptosNetwork } from "@/utils/shelbyNetwork";
+import { useToast } from "@/components/ui/use-toast";
 
 export function WrongNetworkAlert() {
   const { t } = useLanguage();
-  const { network, connected, disconnect } = useWallet();
+  const { network: activeNetwork } = useShelbyNetwork();
+  const { network: walletNetwork, connected, disconnect, changeNetwork } = useWallet();
+  const { toast } = useToast();
 
-  return !connected || network?.name === NETWORK ? (
+  const switchWallet = async () => {
+    if (typeof changeNetwork !== "function") {
+      toast({ variant: "destructive", title: t("Switch manually in your wallet", "Hãy đổi mạng thủ công trong ví") });
+      return;
+    }
+    try {
+      await changeNetwork(toAptosNetwork(activeNetwork) as any);
+    } catch (error) {
+      toast({ variant: "destructive", title: t("Could not switch the wallet network", "Không thể đổi mạng ví"), description: error instanceof Error ? error.message : undefined });
+    }
+  };
+
+  return !connected || isWalletNetworkMatch(walletNetwork, activeNetwork) ? (
     <></>
   ) : (
     <Dialog.Root open={true}>
@@ -23,14 +39,17 @@ export function WrongNetworkAlert() {
             </Dialog.Title>
             <Dialog.Description className="text-sm leading-6 text-gray-600 dark:text-gray-300">
               {t("Your wallet is currently on ", "Ví hiện đang ở ")}
-              <span className="font-bold">{network?.name ?? t("another network", "mạng khác")}</span>.
+              <span className="font-bold">{walletNetwork?.name ?? t("another network", "mạng khác")}</span>.
               {" "}
               {t("Open your wallet and switch to ", "Hãy mở ví và chuyển sang ")}
-              <span className="font-bold">{NETWORK}</span>;
+              <span className="font-bold">{shelbyNetworkLabel(activeNetwork)}</span>;
               {" "}
               {t("the app will continue automatically when the network matches.", "ứng dụng sẽ tự tiếp tục khi nhận đúng mạng.")}
             </Dialog.Description>
-            <Button variant="outline" className="mt-5 rounded-xl" onClick={() => void disconnect()}><LogOut className="mr-2 h-4 w-4" />{t("Disconnect wallet", "Ngắt kết nối ví")}</Button>
+            <div className="mt-5 flex flex-col justify-center gap-2 sm:flex-row">
+              <Button className="rounded-xl" onClick={() => void switchWallet()}><RefreshCw className="mr-2 h-4 w-4" />{t("Switch wallet network", "Đổi mạng ví")}</Button>
+              <Button variant="outline" className="rounded-xl" onClick={() => void disconnect()}><LogOut className="mr-2 h-4 w-4" />{t("Disconnect", "Ngắt kết nối")}</Button>
+            </div>
           </div>
         </Dialog.Content>
       </Dialog.Portal>

@@ -1,7 +1,8 @@
 import { getShelbyBlobUrl } from "@/utils/shelbyConfig";
-import { SHELBY_CLIENT_API_KEY } from "@/utils/geomiClientKey";
+import { getShelbyClientKeyResult } from "@/utils/geomiClientKey";
 import type { AccessPolicyInfo } from "@/utils/accessControl";
 import { localize } from "@/i18n";
+import { getStoredShelbyNetwork, type SupportedShelbyNetwork } from "@/utils/shelbyNetwork";
 
 /** The access labels understood by the RAG importer and its access broker. */
 export type BlobAccessTag = "public" | "allowlist" | "purchasable" | "time_lock";
@@ -211,9 +212,9 @@ export function isRagSourceEligible(blob: unknown, walletAddress?: string, nowMi
   return decision.eligible && (decision.info.tag === "public" || decision.info.tag === "time_lock");
 }
 
-async function signedBrokerGrant(owner: string, blobName: string, walletAddress: string, tag: BlobAccessTag, signMessage: (input: any) => Promise<unknown>, signal?: AbortSignal): Promise<BrokerGrant> {
+async function signedBrokerGrant(owner: string, blobName: string, walletAddress: string, tag: BlobAccessTag, network: SupportedShelbyNetwork, signMessage: (input: any) => Promise<unknown>, signal?: AbortSignal): Promise<BrokerGrant> {
   const challengeResponse = await fetch(`${brokerUrl}/v1/rag-access/challenge`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ owner, blobName, walletAddress, tag }), signal,
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ network, owner, blobName, walletAddress, tag }), signal,
   });
   if (!challengeResponse.ok) throw new Error(localize(`The secure access service could not start verification (${challengeResponse.status}).`, `Dịch vụ xác thực không thể bắt đầu kiểm tra (${challengeResponse.status}).`));
   const challenge = await challengeResponse.json() as BrokerChallenge;
@@ -222,7 +223,7 @@ async function signedBrokerGrant(owner: string, blobName: string, walletAddress:
   const signature = await signMessage({ message: challenge.challenge, nonce: challenge.nonce ?? "shelby-rag-access", application: "Shelby RAG Explorer" });
   signal?.throwIfAborted();
   const grantResponse = await fetch(`${brokerUrl}/v1/rag-access/resolve`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ owner, blobName, walletAddress, tag, challenge, signature }), signal,
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ network, owner, blobName, walletAddress, tag, challenge, signature }), signal,
   });
   if (!grantResponse.ok) throw new Error(localize(
     `Access was denied (${grantResponse.status}). Check the allowlist or purchase receipt.`,
@@ -254,6 +255,7 @@ export async function downloadBlobForRag(params: {
   signMessage: (input: any) => Promise<unknown>;
   maxBytes?: number;
   signal?: AbortSignal;
+  network?: SupportedShelbyNetwork;
 }): Promise<RagBlobDownload> {
   params.signal?.throwIfAborted();
   const record = asRecord(params.blob);
@@ -275,12 +277,14 @@ export async function downloadBlobForRag(params: {
     const url = URL.createObjectURL(content);
     return { url, content, dispose: () => URL.revokeObjectURL(url) };
   }
+  const network = params.network ?? getStoredShelbyNetwork();
+  const clientKey = getShelbyClientKeyResult(network).key;
   const grant = decision.needsBroker
-    ? await signedBrokerGrant(params.owner, params.blobName, params.walletAddress, decision.info.tag, params.signMessage, params.signal)
+    ? await signedBrokerGrant(params.owner, params.blobName, params.walletAddress, decision.info.tag, network, params.signMessage, params.signal)
     : {
-        url: getShelbyBlobUrl(params.owner, params.blobName),
-        headers: SHELBY_CLIENT_API_KEY
-          ? { Authorization: `Bearer ${SHELBY_CLIENT_API_KEY}` }
+        url: getShelbyBlobUrl(params.owner, params.blobName, network),
+        headers: clientKey
+          ? { Authorization: `Bearer ${clientKey}` }
           : undefined,
       };
   // The SDK's current getBlob API cannot receive an AbortSignal. This equivalent
@@ -328,5 +332,5 @@ export async function downloadBlobForRag(params: {
   }
   const content = new Blob(chunks, { type: contentType });
   const url = URL.createObjectURL(content);
-  return { url, content, blobUrl: decision.info.tag === "public" ? getShelbyBlobUrl(params.owner, params.blobName) : undefined, dispose: () => URL.revokeObjectURL(url) };
+  return { url, content, blobUrl: decision.info.tag === "public" ? getShelbyBlobUrl(params.owner, params.blobName, network) : undefined, dispose: () => URL.revokeObjectURL(url) };
 }

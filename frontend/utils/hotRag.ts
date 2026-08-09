@@ -5,6 +5,7 @@ import { normalizeSearchText } from "@/utils/textExtractor";
 import { getShelbyBlobUrl } from "@/utils/shelbyConfig";
 import type { PageRecord, PortableRagDocument, PortableRagPackage, RetrievalResult } from "@/utils/ragTypes";
 import { localize } from "@/i18n";
+import { isSupportedShelbyNetwork, type SupportedShelbyNetwork } from "@/utils/shelbyNetwork";
 
 export const HOT_RAG_MANIFEST_SUFFIX = ".shelby-hot-rag.json";
 export const HOT_RAG_SHARD_SUFFIX = ".shelby-hot-rag-part.json";
@@ -18,6 +19,12 @@ const MAX_HOT_RAG_SHARDS = 4_096;
 const MAX_HOT_RAG_SHARD_BYTES = 8 * 1024 * 1024;
 const SHA256_HEX = /^0x[0-9a-f]{64}$/i;
 const parsedManifestByteLengths = new WeakMap<object, number>();
+
+export function hotRagSourceNetwork(manifest: HotRagManifest): SupportedShelbyNetwork {
+  return manifest.version === 3 && isSupportedShelbyNetwork(manifest.sourceNetwork)
+    ? manifest.sourceNetwork
+    : "testnet";
+}
 
 type PortableManifest = PortableRagDocument["manifest"];
 type PortablePage = PortableRagDocument["pages"][number];
@@ -45,7 +52,9 @@ export interface HotRagShardDescriptor {
 
 export interface HotRagManifest {
   format: "shelby-hot-rag-manifest";
-  version: 1 | 2;
+  version: 1 | 2 | 3;
+  /** Required for v3; v1/v2 artifacts are interpreted as legacy Testnet. */
+  sourceNetwork?: SupportedShelbyNetwork;
   snapshotId: string;
   exportedAt: number;
   sourceOwner: string;
@@ -233,7 +242,7 @@ function createShard(snapshotId: string, index: number, entries: Array<{ documen
 
 export function isHotRagManifest(value: unknown): value is HotRagManifest {
   const candidate = value as Partial<HotRagManifest> | null;
-  if (!candidate || candidate.format !== "shelby-hot-rag-manifest" || (candidate.version !== 1 && candidate.version !== 2) || typeof candidate.snapshotId !== "string" || !candidate.snapshotId || typeof candidate.sourceOwner !== "string" || !candidate.sourceOwner || !Array.isArray(candidate.shards) || !Array.isArray(candidate.documents) || !candidate.totals || typeof candidate.totals !== "object") return false;
+  if (!candidate || candidate.format !== "shelby-hot-rag-manifest" || ![1, 2, 3].includes(Number(candidate.version)) || (candidate.version === 3 && !isSupportedShelbyNetwork(candidate.sourceNetwork)) || typeof candidate.snapshotId !== "string" || !candidate.snapshotId || typeof candidate.sourceOwner !== "string" || !candidate.sourceOwner || !Array.isArray(candidate.shards) || !Array.isArray(candidate.documents) || !candidate.totals || typeof candidate.totals !== "object") return false;
   if (!candidate.shards.length || candidate.shards.length > MAX_HOT_RAG_SHARDS) return false;
   return candidate.shards.every((descriptor, index) => (
     descriptor?.index === index
@@ -293,7 +302,7 @@ export function parseHotRagPackHeader(bytes: Uint8Array): HotRagPackHeader {
 
 export function parseHotRagPackManifest(bytes: Uint8Array, packByteLength?: number): HotRagManifest {
   const value = JSON.parse(new TextDecoder().decode(bytes));
-  if (!isHotRagManifest(value) || value.version !== 2) throw new Error(localize("The Shelby backup directory is invalid.", "Mục lục trong bản sao Shelby không hợp lệ."));
+  if (!isHotRagManifest(value) || (value.version !== 2 && value.version !== 3)) throw new Error(localize("The Shelby backup directory is invalid.", "Mục lục trong bản sao Shelby không hợp lệ."));
   if (value.shards.some((descriptor) => !Number.isSafeInteger(descriptor.byteOffset) || descriptor.byteOffset! < 0 || !Number.isSafeInteger(descriptor.byteLength) || descriptor.byteLength <= 0)) {
     throw new Error(localize("The Shelby backup directory contains an invalid data region.", "Mục lục trong bản sao Shelby chứa vùng dữ liệu không hợp lệ."));
   }
@@ -330,7 +339,8 @@ export function hotRagPartBlobName(manifestBlobName: string, index: number): str
 export async function buildHotRagSnapshot(packageData: PortableRagPackage, baseName: string, targetShardBytes = DEFAULT_HOT_RAG_SHARD_BYTES): Promise<HotRagSnapshot> {
   if (!packageData.documents.length) throw new Error(localize("There are no documents to back up yet.", "Kho tri thức chưa có tài liệu để lưu."));
   const safeTarget = Math.max(64 * 1024, targetShardBytes);
-  const snapshotId = `${packageData.sourceOwner.toLowerCase()}:${packageData.exportedAt}`;
+  const sourceNetwork = packageData.version === 2 ? packageData.sourceNetwork : "testnet";
+  const snapshotId = `${sourceNetwork}:${packageData.sourceOwner.toLowerCase()}:${packageData.exportedAt}`;
   const entries = packageData.documents.flatMap((document) => document.chunks.map((chunk, chunkIndex) => ({ document, chunk, chunkIndex })));
   if (!entries.length) throw new Error(localize("There are no searchable chunks to back up yet.", "Kho tri thức chưa có chunks để lưu."));
 
@@ -389,7 +399,8 @@ export async function buildHotRagSnapshot(packageData: PortableRagPackage, baseN
 
   const manifest: HotRagManifest = {
     format: "shelby-hot-rag-manifest",
-    version: 1,
+    version: 3,
+    sourceNetwork,
     snapshotId,
     exportedAt: packageData.exportedAt,
     sourceOwner: packageData.sourceOwner,
@@ -430,7 +441,7 @@ export async function buildHotRagPack(packageData: PortableRagPackage, blobName:
     byteOffset += encodedParts[index].byteLength;
     return descriptor;
   });
-  const manifest: HotRagManifest = { ...legacyShape.manifest, version: 2, shards: descriptors };
+  const manifest: HotRagManifest = { ...legacyShape.manifest, version: 3, shards: descriptors };
   const manifestContent = JSON.stringify(manifest);
   const manifestBytes = textEncoder.encode(manifestContent);
   parsedManifestByteLengths.set(manifest, manifestBytes.byteLength);
@@ -465,9 +476,11 @@ export async function buildHotRagPack(packageData: PortableRagPackage, blobName:
 }
 
 export function hotRagManifestToPortableCatalog(manifest: HotRagManifest): PortableRagPackage {
+  const sourceNetwork = hotRagSourceNetwork(manifest);
   return {
     format: "shelby-rag-package",
-    version: 1,
+    version: 2,
+    sourceNetwork,
     exportedAt: manifest.exportedAt,
     sourceOwner: manifest.sourceOwner,
     inventory: manifest.inventory,
@@ -475,8 +488,8 @@ export function hotRagManifestToPortableCatalog(manifest: HotRagManifest): Porta
   };
 }
 
-function remoteDocumentId(owner: string, source: string): string {
-  return `shelby:${owner.toLowerCase()}:${source}`;
+function remoteDocumentId(owner: string, source: string, network: SupportedShelbyNetwork): string {
+  return `shelby:${network}:${owner.toLowerCase()}:${source}`;
 }
 
 function metricNow(): number {
@@ -641,6 +654,7 @@ export class HotRagRuntime {
   }
 
   private async rankEntries(query: string, shards: HotRagShard[], excludeSources: Set<string>, signal?: AbortSignal): Promise<RetrievalResult[]> {
+    const network = hotRagSourceNetwork(this.manifest);
     const queryTokens = tokens(query);
     const normalizedQuery = normalizeSearchText(query);
     const providers = new Set<EmbeddingProvider>();
@@ -665,7 +679,7 @@ export class HotRagRuntime {
         const score = coverage * 0.42 + (exact ? 0.85 : 0) + Math.max(0, semantic) * 0.5;
         if (score < 0.12) continue;
         const owner = document.manifest.originalSourceOwner || this.manifest.sourceOwner;
-        const documentId = remoteDocumentId(owner, source);
+        const documentId = remoteDocumentId(owner, source, network);
         const page = document.pages.find((candidate) => candidate.pageNumber === chunk.pageNumber);
         const isPublic = document.manifest.accessTag === "public";
         results.push({
@@ -678,8 +692,9 @@ export class HotRagRuntime {
           excerpt: chunk.text,
           score,
           imageUrl: chunk.imageUrl,
-          link: isPublic ? `${getShelbyBlobUrl(owner, source)}${chunk.pageNumber ? `#page=${chunk.pageNumber}` : ""}` : undefined,
+          link: isPublic ? `${getShelbyBlobUrl(owner, source, network)}${chunk.pageNumber ? `#page=${chunk.pageNumber}` : ""}` : undefined,
           provenance: {
+            network,
             owner,
             accessTag: document.manifest.accessTag,
             blobId: document.manifest.blobId,
@@ -720,10 +735,11 @@ export class HotRagRuntime {
   }
 
   getPageRecord(documentId: string, pageNumber: number): PageRecord | undefined {
+    const network = hotRagSourceNetwork(this.manifest);
     for (const cached of this.cache.values()) {
       for (const document of cached.shard.documents) {
         const owner = document.manifest.originalSourceOwner || this.manifest.sourceOwner;
-        if (remoteDocumentId(owner, document.manifest.source) !== documentId) continue;
+        if (remoteDocumentId(owner, document.manifest.source, network) !== documentId) continue;
         const page = document.pages.find((candidate) => candidate.pageNumber === pageNumber);
         if (page) return { ...page, id: `${documentId}:page:${pageNumber}`, owner, documentId };
       }
@@ -747,7 +763,8 @@ export class HotRagRuntime {
     }
     return {
       format: "shelby-rag-package",
-      version: 1,
+      version: 2,
+      sourceNetwork: hotRagSourceNetwork(this.manifest),
       exportedAt: this.manifest.exportedAt,
       sourceOwner: this.manifest.sourceOwner,
       inventory: this.manifest.inventory,

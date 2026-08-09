@@ -1,8 +1,21 @@
+import { BlobNameSchema } from "@shelby-protocol/sdk/browser";
 import { aptosClient } from "@/utils/aptosClient";
+import { getShelbyRuntime } from "@/utils/shelbyConfig";
+import { getStoredShelbyNetwork, type SupportedShelbyNetwork } from "@/utils/shelbyNetwork";
 
-/** Default access-control deployment used by this Shelby explorer. */
-export const ACCESS_CONTROL_MODULE_ADDRESS = import.meta.env.VITE_ACCESS_CONTROL_MODULE_ADDRESS
-  ?? "0x5211945b33c28c975544f65d361c3739a0244eb6779920128d72e7f70c088069";
+const DEFAULT_TESTNET_ACCESS_CONTROL_MODULE_ADDRESS = "0x5211945b33c28c975544f65d361c3739a0244eb6779920128d72e7f70c088069";
+
+/** A module address is network-local; never query Testnet's deployment on ShelbyNet. */
+export function getAccessControlModuleAddress(network: SupportedShelbyNetwork): string | null {
+  const configured = network === "shelbynet"
+    ? import.meta.env.VITE_SHELBYNET_ACCESS_CONTROL_MODULE_ADDRESS
+    : import.meta.env.VITE_TESTNET_ACCESS_CONTROL_MODULE_ADDRESS || import.meta.env.VITE_ACCESS_CONTROL_MODULE_ADDRESS;
+  const value = configured?.trim() || (network === "testnet" ? DEFAULT_TESTNET_ACCESS_CONTROL_MODULE_ADDRESS : "");
+  return value || null;
+}
+
+/** @deprecated Testnet compatibility export; use getAccessControlModuleAddress(network). */
+export const ACCESS_CONTROL_MODULE_ADDRESS = getAccessControlModuleAddress("testnet")!;
 
 export interface AccessPolicyInfo {
   type: "allowlist" | "timelock" | "purchasable" | "custom" | "none" | "unknown";
@@ -20,6 +33,21 @@ export interface AccessPoliciesSnapshot {
   /** False means at least one policy could not be verified or decoded. */
   verified: boolean;
   unresolvedNames: string[];
+}
+
+/** Cache access checks per network, wallet and normalized blob inventory. */
+export function accessPolicyQueryKey(
+  network: SupportedShelbyNetwork,
+  ownerAddress: string,
+  blobNames: string[],
+) {
+  return [
+    "shelby",
+    "access-policies",
+    network,
+    ownerAddress.toLowerCase(),
+    [...new Set(blobNames.filter(Boolean))].sort(),
+  ] as const;
 }
 
 class BcsReader {
@@ -134,12 +162,30 @@ export function createAccessControlBlobName(ownerAddress: string, blobNameSuffix
  * Queries the same on-chain source as shelbyproject's Explorer. A query error
  * deliberately remains `unknown`, never silently becomes a public blob.
  */
-export async function queryAccessPolicy(ownerAddress: string, blobNameSuffix: string, signal?: AbortSignal): Promise<AccessPolicyInfo> {
+export async function queryAccessPolicy(
+  ownerAddress: string,
+  blobNameSuffix: string,
+  signal?: AbortSignal,
+  network: SupportedShelbyNetwork = getStoredShelbyNetwork(),
+): Promise<AccessPolicyInfo> {
   try {
     signal?.throwIfAborted();
-    const result = await aptosClient().view({
+    const moduleAddress = getAccessControlModuleAddress(network);
+    if (!moduleAddress) {
+      // ShelbyNet object-v2 does not use the legacy Testnet access-control
+      // deployment. Verify the on-chain encryption scheme instead: only an
+      // explicitly unencrypted object is readable without a decryptor.
+      const metadata = await getShelbyRuntime(network).blobClient.getFullObjectMetadata({
+        account: ownerAddress,
+        name: BlobNameSchema.parse(blobNameSuffix),
+      });
+      signal?.throwIfAborted();
+      if (metadata?.encryption === "Unencrypted") return { type: "none", canAccess: true };
+      return { type: "unknown", canAccess: null };
+    }
+    const result = await aptosClient(network).view({
       payload: {
-        function: `${ACCESS_CONTROL_MODULE_ADDRESS}::access_control::query3_bcs`,
+        function: `${moduleAddress}::access_control::query3_bcs`,
         functionArguments: [ownerAddress, createAccessControlBlobName(ownerAddress, blobNameSuffix)],
       },
     });
@@ -153,14 +199,19 @@ export async function queryAccessPolicy(ownerAddress: string, blobNameSuffix: st
   }
 }
 
-export async function queryAccessPolicies(ownerAddress: string, blobNames: string[], signal?: AbortSignal): Promise<AccessPoliciesSnapshot> {
+export async function queryAccessPolicies(
+  ownerAddress: string,
+  blobNames: string[],
+  signal?: AbortSignal,
+  network: SupportedShelbyNetwork = getStoredShelbyNetwork(),
+): Promise<AccessPoliciesSnapshot> {
   const policiesByName = new Map<string, AccessPolicyInfo>();
   const uniqueNames = [...new Set(blobNames.filter(Boolean))];
   const batchSize = 6;
   for (let offset = 0; offset < uniqueNames.length; offset += batchSize) {
     signal?.throwIfAborted();
     const batch = uniqueNames.slice(offset, offset + batchSize);
-    const policies = await Promise.all(batch.map((blobName) => queryAccessPolicy(ownerAddress, blobName, signal)));
+    const policies = await Promise.all(batch.map((blobName) => queryAccessPolicy(ownerAddress, blobName, signal, network)));
     signal?.throwIfAborted();
     batch.forEach((blobName, index) => policiesByName.set(blobName, policies[index]));
   }

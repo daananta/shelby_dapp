@@ -11,6 +11,8 @@ type ResponseLike = {
   status: (code: number) => ResponseLike;
   setHeader: (name: string, value: string) => void;
   json: (value: unknown) => void;
+  write?: (chunk: string) => boolean;
+  end?: () => void;
 };
 
 type ChatRole = "system" | "user" | "assistant" | "tool";
@@ -102,15 +104,27 @@ function sanitizeAvailableToolNames(value: unknown): Set<string> | null {
   return names;
 }
 
-function sanitizeToolCalls(value: unknown, availableTools: ReadonlySet<string>): ChatMessage["tool_calls"] {
+function serializeToolArguments(value: unknown, allowObjectArguments: boolean): string | undefined {
+  if (typeof value === "string") return value.length <= 4_000 ? value : undefined;
+  if (!allowObjectArguments || !isRecord(value)) return undefined;
+  const serialized = JSON.stringify(value);
+  return serialized.length <= 4_000 ? serialized : undefined;
+}
+
+function sanitizeToolCalls(
+  value: unknown,
+  availableTools: ReadonlySet<string>,
+  options: { allowObjectArguments?: boolean; generateMissingIds?: boolean } = {},
+): ChatMessage["tool_calls"] {
   if (!Array.isArray(value) || value.length > 3) return undefined;
   const calls: NonNullable<ChatMessage["tool_calls"]> = [];
-  for (const item of value) {
+  for (const [index, item] of value.entries()) {
     if (!isRecord(item) || !isRecord(item.function)) return undefined;
-    const id = typeof item.id === "string" ? item.id.slice(0, 200) : "";
+    const providerId = typeof item.id === "string" ? item.id.trim().slice(0, 200) : "";
+    const id = providerId || (options.generateMissingIds ? `tool-call-${Date.now().toString(36)}-${index}` : "");
     const name = typeof item.function.name === "string" ? item.function.name : "";
-    const args = typeof item.function.arguments === "string" ? item.function.arguments : "";
-    if (!id || !availableTools.has(name) || args.length > 4_000) return undefined;
+    const args = serializeToolArguments(item.function.arguments, options.allowObjectArguments === true);
+    if (!id || !availableTools.has(name) || args === undefined) return undefined;
     calls.push({ id, type: "function", function: { name, arguments: args } });
   }
   return calls.length ? calls : undefined;
@@ -158,13 +172,20 @@ function sanitizeChatResponseMessage(
   value: Record<string, unknown>,
   availableTools: ReadonlySet<string>,
 ): ChatMessage | null {
-  const content = value.content === null
-    ? null
-    : typeof value.content === "string"
-      ? value.content.trim()
+  const content = typeof value.content === "string"
+    ? value.content.trim()
+    : Array.isArray(value.content)
+      ? value.content
+        .filter((part): part is Record<string, unknown> => isRecord(part))
+        .map((part) => typeof part.text === "string" ? part.text : "")
+        .join("")
+        .trim() || null
       : null;
   if (content && content.length > 16_000) return null;
-  const toolCalls = sanitizeToolCalls(value.tool_calls, availableTools);
+  const toolCalls = sanitizeToolCalls(value.tool_calls, availableTools, {
+    allowObjectArguments: true,
+    generateMissingIds: true,
+  });
   if (Array.isArray(value.tool_calls) && !toolCalls) return null;
   const reasoningDetails = Array.isArray(value.reasoning_details)
     && JSON.stringify(value.reasoning_details).length <= 16_000
@@ -286,6 +307,108 @@ function sanitizeVisionResponseMessage(value: Record<string, unknown>) {
   return { role: "assistant" as const, content };
 }
 
+type StreamedToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+};
+
+function writeSse(response: ResponseLike, event: "token" | "message" | "error", value: unknown) {
+  response.write?.(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`);
+}
+
+async function relayChatStream(
+  upstream: Response,
+  response: ResponseLike,
+  availableTools: ReadonlySet<string>,
+) {
+  if (!upstream.body || !response.write || !response.end) return false;
+  response.status(200);
+  response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  response.setHeader("Cache-Control", "no-cache, no-transform");
+  response.setHeader("X-Accel-Buffering", "no");
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  const reasoningDetails: unknown[] = [];
+  const streamedCalls = new Map<number, StreamedToolCall>();
+
+  const consumeEvent = (rawEvent: string) => {
+    const data = rawEvent
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (!data || data === "[DONE]") return;
+    const parsed = JSON.parse(data) as { choices?: Array<{ delta?: unknown }> };
+    const delta = parsed.choices?.[0]?.delta;
+    if (!isRecord(delta)) return;
+    const text = typeof delta.content === "string"
+      ? delta.content
+      : Array.isArray(delta.content)
+        ? delta.content
+          .filter((part): part is Record<string, unknown> => isRecord(part))
+          .map((part) => typeof part.text === "string" ? part.text : "")
+          .join("")
+        : "";
+    if (text) {
+      content += text;
+      writeSse(response, "token", { text });
+    }
+    if (Array.isArray(delta.reasoning_details)) reasoningDetails.push(...delta.reasoning_details);
+    if (!Array.isArray(delta.tool_calls)) return;
+    for (const [fallbackIndex, item] of delta.tool_calls.entries()) {
+      if (!isRecord(item)) continue;
+      const index = typeof item.index === "number" && Number.isInteger(item.index) ? item.index : fallbackIndex;
+      const current = streamedCalls.get(index) ?? {
+        id: "",
+        type: "function" as const,
+        function: { name: "", arguments: "" },
+      };
+      if (typeof item.id === "string") current.id += item.id;
+      if (isRecord(item.function)) {
+        if (typeof item.function.name === "string") current.function.name += item.function.name;
+        if (typeof item.function.arguments === "string") current.function.arguments += item.function.arguments;
+      }
+      streamedCalls.set(index, current);
+    }
+  };
+
+  let streamComplete = false;
+  while (!streamComplete) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      consumeEvent(buffer.slice(0, boundary));
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+    }
+    streamComplete = done;
+  }
+  if (buffer.trim()) consumeEvent(buffer);
+
+  const rawMessage: Record<string, unknown> = {
+    role: "assistant",
+    content: content || null,
+    ...(streamedCalls.size
+      ? { tool_calls: [...streamedCalls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call) }
+      : {}),
+    ...(reasoningDetails.length ? { reasoning_details: reasoningDetails } : {}),
+  };
+  const message = sanitizeChatResponseMessage(rawMessage, availableTools);
+  if (!message) {
+    writeSse(response, "error", { status: 422, kind: "invalid_response" });
+    response.end();
+    return true;
+  }
+  writeSse(response, "message", { message });
+  response.end();
+  return true;
+}
+
 class UpstreamError extends Error {
   constructor(
     readonly status: number,
@@ -314,6 +437,10 @@ export default async function handler(request: RequestLike, response: ResponseLi
   }
   const body = isRecord(request.body) ? request.body : {};
   const isVisionRequest = body.mode === "vision";
+  const wantsChatStream = !isVisionRequest
+    && body.stream === true
+    && typeof response.write === "function"
+    && typeof response.end === "function";
   const isAgentContinuation = !isVisionRequest
     && Array.isArray(body.messages)
     && body.messages.some((message) => isRecord(message) && message.role === "tool");
@@ -386,6 +513,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
       temperature: 0.2,
       reasoning: AGENT_REASONING,
       max_tokens: MAX_OUTPUT_TOKENS,
+      ...(wantsChatStream ? { stream: true } : {}),
     };
   }
 
@@ -402,6 +530,12 @@ export default async function handler(request: RequestLike, response: ResponseLi
       signal: AbortSignal.timeout(45_000),
     });
     if (!upstream.ok) throw new UpstreamError(upstream.status, upstream.headers.get("retry-after") ?? undefined);
+    const upstreamContentType = upstream.headers.get("content-type")?.toLowerCase() ?? "";
+    if (
+      wantsChatStream
+      && upstreamContentType.includes("text/event-stream")
+      && await relayChatStream(upstream, response, chatAvailableTools)
+    ) return;
     const payload = await upstream.json() as {
       id?: string;
       model?: string;
@@ -409,15 +543,22 @@ export default async function handler(request: RequestLike, response: ResponseLi
       usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
     };
     const message = payload.choices?.[0]?.message;
-    if (!isRecord(message)) throw new Error("OpenRouter response was incomplete");
+    if (!isRecord(message)) {
+      response.status(422).json({ error: "Hosted AI response was incomplete", kind: "invalid_response" });
+      return;
+    }
     const responseMessage = isVisionRequest
       ? sanitizeVisionResponseMessage(message)
       : sanitizeChatResponseMessage(message, chatAvailableTools);
-    if (!responseMessage) throw new Error(
-      isVisionRequest
-        ? "OpenRouter vision response was incomplete"
-        : "OpenRouter chat response was incomplete",
-    );
+    if (!responseMessage) {
+      response.status(422).json({
+        error: isVisionRequest
+          ? "Hosted AI vision response was incomplete"
+          : "Hosted AI chat response was incomplete",
+        kind: isVisionRequest ? "invalid_image" : "invalid_response",
+      });
+      return;
+    }
     response.status(200).json({
       id: payload.id,
       model: payload.model ?? MODEL,

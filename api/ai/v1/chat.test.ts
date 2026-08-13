@@ -30,6 +30,33 @@ function responseRecorder() {
   };
 }
 
+function streamingResponseRecorder() {
+  let statusCode = 200;
+  let ended = false;
+  const chunks: string[] = [];
+  const headers = new Map<string, string>();
+  const response = {
+    status(code: number) {
+      statusCode = code;
+      return response;
+    },
+    setHeader(name: string, value: string) {
+      headers.set(name.toLowerCase(), value);
+    },
+    json(value: unknown) {
+      chunks.push(JSON.stringify(value));
+    },
+    write(chunk: string) {
+      chunks.push(chunk);
+      return true;
+    },
+    end() {
+      ended = true;
+    },
+  };
+  return { response, read: () => ({ statusCode, ended, chunks, headers }) };
+}
+
 describe("hosted Qwen gateway", () => {
   it("keeps the provider key server-side and pins the model", async () => {
     process.env.APP_ORIGIN = "https://example.test";
@@ -94,6 +121,137 @@ describe("hosted Qwen gateway", () => {
       .toEqual(["search_user_knowledge", "get_connected_wallet"]);
   });
 
+  it("normalizes provider tool calls with object arguments and a missing id", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{
+        message: {
+          role: "assistant",
+          content: [],
+          tool_calls: [{
+            type: "function",
+            function: { name: "get_wallet_blob_inventory", arguments: { detail: "count" } },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } })));
+    const recorder = responseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.66" },
+      body: {
+        messages: [{ role: "user", content: "How many blobs do I have?" }],
+        availableTools: ["get_wallet_blob_inventory"],
+      },
+    }, recorder.response);
+
+    expect(recorder.read()).toMatchObject({
+      statusCode: 200,
+      payload: {
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: expect.stringMatching(/^tool-call-/),
+            type: "function",
+            function: { name: "get_wallet_blob_inventory", arguments: "{\"detail\":\"count\"}" },
+          }],
+        },
+      },
+    });
+  });
+
+  it("relays OpenRouter tokens and the final tool-safe message as SSE", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    const upstreamBody = [
+      "data: {\"choices\":[{\"delta\":{\"content\":\"Your wallet \"}}]}",
+      "",
+      "data: {\"choices\":[{\"delta\":{\"content\":\"has one blob.\"}}]}",
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })));
+    const recorder = streamingResponseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.68" },
+      body: {
+        stream: true,
+        messages: [{ role: "user", content: "How many blobs do I have?" }],
+        availableTools: ["get_wallet_blob_inventory"],
+      },
+    }, recorder.response);
+
+    const result = recorder.read();
+    expect(result.statusCode).toBe(200);
+    expect(result.ended).toBe(true);
+    expect(result.headers.get("content-type")).toContain("text/event-stream");
+    expect(result.chunks.join(""))
+      .toContain("event: token\ndata: {\"text\":\"Your wallet \"}");
+    expect(result.chunks.join(""))
+      .toContain("event: message\ndata: {\"message\":{\"role\":\"assistant\",\"content\":\"Your wallet has one blob.\"}}");
+  });
+
+  it("assembles fragmented streamed tool calls before returning them to the browser", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    const upstreamBody = [
+      "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"inventory-\",\"function\":{\"name\":\"get_wallet_blob_inventory\",\"arguments\":\"{\\\"detail\\\":\"}}]}}]}",
+      "",
+      "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"1\",\"function\":{\"arguments\":\"\\\"count\\\"}\"}}]}}]}",
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })));
+    const recorder = streamingResponseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.69" },
+      body: {
+        stream: true,
+        messages: [{ role: "user", content: "How many blobs do I have?" }],
+        availableTools: ["get_wallet_blob_inventory"],
+      },
+    }, recorder.response);
+
+    expect(recorder.read().chunks.join(""))
+      .toContain("event: message\ndata: {\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"inventory-1\",\"type\":\"function\",\"function\":{\"name\":\"get_wallet_blob_inventory\",\"arguments\":\"{\\\"detail\\\":\\\"count\\\"}\"}}]}}");
+  });
+
+  it("reports a malformed provider answer as invalid instead of provider downtime", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", content: null }, finish_reason: "tool_calls" }],
+    }), { status: 200, headers: { "content-type": "application/json" } })));
+    const recorder = responseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.67" },
+      body: { messages: [{ role: "user", content: "How many blobs do I have?" }] },
+    }, recorder.response);
+
+    expect(recorder.read()).toMatchObject({
+      statusCode: 422,
+      payload: { kind: "invalid_response" },
+    });
+  });
+
   it("rejects an upstream tool call that the current browser turn cannot execute", async () => {
     process.env.APP_ORIGIN = "https://example.test";
     process.env.OPENROUTER_API_KEY = "server-only-test-key";
@@ -123,8 +281,8 @@ describe("hosted Qwen gateway", () => {
     }, recorder.response);
 
     expect(recorder.read()).toMatchObject({
-      statusCode: 502,
-      payload: { error: "Hosted AI is unavailable" },
+      statusCode: 422,
+      payload: { error: "Hosted AI chat response was incomplete", kind: "invalid_response" },
     });
   });
 

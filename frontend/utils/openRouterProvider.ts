@@ -124,6 +124,66 @@ async function requestHostedGateway(
   return { response, payload: payload as HostedGatewayPayload };
 }
 
+async function requestHostedChatStream(
+  response: Response,
+  signal: AbortSignal | undefined,
+  onToken: (text: string) => void,
+): Promise<HostedChatResponse["message"]> {
+  if (!response.body) throw new HostedAiError(
+    "invalid_response",
+    localize("Qwen returned an empty stream.", "Qwen trả về luồng dữ liệu rỗng."),
+    response.status,
+  );
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalMessage: HostedChatResponse["message"];
+
+  const consumeEvent = (rawEvent: string) => {
+    const event = rawEvent.split("\n").find((line) => line.startsWith("event:"))?.slice(6).trim() ?? "message";
+    const data = rawEvent
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (!data) return;
+    const payload = JSON.parse(data) as HostedGatewayPayload & { text?: string; status?: number };
+    if (event === "token") {
+      if (payload.text) onToken(payload.text);
+      return;
+    }
+    if (event === "error") {
+      throw hostedGatewayFailure(
+        new Response(null, { status: payload.status ?? 502 }),
+        payload,
+        "chat",
+      );
+    }
+    if (payload.message) finalMessage = payload.message;
+  };
+
+  let streamComplete = false;
+  while (!streamComplete) {
+    signal?.throwIfAborted();
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      consumeEvent(buffer.slice(0, boundary));
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+    }
+    streamComplete = done;
+  }
+  if (buffer.trim()) consumeEvent(buffer);
+  if (!finalMessage) throw new HostedAiError(
+    "invalid_response",
+    localize("Qwen returned an incomplete stream.", "Qwen trả về luồng dữ liệu chưa hoàn chỉnh."),
+    response.status,
+  );
+  return finalMessage;
+}
+
 function hostedGatewayFailure(
   response: Response,
   payload: HostedGatewayPayload,
@@ -154,6 +214,15 @@ function hostedGatewayFailure(
         "The app's AI service needs server configuration. Try Gemini or contact the app owner.",
         "Dịch vụ AI của ứng dụng chưa được cấu hình đầy đủ. Hãy dùng Gemini hoặc liên hệ chủ ứng dụng.",
       ),
+      response.status,
+    );
+  }
+  if (response.status === 422 || payload.kind === "invalid_response") {
+    return new HostedAiError(
+      "invalid_response",
+      mode === "vision"
+        ? localize("Qwen returned an incomplete image analysis. Please try again.", "Qwen trả về phân tích ảnh chưa hoàn chỉnh. Hãy thử lại.")
+        : localize("Qwen returned an incomplete tool response. Please try again.", "Qwen trả về lệnh công cụ chưa hoàn chỉnh. Hãy thử lại."),
       response.status,
     );
   }
@@ -418,8 +487,49 @@ async function requestHostedChat(
   signal?: AbortSignal,
   toolChoice: "auto" | "none" = "auto",
   availableTools: AgentToolName[] = [],
+  onToken?: (text: string) => void,
 ): Promise<HostedChatResponse["message"]> {
   signal?.throwIfAborted();
+  if (onToken) {
+    let response: Response;
+    try {
+      response = await fetch("/api/ai/v1/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages, toolChoice, availableTools, stream: true }),
+        signal,
+      });
+    } catch (error) {
+      if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+      throw new HostedAiError(
+        "unavailable",
+        localize("The AI service could not be reached. Check your connection and try again.", "Không thể kết nối tới dịch vụ AI. Hãy kiểm tra mạng và thử lại."),
+      );
+    }
+    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+    if (response.ok && contentType.includes("text/event-stream")) {
+      return requestHostedChatStream(response, signal, onToken);
+    }
+    if (!contentType.includes("json")) {
+      throw new HostedAiError(
+        "unavailable",
+        isLocalPreviewHost()
+          ? localize(
+            "This local preview does not run the AI service. Start the full app with npm run dev:fullstack, or use production.",
+            "Bản xem trước local chưa chạy dịch vụ AI. Hãy dùng npm run dev:fullstack hoặc bản production.",
+          )
+          : localize(
+            "The AI service returned an unexpected response. Please try again.",
+            "Dịch vụ AI trả về phản hồi không đúng định dạng. Hãy thử lại.",
+          ),
+        response.status,
+      );
+    }
+    const payload = await response.json().catch(() => ({})) as HostedGatewayPayload;
+    if (!response.ok) throw hostedGatewayFailure(response, payload, "chat");
+    if (!payload.message) throw new HostedAiError("invalid_response", localize("Qwen returned an incomplete response.", "Qwen trả về phản hồi chưa hoàn chỉnh."));
+    return payload.message;
+  }
   const { response, payload } = await requestHostedGateway({ messages, toolChoice, availableTools }, signal);
   if (!response.ok) throw hostedGatewayFailure(response, payload, "chat");
   if (!payload.message) {
@@ -505,7 +615,7 @@ export async function describeImageWithHostedAi(
  */
 export async function streamHostedAgentAnswer(
   { contents, systemInstruction, activeNetwork }: AiRequest,
-  onChunk: (text: string) => void,
+  onChunk: (text: string, mode?: "append" | "replace") => void,
   handlers: AgentToolHandlers,
   signal?: AbortSignal,
 ): Promise<string> {
@@ -522,13 +632,19 @@ export async function streamHostedAgentAnswer(
   const harnessState = createAgentHarnessState();
   let toolRound = 0;
   let repairOnly = false;
+  let repairAttempts = 0;
   while (toolRound <= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
     signal?.throwIfAborted();
+    let streamedThisRequest = false;
     const response = await requestHostedChat(
       messages,
       signal,
       repairOnly || toolRound >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds ? "none" : "auto",
       availableTools,
+      (text) => {
+        streamedThisRequest = true;
+        onChunk(text, "append");
+      },
     );
     const calls = parseToolCalls(response?.tool_calls);
     if (!calls.length) {
@@ -539,6 +655,12 @@ export async function streamHostedAgentAnswer(
       );
       const repairInstruction = createFinalAnswerRepairInstruction(harnessState, finalAnswer);
       if (repairInstruction) {
+        if (repairAttempts >= 1) throw new HostedAiError(
+          "invalid_response",
+          localize("Qwen could not preserve the verified app facts.", "Qwen chưa giữ đúng dữ kiện đã được ứng dụng xác minh."),
+        );
+        repairAttempts += 1;
+        if (streamedThisRequest) onChunk("", "replace");
         messages.push({
           role: "assistant",
           content: finalAnswer,
@@ -558,9 +680,10 @@ export async function streamHostedAgentAnswer(
         );
       }
       signal?.throwIfAborted();
-      onChunk(finalAnswer);
+      if (!streamedThisRequest) onChunk(finalAnswer);
       return finalAnswer;
     }
+    if (streamedThisRequest) onChunk("", "replace");
     if (toolRound >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
       messages.push({
         role: "assistant",
@@ -581,7 +704,11 @@ export async function streamHostedAgentAnswer(
         });
       });
       messages.push({ role: "user", content: createToolBudgetFinalizationInstruction() });
-      const finalResponse = await requestHostedChat(messages, signal, "none", availableTools);
+      let finalStreamed = false;
+      const finalResponse = await requestHostedChat(messages, signal, "none", availableTools, (text) => {
+        finalStreamed = true;
+        onChunk(text, "append");
+      });
       let finalAnswer = typeof finalResponse?.content === "string" ? finalResponse.content.trim() : "";
       if (!finalAnswer || parseToolCalls(finalResponse?.tool_calls).length) {
         throw new HostedAiError(
@@ -595,6 +722,7 @@ export async function streamHostedAgentAnswer(
       let repairInstruction = createFinalAnswerRepairInstruction(harnessState, finalAnswer);
       let finalReasoningDetails = finalResponse?.reasoning_details;
       while (repairInstruction) {
+        if (finalStreamed) onChunk("", "replace");
         messages.push({
           role: "assistant",
           content: finalAnswer,
@@ -603,7 +731,11 @@ export async function streamHostedAgentAnswer(
             : {}),
         });
         messages.push({ role: "user", content: repairInstruction });
-        const repaired = await requestHostedChat(messages, signal, "none", availableTools);
+        finalStreamed = false;
+        const repaired = await requestHostedChat(messages, signal, "none", availableTools, (text) => {
+          finalStreamed = true;
+          onChunk(text, "append");
+        });
         const repairedAnswer = typeof repaired?.content === "string" ? repaired.content.trim() : "";
         if (!repairedAnswer || parseToolCalls(repaired?.tool_calls).length) break;
         finalAnswer = repairedAnswer;
@@ -620,7 +752,7 @@ export async function streamHostedAgentAnswer(
         );
       }
       signal?.throwIfAborted();
-      onChunk(finalAnswer);
+      if (!finalStreamed) onChunk(finalAnswer);
       return finalAnswer;
     }
     toolRound += 1;

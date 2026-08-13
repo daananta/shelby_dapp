@@ -11,6 +11,15 @@ function jsonResponse(value: unknown, status = 200) {
   });
 }
 
+function sseResponse(events: Array<{ event: "token" | "message"; data: unknown }>) {
+  return new Response(events.map(({ event, data }) => (
+    `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+  )).join(""), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
 describe("hosted Qwen agent", () => {
   it("sends one fetched indexed image to the same-origin vision gateway without a browser provider key", async () => {
     const imageBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
@@ -140,6 +149,72 @@ describe("hosted Qwen agent", () => {
     expect(url).toBe("/api/ai/v1/chat");
     expect(new Headers(init.headers).has("authorization")).toBe(false);
     expect(String(init.body)).not.toContain("sk-or-");
+  });
+
+  it("shows an accurate error when the hosted tool response is incomplete", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+      error: "Hosted AI chat response was incomplete",
+      kind: "invalid_response",
+    }, 422)));
+
+    await expect(streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "How many blobs do I have?" }] }] },
+      vi.fn(),
+      { searchKnowledge: vi.fn(), getWalletBlobInventory: vi.fn() },
+    )).rejects.toMatchObject({
+      kind: "invalid_response",
+      status: 422,
+      message: expect.stringContaining("tool response"),
+    });
+  });
+
+  it("streams the final inventory answer after Qwen calls the local tool", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(sseResponse([{
+        event: "message",
+        data: {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: "inventory-stream-1",
+              type: "function",
+              function: { name: "get_wallet_blob_inventory", arguments: "{\"detail\":\"count\"}" },
+            }],
+          },
+        },
+      }]))
+      .mockResolvedValueOnce(sseResponse([
+        { event: "token", data: { text: "Ví của bạn " } },
+        { event: "token", data: { text: "hiện có 1 blob." } },
+        { event: "message", data: { message: { role: "assistant", content: "Ví của bạn hiện có 1 blob." } } },
+      ]));
+    vi.stubGlobal("fetch", fetchMock);
+    const onChunk = vi.fn();
+    const getWalletBlobInventory = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "blob_inventory",
+      count: 1,
+      singleton: "sample.txt",
+      answerContract: { allowedValues: [1] },
+    });
+
+    await expect(streamHostedAgentAnswer(
+      { contents: [{ role: "user", parts: [{ text: "Tôi có bao nhiêu blob?" }] }] },
+      onChunk,
+      { searchKnowledge: vi.fn(), getWalletBlobInventory },
+    )).resolves.toBe("Ví của bạn hiện có 1 blob.");
+
+    expect(getWalletBlobInventory).toHaveBeenCalledWith({ detail: "count" }, undefined);
+    expect(onChunk.mock.calls).toEqual([
+      ["Ví của bạn ", "append"],
+      ["hiện có 1 blob.", "append"],
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toMatchObject({
+      stream: true,
+      toolChoice: "auto",
+    });
   });
 
   it("executes a local RAG tool and returns its result to Qwen in a bounded second request", async () => {

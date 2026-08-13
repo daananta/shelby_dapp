@@ -103,10 +103,11 @@ describe("chat tools", () => {
       "invoice.pdf",
     ]);
 
-    const payload = readBlobInventoryForAgent({ detail: "sample", nameQuery: "anime" });
+    const payload = readBlobInventoryForAgent({ detail: "sample", nameQuery: "anime" }, { network: "shelbynet" });
 
     expect(payload).toMatchObject({
       ok: true,
+      network: "shelbynet",
       count: 3,
       nameQuery: "anime",
       matchedCount: 2,
@@ -152,6 +153,21 @@ describe("chat tools", () => {
     });
   });
 
+  it("includes the only blob even when the model initially asks only for a count", async () => {
+    const owner = "0xinventory-agent-singleton";
+    await setActiveRagOwner(owner);
+    await setShelbyBlobInventory(owner, ["only-note.txt"]);
+
+    const payload = readBlobInventoryForAgent({ detail: "count" }, { network: "shelbynet" });
+
+    expect(payload).toMatchObject({
+      ok: true,
+      network: "shelbynet",
+      count: 1,
+      singleton: "only-note.txt",
+    });
+  });
+
   it("rejects model phrasing that changes a verified inventory count or examples", async () => {
     const owner = "0xinventory-answer-check";
     await setActiveRagOwner(owner);
@@ -164,6 +180,16 @@ describe("chat tools", () => {
     expect(isBlobInventoryAnswerConsistent(count, "Có 2 blob, không phải 3 blob.")).toBe(false);
     expect(isBlobInventoryAnswerConsistent(sample, "Có 2 blob, ví dụ one.pdf và two.png.")).toBe(true);
     expect(isBlobInventoryAnswerConsistent(sample, "Có 2 blob, ví dụ one.pdf.")).toBe(false);
+  });
+
+  it("keeps inventory presentation and durable observations scoped to one network", async () => {
+    const owner = "shelbynet:0xinventory-network-scope";
+    await setActiveRagOwner(owner);
+    await setShelbyBlobInventory(owner, ["one.pdf"]);
+
+    const result = readBlobInventory("count", { language: "en", network: "shelbynet" });
+    expect(result.text).toContain("ShelbyNet snapshot");
+    expect(result.data?.network).toBe("shelbynet");
   });
 
   it("does not present an invalidated inventory snapshot as current", async () => {

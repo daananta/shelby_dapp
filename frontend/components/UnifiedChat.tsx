@@ -350,7 +350,8 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
       await streamAgentAnswer(
         {
           contents,
-          systemInstruction: buildAdaptiveAgentSystemInstruction(),
+          systemInstruction: buildAdaptiveAgentSystemInstruction({ activeNetwork: network }),
+          activeNetwork: network,
           ...(geminiApiKey ? { cloudApiKey: geminiApiKey } : {}),
         },
         (chunk, mode = "append") => {
@@ -387,9 +388,9 @@ export function UnifiedChat({ refreshBlobInventory }: UnifiedChatProps) {
           getWalletBlobInventory: async (inventoryRequest, requestSignal) => {
             assertRequestCurrent();
             requestSignal?.throwIfAborted();
-            const result = readBlobInventory(inventoryRequest.detail, { language });
+            const result = readBlobInventory(inventoryRequest.detail, { language, network });
             if (!agentToolResult?.imageUrls?.length) agentToolResult = result;
-            const payload = readBlobInventoryForAgent(inventoryRequest);
+            const payload = readBlobInventoryForAgent(inventoryRequest, { network });
             const status = payload.status;
             if (status === "not_loaded") return { ...payload, ok: false, code: "inventory_unavailable" };
             return payload;

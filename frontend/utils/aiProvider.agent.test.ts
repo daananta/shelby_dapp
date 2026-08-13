@@ -136,10 +136,11 @@ describe("Gemini agent tool orchestration", () => {
     expect(answer).toBe("Theo snapshot gần nhất, ví có 35 blob.");
     expect(getWalletBlobInventory).toHaveBeenCalledOnce();
     expect(searchKnowledge).not.toHaveBeenCalled();
-    expect(JSON.stringify(agentSdk.startChatConfig.history)).toContain("Previous Shelby inventory observation");
+    expect(JSON.stringify(agentSdk.startChatConfig.history)).toContain("Snapshot có 35 blob");
     expect(JSON.stringify(agentSdk.startChatConfig.history)).not.toContain("If the user");
-    expect(JSON.stringify(agentSdk.startChatConfig.history)).not.toContain("private-plan.pdf");
-    expect(JSON.stringify(agentSdk.startChatConfig.history)).not.toContain("35 blob");
+    expect(JSON.stringify(agentSdk.startChatConfig.history)).toContain("private-plan.pdf");
+    expect(JSON.stringify(agentSdk.startChatConfig.history)).not.toContain("observedAt");
+    expect(JSON.stringify(agentSdk.startChatConfig.history)).not.toContain("fetchedAt");
     expect(agentSdk.sendMessageStream.mock.calls[0][0]).toEqual([{
       functionResponse: {
         name: "get_wallet_blob_inventory",
@@ -150,13 +151,11 @@ describe("Gemini agent tool orchestration", () => {
       .toEqual(["search_user_knowledge", "get_wallet_blob_inventory"]);
   });
 
-  it("uses the dedicated connected-wallet tool for the Vietnamese address request", async () => {
-    agentSdk.sendMessage.mockResolvedValue(firstResponse([], "Tôi không thể truy cập địa chỉ ví của bạn."));
-    agentSdk.sendMessageStream
-      .mockResolvedValueOnce(streamedCalls([
-        { name: "get_connected_wallet", args: { detail: "address" } },
-      ]))
-      .mockResolvedValueOnce(streamedResponse("Địa chỉ ví Aptos đang kết nối là 0x1234."));
+  it("lets Gemini choose the dedicated connected-wallet tool for the Vietnamese address request", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([
+      { name: "get_connected_wallet", args: { detail: "address" } },
+    ]));
+    agentSdk.sendMessageStream.mockResolvedValueOnce(streamedResponse("Địa chỉ ví Aptos đang kết nối là 0x1234."));
     const onChunk = vi.fn();
     const getConnectedWallet = vi.fn().mockResolvedValue({
       ok: true,
@@ -182,14 +181,11 @@ describe("Gemini agent tool orchestration", () => {
 
     expect(answer).toBe("Địa chỉ ví Aptos đang kết nối là 0x1234.");
     expect(onChunk).not.toHaveBeenCalledWith(expect.stringContaining("không thể truy cập"));
-    expect(agentSdk.sendMessageStream.mock.calls[0][0]).toEqual([{
-      text: expect.stringContaining("get_connected_wallet"),
-    }]);
     expect(getConnectedWallet).toHaveBeenCalledWith(
       { detail: "address" },
       undefined,
     );
-    expect(agentSdk.sendMessageStream.mock.calls[1][0]).toEqual([{
+    expect(agentSdk.sendMessageStream.mock.calls[0][0]).toEqual([{
       functionResponse: {
         name: "get_connected_wallet",
         response: expect.objectContaining({ ok: true, kind: "wallet_address", facts: "0x1234" }),
@@ -199,21 +195,13 @@ describe("Gemini agent tool orchestration", () => {
       .toEqual(["search_user_knowledge", "get_wallet_blob_inventory", "get_connected_wallet"]);
   });
 
-  it("rejects an irrelevant initial tool and recovers with the required wallet capability", async () => {
+  it("executes the model-selected tool without a keyword routing override", async () => {
     agentSdk.sendMessage.mockResolvedValue(firstResponse([
       { name: "search_user_knowledge", args: { query: "wallet address" } },
     ]));
-    agentSdk.sendMessageStream
-      .mockResolvedValueOnce(streamedCalls([
-        { name: "get_connected_wallet", args: { detail: "address" } },
-      ]))
-      .mockResolvedValueOnce(streamedResponse("Your connected Aptos wallet is 0x1234."));
-    const searchKnowledge = vi.fn();
-    const getConnectedWallet = vi.fn().mockResolvedValue({
-      ok: true,
-      wallet: { connected: true, address: "0x1234" },
-      answerContract: { requiredExactStrings: ["0x1234"] },
-    });
+    agentSdk.sendMessageStream.mockResolvedValueOnce(streamedResponse("I could not find that in your documents."));
+    const searchKnowledge = vi.fn().mockResolvedValue({ found: false, evidence: [] });
+    const getConnectedWallet = vi.fn();
 
     await expect(streamCloudAgentAnswer(
       {
@@ -226,19 +214,13 @@ describe("Gemini agent tool orchestration", () => {
         getWalletBlobInventory: vi.fn(),
         getConnectedWallet,
       },
-    )).resolves.toContain("0x1234");
+    )).resolves.toContain("could not find");
 
-    expect(searchKnowledge).not.toHaveBeenCalled();
-    expect(getConnectedWallet).toHaveBeenCalledOnce();
-    expect(agentSdk.sendMessageStream.mock.calls[0][0]).toEqual([
-      expect.objectContaining({
-        functionResponse: expect.objectContaining({
-          name: "search_user_knowledge",
-          response: expect.objectContaining({ code: "wrong_tool_for_required_observation" }),
-        }),
-      }),
-      expect.objectContaining({ text: expect.stringContaining("get_connected_wallet") }),
-    ]);
+    expect(searchKnowledge).toHaveBeenCalledOnce();
+    expect(getConnectedWallet).not.toHaveBeenCalled();
+    expect(agentSdk.sendMessageStream.mock.calls[0][0]).toEqual([expect.objectContaining({
+      functionResponse: expect.objectContaining({ name: "search_user_knowledge" }),
+    })]);
   });
 
   it("lets Gemini decide to inspect an indexed image through the dedicated vision tool", async () => {
@@ -522,7 +504,7 @@ describe("Gemini agent tool orchestration", () => {
     expect(onChunk).not.toHaveBeenCalledWith("Bản nháp chưa kiểm chứng.");
   });
 
-  it("rejects a wrong tool in a later observation stage before executing it", async () => {
+  it("allows the model to revise its tool sequence after a refresh", async () => {
     agentSdk.sendMessage.mockResolvedValue(firstResponse([
       { name: "refresh_wallet_blob_inventory", args: {} },
     ]));
@@ -534,7 +516,7 @@ describe("Gemini agent tool orchestration", () => {
         { name: "get_wallet_blob_inventory", args: { detail: "count" } },
       ]))
       .mockResolvedValueOnce(streamedResponse("The refreshed wallet has 36 blobs."));
-    const searchKnowledge = vi.fn();
+    const searchKnowledge = vi.fn().mockResolvedValue({ found: false, evidence: [] });
     const refreshWalletBlobInventory = vi.fn().mockResolvedValue({ ok: true, status: "refreshed" });
     const getWalletBlobInventory = vi.fn().mockResolvedValue({
       ok: true,
@@ -554,17 +536,11 @@ describe("Gemini agent tool orchestration", () => {
     )).resolves.toBe("The refreshed wallet has 36 blobs.");
 
     expect(refreshWalletBlobInventory).toHaveBeenCalledOnce();
-    expect(searchKnowledge).not.toHaveBeenCalled();
+    expect(searchKnowledge).toHaveBeenCalledOnce();
     expect(getWalletBlobInventory).toHaveBeenCalledOnce();
-    expect(agentSdk.sendMessageStream.mock.calls[1][0]).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        functionResponse: expect.objectContaining({
-          name: "search_user_knowledge",
-          response: expect.objectContaining({ code: "wrong_tool_for_required_observation" }),
-        }),
-      }),
-      expect.objectContaining({ text: expect.stringContaining("get_wallet_blob_inventory") }),
-    ]));
+    expect(agentSdk.sendMessageStream.mock.calls[1][0]).toEqual([expect.objectContaining({
+      functionResponse: expect.objectContaining({ name: "search_user_knowledge" }),
+    })]);
   });
 
   it("rejects an unbounded function-call batch before executing app tools", async () => {

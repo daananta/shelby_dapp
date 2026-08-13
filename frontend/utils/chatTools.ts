@@ -41,6 +41,7 @@ export type IndexedImageAnalysisOutcome =
 
 export interface BlobInventoryToolData {
   kind: "blob_inventory";
+  network?: SupportedShelbyNetwork;
   status: "verified" | "stale" | "not_loaded";
   count?: number;
   examples: string[];
@@ -58,6 +59,7 @@ export interface ChatToolObservation {
   status: BlobInventoryToolData["status"];
   observedAt: number;
   fetchedAt?: number;
+  network?: SupportedShelbyNetwork;
 }
 
 export interface WalletToolData {
@@ -195,14 +197,17 @@ export function createChatToolObservation(result: ChatToolResult | null | undefi
     status: result.data.status,
     observedAt: result.data.observedAt,
     fetchedAt: result.data.fetchedAt,
+    network: result.data.network,
   };
 }
 
 export function readBlobInventory(
   detail: BlobInventoryDetail = "count",
-  context: Pick<ChatToolContext, "language"> = {},
+  context: Pick<ChatToolContext, "language" | "network"> = {},
 ): ChatToolResult {
   const t = (english: string, vietnamese: string) => context.language === "en" ? english : vietnamese;
+  const network = context.network ?? getStoredShelbyNetwork();
+  const networkLabel = network === "shelbynet" ? "ShelbyNet" : "Shelby Testnet";
   const inventory = getShelbyBlobInventory();
   const observedAt = Date.now();
   if (!inventory) {
@@ -212,7 +217,7 @@ export function readBlobInventory(
         "The Shelby blob list has not been loaded yet. Select Refresh in the Library, then ask again.",
         "Danh sách blob Shelby chưa được tải. Hãy bấm Làm mới trong Thư viện rồi hỏi lại.",
       ),
-      data: { kind: "blob_inventory", status: "not_loaded", examples: [], observedAt, freshness: "unavailable" },
+      data: { kind: "blob_inventory", network, status: "not_loaded", examples: [], observedAt, freshness: "unavailable" },
     };
   }
 
@@ -224,6 +229,7 @@ export function readBlobInventory(
   const freshness = inventory.verified && ageMs <= RECENT_INVENTORY_MS ? "recent_cache" : "stale_cache";
   const data: BlobInventoryToolData = {
     kind: "blob_inventory",
+    network,
     status: freshness === "recent_cache" ? "verified" : "stale",
     count,
     examples,
@@ -239,8 +245,8 @@ export function readBlobInventory(
     return {
       name: "blob_inventory",
       text: t(
-        `The last successful refresh found ${count} ${count === 1 ? "blob" : "blobs"}, but the latest Shelby refresh failed, so I cannot confirm the current count. Select Refresh in the Library and try again.`,
-        `Lần làm mới thành công trước ghi nhận ${count} blob, nhưng lần đồng bộ Shelby gần nhất bị lỗi nên chưa thể xác nhận số hiện tại. Hãy bấm Làm mới trong Thư viện rồi thử lại.`,
+        `The last successful ${networkLabel} refresh found ${count} ${count === 1 ? "blob" : "blobs"}, but the latest refresh failed, so I cannot confirm the current count. Select Refresh in the Library and try again.`,
+        `Lần làm mới ${networkLabel} thành công trước ghi nhận ${count} blob, nhưng lần đồng bộ gần nhất bị lỗi nên chưa thể xác nhận số hiện tại. Hãy bấm Làm mới trong Thư viện rồi thử lại.`,
       ),
       data,
     };
@@ -253,8 +259,8 @@ export function readBlobInventory(
     return {
       name: "blob_inventory",
       text: t(
-        `The last successful Shelby refresh at ${fetchedLabel} found ${count} ${count === 1 ? "blob" : "blobs"}. This snapshot may be outdated; select Refresh in the Library before treating it as current.`,
-        `Lần đồng bộ Shelby thành công gần nhất lúc ${fetchedLabel} ghi nhận ${count} blob. Snapshot này có thể đã cũ; hãy bấm Làm mới trong Thư viện trước khi xem đó là số hiện tại.`,
+        `The last successful ${networkLabel} refresh at ${fetchedLabel} found ${count} ${count === 1 ? "blob" : "blobs"}. This snapshot may be outdated; select Refresh in the Library before treating it as current.`,
+        `Lần đồng bộ ${networkLabel} thành công gần nhất lúc ${fetchedLabel} ghi nhận ${count} blob. Snapshot này có thể đã cũ; hãy bấm Làm mới trong Thư viện trước khi xem đó là số hiện tại.`,
       ),
       data,
     };
@@ -268,8 +274,8 @@ export function readBlobInventory(
     return {
       name: "blob_inventory",
       text: t(
-        `The Shelby snapshot refreshed at ${fetchedLabel} contains ${count} ${count === 1 ? "blob" : "blobs"}:${list}${limitNote}`,
-        `Snapshot Shelby được làm mới lúc ${fetchedLabel} có ${count} blob:${list}${limitNote}`,
+        `The ${networkLabel} snapshot refreshed at ${fetchedLabel} contains ${count} ${count === 1 ? "blob" : "blobs"}:${list}${limitNote}`,
+        `Snapshot ${networkLabel} được làm mới lúc ${fetchedLabel} có ${count} blob:${list}${limitNote}`,
       ),
       data,
     };
@@ -281,8 +287,8 @@ export function readBlobInventory(
   return {
     name: "blob_inventory",
     text: t(
-      `The Shelby snapshot refreshed at ${fetchedLabel} contains ${count} ${count === 1 ? "blob" : "blobs"}.${exampleText}`,
-      `Snapshot Shelby được làm mới lúc ${fetchedLabel} có ${count} blob.${exampleText}`,
+      `The ${networkLabel} snapshot refreshed at ${fetchedLabel} contains ${count} ${count === 1 ? "blob" : "blobs"}.${exampleText}`,
+      `Snapshot ${networkLabel} được làm mới lúc ${fetchedLabel} có ${count} blob.${exampleText}`,
     ),
     data,
   };
@@ -295,12 +301,15 @@ export function readBlobInventory(
  */
 export function readBlobInventoryForAgent(
   request: { detail: BlobInventoryDetail; nameQuery?: string },
+  context: Pick<ChatToolContext, "network"> = {},
 ): Record<string, unknown> {
   const inventory = getShelbyBlobInventory();
   const observedAt = Date.now();
+  const network = context.network ?? getStoredShelbyNetwork();
   if (!inventory) {
     return {
       ok: false,
+      network,
       status: "not_loaded",
       freshness: "unavailable",
       observedAt,
@@ -322,12 +331,18 @@ export function readBlobInventoryForAgent(
       ? inventory.names.slice(0, BLOB_EXAMPLE_LIMIT)
       : [];
   const expectedCount = nameQuery ? allMatchingNames.length : inventory.names.length;
+  const singleton = inventory.names.length === 1 ? inventory.names[0] : undefined;
 
   return {
     ok: true,
+    network,
     status: recent ? "verified" : "stale",
     freshness: recent ? "recent_cache" : "stale_cache",
     count: inventory.names.length,
+    // A one-item inventory is semantically complete even when the model first
+    // requested only the count. This lets it resolve later references without
+    // guessing or spending another tool round.
+    ...(singleton ? { singleton } : {}),
     ...(nameQuery ? {
       nameQuery,
       matchedCount: allMatchingNames.length,
@@ -507,8 +522,8 @@ function calculateBasicExpression(question: string): number | null {
 }
 
 /**
- * Deterministic browser-side tools. These intentionally run before the LLM so
- * wallet state and Shelby inventory are never guessed from RAG text.
+ * Deterministic browser-side tool implementations. The cloud model decides
+ * when to invoke them; the implementations only return scoped observations.
  */
 export async function runChatTool(question: string, address?: string, context: ChatToolContext = {}, signal?: AbortSignal): Promise<ChatToolResult | null> {
   signal?.throwIfAborted();

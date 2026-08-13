@@ -21,17 +21,17 @@ describe("scoped conversation memory", () => {
     expect(JSON.stringify(history)).not.toContain("Mặt trời");
   });
 
-  it("keeps conversational intent without replaying grounded answer text", () => {
+  it("keeps user-visible grounded answers without replaying raw source records", () => {
     const history = buildAdaptiveGeminiHistory(messages);
     expect(JSON.stringify(history)).toContain("Mặt trời");
     expect(JSON.stringify(history)).toContain("AGENTS.md nói gì?");
-    expect(JSON.stringify(history)).not.toContain("Tài liệu nói về Shelby SDK");
+    expect(JSON.stringify(history)).toContain("Tài liệu nói về Shelby SDK");
     expect(JSON.stringify(history)).not.toContain('"sources"');
     expect(JSON.stringify(history)).not.toContain('"source"');
     expect(JSON.stringify(history)).not.toContain("If the user follows up");
   });
 
-  it("keeps only bounded declarative metadata for blob-inventory follow-ups", () => {
+  it("keeps the user-visible inventory answer without exposing harness metadata", () => {
     const history = buildAdaptiveGeminiHistory([
       { role: "user", text: "Ví này có bao nhiêu blob?" },
       {
@@ -44,17 +44,21 @@ describe("scoped conversation memory", () => {
           status: "verified",
           observedAt: 10,
           fetchedAt: 9,
+          network: "shelbynet",
         },
       },
     ]);
     const serialized = JSON.stringify(history);
-    expect(serialized).toContain("Previous Shelby inventory observation");
-    expect(serialized).toContain("status=verified");
+    expect(serialized).toContain("35 blob");
+    expect(serialized).toContain("private-plan.pdf");
+    expect(serialized).toContain("secret-name.txt");
     expect(serialized).not.toContain("If the user");
     expect(serialized).not.toContain("call get_wallet_blob_inventory");
-    expect(serialized).not.toContain("35 blob");
-    expect(serialized).not.toContain("private-plan.pdf");
-    expect(serialized).not.toContain("secret-name.txt");
+    expect(serialized).not.toContain("Previous Shelby inventory observation");
+    expect(serialized).not.toContain("status=verified");
+    expect(serialized).not.toContain("observedAt");
+    expect(serialized).not.toContain("fetchedAt");
+    expect(serialized).not.toContain("network=shelbynet");
   });
 
   it("keeps the prior user-visible image answer and exact source for natural follow-ups", () => {

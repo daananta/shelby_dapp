@@ -9,6 +9,7 @@ interface MemoryMessage {
     status: "verified" | "stale" | "not_loaded";
     observedAt: number;
     fetchedAt?: number;
+    network?: "shelbynet" | "testnet";
   };
   imageUrls?: string[];
   referencedSources?: string[];
@@ -35,9 +36,10 @@ export function buildScopedGeminiHistory(messages: MemoryMessage[], scope: "gene
 }
 
 /**
- * Recent conversational text for the adaptive agent. Source records and tool
- * payloads are intentionally omitted so document data can only enter through
- * the explicit knowledge-search tool.
+ * Recent user-visible conversation for the adaptive agent. Raw source records,
+ * tool payloads and orchestration metadata stay out of model history. Keeping
+ * the final visible answer lets the model resolve natural follow-ups, while a
+ * tool is still required for any user-specific fact that answer did not state.
  */
 export function buildAdaptiveGeminiHistory(messages: MemoryMessage[]) {
   const output: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> = [];
@@ -45,7 +47,6 @@ export function buildAdaptiveGeminiHistory(messages: MemoryMessage[]) {
     const user = messages[index];
     const answer = messages[index + 1];
     if (user.role !== "user" || answer.role !== "ai") continue;
-    const documentGrounded = Boolean(answer.sources?.length || answer.tool || answer.imageUrls?.length);
     const imageSources = answer.imageUrls?.length
       ? [...new Set((answer.referencedSources ?? []).filter((source) => typeof source === "string" && source.trim()))]
         .slice(0, 3)
@@ -53,17 +54,12 @@ export function buildAdaptiveGeminiHistory(messages: MemoryMessage[]) {
     const safeImageMemory = imageSources.length
       ? `I previously answered using ${imageSources.length === 1 ? "the indexed image" : "the indexed images"} ${imageSources.map((source) => JSON.stringify(source)).join(", ")}. ${answer.text.slice(0, 4_000)}`
       : null;
-    const safeToolMemory = answer.toolObservation?.kind === "blob_inventory"
-      ? `Previous Shelby inventory observation: status=${answer.toolObservation.status}; observedAt=${answer.toolObservation.observedAt}; fetchedAt=${answer.toolObservation.fetchedAt ?? "unknown"}. Exact inventory facts are not retained in chat memory.`
-      : null;
     output.push(
       { role: "user", parts: [{ text: user.text.slice(0, 2_000) }] },
       {
         role: "model",
         parts: [{
-          text: safeImageMemory ?? safeToolMemory ?? (documentGrounded
-            ? "The previous response was based on connected workspace data; its exact contents are not retained in chat memory."
-            : answer.text.slice(0, 4_000)),
+          text: safeImageMemory ?? answer.text.slice(0, 4_000),
         }],
       },
     );

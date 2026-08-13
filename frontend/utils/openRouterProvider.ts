@@ -6,15 +6,12 @@ import {
   createToolBudgetFinalizationInstruction,
   createAgentHarnessState,
   executeAgentToolCalls,
-  nextRequiredObservationTools,
   validateAgentFinalAnswer,
   type AgentFunctionCall,
 } from "@/utils/agentHarness";
 import {
   availableAgentToolNames,
-  createMissingObservationInstruction,
   createAgentToolRegistry,
-  requiredObservationPlan,
   type AgentToolHandlers,
   type AiRequest,
 } from "@/utils/agentRuntime";
@@ -507,7 +504,7 @@ export async function describeImageWithHostedAi(
  * local, read-only, abortable, and bounded by the same harness as Gemini.
  */
 export async function streamHostedAgentAnswer(
-  { contents, systemInstruction }: AiRequest,
+  { contents, systemInstruction, activeNetwork }: AiRequest,
   onChunk: (text: string) => void,
   handlers: AgentToolHandlers,
   signal?: AbortSignal,
@@ -519,14 +516,12 @@ export async function streamHostedAgentAnswer(
   }
 
   const latestText = messages.at(-1)?.content?.slice(0, 1_000) ?? "";
-  const toolRegistry = createAgentToolRegistry(handlers, latestText);
+  const toolRegistry = createAgentToolRegistry(handlers, latestText, activeNetwork);
   const availableTools = availableAgentToolNames(toolRegistry);
-  const observationPlan = requiredObservationPlan(latestText, availableTools);
 
   const harnessState = createAgentHarnessState();
   let toolRound = 0;
   let repairOnly = false;
-  const recoveredObservationStages = new Set<string>();
   while (toolRound <= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
     signal?.throwIfAborted();
     const response = await requestHostedChat(
@@ -536,70 +531,12 @@ export async function streamHostedAgentAnswer(
       availableTools,
     );
     const calls = parseToolCalls(response?.tool_calls);
-    const requiredTools = nextRequiredObservationTools(harnessState, observationPlan);
-    const recoveryStageKey = requiredTools.join("|");
-    if (
-      calls.length
-      && requiredTools.length
-      && !calls.some((call) => requiredTools.some((name) => name === call.name))
-    ) {
-      if (recoveredObservationStages.has(recoveryStageKey)) {
-        throw new HostedAiError(
-          "invalid_response",
-          localize(
-            "The AI did not use the required app data for this request. Please try again.",
-            "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
-          ),
-        );
-      }
-      messages.push({
-        role: "assistant",
-        content: typeof response?.content === "string" ? response.content : null,
-        ...(Array.isArray(response?.reasoning_details) ? { reasoning_details: response.reasoning_details } : {}),
-        tool_calls: calls.map((call) => ({
-          id: call.id,
-          type: "function",
-          function: { name: call.name, arguments: JSON.stringify(call.args ?? {}) },
-        })),
-      });
-      calls.forEach((call) => messages.push({
-        role: "tool",
-        tool_call_id: call.id,
-        content: JSON.stringify({
-          ok: false,
-          code: "wrong_tool_for_required_observation",
-          message: "Choose the relevant application capability from the correction that follows.",
-        }),
-      }));
-      messages.push({ role: "user", content: createMissingObservationInstruction(requiredTools) });
-      recoveredObservationStages.add(recoveryStageKey);
-      continue;
-    }
     if (!calls.length) {
       const answer = typeof response?.content === "string" ? response.content.trim() : "";
       const finalAnswer = answer || localize(
         "There is not enough information for a confident answer.",
         "Không tìm thấy đủ thông tin để trả lời chắc chắn.",
       );
-      if (requiredTools.length) {
-        if (recoveredObservationStages.has(recoveryStageKey)) {
-          throw new HostedAiError(
-            "invalid_response",
-            localize(
-              "The AI did not use the required app data for this request. Please try again.",
-              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
-            ),
-          );
-        }
-        messages.push({
-          role: "assistant",
-          content: finalAnswer,
-          ...(Array.isArray(response?.reasoning_details) ? { reasoning_details: response.reasoning_details } : {}),
-        });
-        messages.push({ role: "user", content: createMissingObservationInstruction(requiredTools) });
-        recoveredObservationStages.add(recoveryStageKey);
-        continue;
-      }
       const repairInstruction = createFinalAnswerRepairInstruction(harnessState, finalAnswer);
       if (repairInstruction) {
         messages.push({
@@ -625,15 +562,6 @@ export async function streamHostedAgentAnswer(
       return finalAnswer;
     }
     if (toolRound >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
-      if (requiredTools.length) {
-        throw new HostedAiError(
-          "invalid_response",
-          localize(
-            "The AI did not use the required app data for this request. Please try again.",
-            "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
-          ),
-        );
-      }
       messages.push({
         role: "assistant",
         content: typeof response?.content === "string" ? response.content : null,

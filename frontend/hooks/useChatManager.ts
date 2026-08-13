@@ -3,6 +3,7 @@ import type { ChatToolObservation, ChatToolResult } from "@/utils/chatTools";
 import type { AnswerReceipt, RetrievalResult } from "@/utils/ragTypes";
 import type { HotRagProofSnapshot } from "@/utils/hotRagProof";
 import { localize } from "@/i18n";
+import { isSupportedShelbyNetwork } from "@/utils/shelbyNetwork";
 
 export interface ChatMessage {
   id: string;
@@ -102,6 +103,7 @@ function normalizeToolObservation(value: unknown): ChatToolObservation | undefin
     status: candidate.status,
     observedAt: candidate.observedAt,
     fetchedAt,
+    network: isSupportedShelbyNetwork(candidate.network) ? candidate.network : undefined,
   };
 }
 

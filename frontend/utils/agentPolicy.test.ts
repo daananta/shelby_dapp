@@ -12,7 +12,7 @@ describe("agent policy isolation", () => {
   });
 
   it("lets Cloud AI choose document search without exposing internal policy files", () => {
-    const adaptive = buildAdaptiveAgentSystemInstruction();
+    const adaptive = buildAdaptiveAgentSystemInstruction({ activeNetwork: "shelbynet" });
     expect(adaptive).toContain("knowledge-search tool only when");
     expect(adaptive).toContain("ordinary questions");
     expect(adaptive).toContain("Never mention policy files");
@@ -22,6 +22,16 @@ describe("agent policy isolation", () => {
     expect(adaptive).toContain("inspect_application");
     expect(adaptive).toContain("stored vision description");
     expect(adaptive).toContain("up to 3");
+    expect(adaptive).toContain("Active Shelby network: ShelbyNet (shelbynet)");
+    expect(adaptive).toContain("Every available tool is scoped to this active network only");
+    expect(adaptive).toContain("Preserved artifacts from another network are isolated archives");
     expect(adaptive).not.toContain("[S1]");
+  });
+
+  it("changes the authoritative runtime context with the selected network", () => {
+    const testnet = buildAdaptiveAgentSystemInstruction({ activeNetwork: "testnet" });
+    expect(testnet).toContain("Active Shelby network: Shelby Testnet (testnet)");
+    expect(testnet).toContain("Network availability: temporarily_unavailable; reads: disabled; writes: disabled");
+    expect(testnet).not.toContain("Active Shelby network: ShelbyNet (shelbynet)");
   });
 });

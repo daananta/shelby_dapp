@@ -1,5 +1,5 @@
 import type { AgentToolDefinition } from "@/utils/agentHarness";
-import { asksForLiveInventoryRefresh, classifyQueryIntent } from "@/utils/queryRouter";
+import { isSupportedShelbyNetwork, shelbyNetworkLabel, type SupportedShelbyNetwork } from "@/utils/shelbyNetwork";
 import { AGENT_TOOL_NAMES, type AgentToolName, type ConnectedWalletDetail } from "../../shared/agentTools";
 
 export interface AiRequest {
@@ -7,6 +7,7 @@ export interface AiRequest {
   contents?: any[];
   cloudApiKey?: string;
   systemInstruction?: string;
+  activeNetwork?: SupportedShelbyNetwork;
 }
 
 export interface KnowledgeSearchRequest {
@@ -59,33 +60,86 @@ function textArg(args: Record<string, unknown>, key: string, fallback: string, m
     : fallback;
 }
 
+export function explicitShelbyNetworkTargets(question: string): SupportedShelbyNetwork[] {
+  const normalized = question.normalize("NFKC").toLocaleLowerCase("en-US");
+  const targets: SupportedShelbyNetwork[] = [];
+  if (/\bshelbynet\b/.test(normalized)) targets.push("shelbynet");
+  if (/\b(?:shelby\s+)?testnet\b/.test(normalized)) targets.push("testnet");
+  return targets;
+}
+
+function networkScopeMismatch(
+  latestText: string,
+  activeNetwork: SupportedShelbyNetwork | undefined,
+): Record<string, unknown> | null {
+  if (!activeNetwork) return null;
+  const requestedNetworks = explicitShelbyNetworkTargets(latestText);
+  if (!requestedNetworks.length || requestedNetworks.includes(activeNetwork)) return null;
+  const foreignNetworks = requestedNetworks.filter((network) => network !== activeNetwork);
+  return {
+    ok: false,
+    code: "network_scope_mismatch",
+    activeNetwork,
+    activeNetworkLabel: shelbyNetworkLabel(activeNetwork),
+    requestedNetworks: foreignNetworks,
+    message: `This tool can observe only the active ${shelbyNetworkLabel(activeNetwork)} workspace. Do not use its data to answer for ${foreignNetworks.map(shelbyNetworkLabel).join(" or ")}.`,
+  };
+}
+
+function scopedExecutor(
+  activeNetwork: SupportedShelbyNetwork | undefined,
+  latestText: string,
+  execute: AgentToolDefinition["execute"],
+): AgentToolDefinition["execute"] {
+  return async (args, signal) => {
+    const mismatch = networkScopeMismatch(latestText, activeNetwork);
+    if (mismatch) return mismatch;
+    const result = await execute(args, signal);
+    if (
+      activeNetwork
+      && isSupportedShelbyNetwork(result.network)
+      && result.network !== activeNetwork
+    ) {
+      return {
+        ok: false,
+        code: "tool_network_mismatch",
+        activeNetwork,
+        observedNetwork: result.network,
+        message: "The application rejected an observation from a different Shelby network.",
+      };
+    }
+    return activeNetwork ? { ...result, network: activeNetwork } : result;
+  };
+}
+
 /** One executor registry shared by Gemini and Qwen. */
 export function createAgentToolRegistry(
   handlers: AgentToolHandlers,
   latestText: string,
+  activeNetwork?: SupportedShelbyNetwork,
 ): Map<string, AgentToolDefinition> {
   const definitions: AgentToolDefinition[] = [
     {
       name: "search_user_knowledge",
       maxExecutions: 1,
       unavailableCode: "knowledge_search_unavailable",
-      execute: async (args, requestSignal) => ({
+      execute: scopedExecutor(activeNetwork, latestText, async (args, requestSignal) => ({
         ...await handlers.searchKnowledge({
           query: textArg(args, "query", latestText, 1_000),
         }, requestSignal),
-      }),
+      })),
     },
     {
       name: "get_wallet_blob_inventory",
       maxExecutions: 2,
       allowRepeatedSignature: true,
       unavailableCode: "blob_inventory_unavailable",
-      execute: async (args, requestSignal) => handlers.getWalletBlobInventory({
+      execute: scopedExecutor(activeNetwork, latestText, async (args, requestSignal) => handlers.getWalletBlobInventory({
         detail: args.detail === "all" || args.detail === "sample" ? args.detail : "count",
         nameQuery: typeof args.nameQuery === "string" && args.nameQuery.trim()
           ? args.nameQuery.trim().slice(0, 200)
           : undefined,
-      }, requestSignal),
+      }, requestSignal)),
     },
   ];
 
@@ -94,7 +148,7 @@ export function createAgentToolRegistry(
       name: "refresh_wallet_blob_inventory",
       maxExecutions: 1,
       unavailableCode: "blob_inventory_refresh_unavailable",
-      execute: async (_args, requestSignal) => handlers.refreshWalletBlobInventory!(requestSignal),
+      execute: scopedExecutor(activeNetwork, latestText, async (_args, requestSignal) => handlers.refreshWalletBlobInventory!(requestSignal)),
     });
   }
 
@@ -103,13 +157,13 @@ export function createAgentToolRegistry(
       name: "get_connected_wallet",
       maxExecutions: 1,
       unavailableCode: "connected_wallet_unavailable",
-      execute: async (args, requestSignal) => handlers.getConnectedWallet!({
+      execute: scopedExecutor(activeNetwork, latestText, async (args, requestSignal) => handlers.getConnectedWallet!({
         detail: args.detail === "apt_balance"
           || args.detail === "shelbyusd_balance"
           || args.detail === "account_info"
           ? args.detail
           : "address",
-      }, requestSignal),
+      }, requestSignal)),
     });
   }
 
@@ -118,9 +172,9 @@ export function createAgentToolRegistry(
       name: "inspect_application",
       maxExecutions: 1,
       unavailableCode: "application_inspection_unavailable",
-      execute: async (args, requestSignal) => handlers.inspectApplication!({
+      execute: scopedExecutor(activeNetwork, latestText, async (args, requestSignal) => handlers.inspectApplication!({
         query: textArg(args, "query", latestText, 1_000),
-      }, requestSignal),
+      }, requestSignal)),
     });
   }
 
@@ -129,12 +183,12 @@ export function createAgentToolRegistry(
       name: "analyze_indexed_image",
       maxExecutions: 1,
       unavailableCode: "image_analysis_unavailable",
-      execute: async (args, requestSignal) => handlers.analyzeIndexedImage!({
+      execute: scopedExecutor(activeNetwork, latestText, async (args, requestSignal) => handlers.analyzeIndexedImage!({
         source: typeof args.source === "string" && args.source.trim()
           ? args.source.trim().slice(0, 200)
           : undefined,
         question: textArg(args, "question", latestText, 1_000),
-      }, requestSignal),
+      }, requestSignal)),
     });
   }
 
@@ -144,56 +198,4 @@ export function createAgentToolRegistry(
 export function availableAgentToolNames(registry: Map<string, AgentToolDefinition>): AgentToolName[] {
   const knownNames = new Set<string>(AGENT_TOOL_NAMES);
   return [...registry.keys()].filter((name): name is AgentToolName => knownNames.has(name));
-}
-
-/**
- * Model-first routing guard. It never extracts arguments or writes an answer;
- * it only detects when accepting a tool-free answer would violate an app-data
- * trust boundary.
- */
-export function requiredObservationPlan(
-  question: string,
-  availableTools: readonly AgentToolName[],
-): AgentToolName[][] {
-  const intent = classifyQueryIntent(question).intent;
-  const needsPixelInspection = /(?:what (?:is|can be) visible|what (?:do|can) you see|visible details?|visual details?|describe|depict|read (?:the )?text|chi tiết (?:nhìn thấy|thị giác|trong ảnh)|nhìn thấy gì|mô tả|đọc (?:chữ|văn bản))/i.test(question);
-  const candidates: AgentToolName[] = intent === "wallet"
-    ? ["get_connected_wallet"]
-    : intent === "inventory"
-      ? ["get_wallet_blob_inventory"]
-      : intent === "image"
-        ? needsPixelInspection
-          ? ["analyze_indexed_image", "inspect_application"]
-          : ["inspect_application", "analyze_indexed_image"]
-        : intent === "general"
-          ? []
-          : intent === "metadata"
-            ? ["search_user_knowledge", "inspect_application"]
-            : ["search_user_knowledge"];
-  const available = new Set(availableTools);
-  if (intent === "image") {
-    // Require the strongest available observation for the request. Returning
-    // both would let a metadata-only preview satisfy a pixel-analysis turn.
-    const selected = candidates.find((name) => available.has(name));
-    return selected ? [[selected]] : [];
-  }
-  const alternatives = candidates.filter((name) => available.has(name));
-  if (!alternatives.length) return [];
-  if (
-    intent === "inventory"
-    && asksForLiveInventoryRefresh(question)
-    && available.has("refresh_wallet_blob_inventory")
-  ) {
-    return [["refresh_wallet_blob_inventory"], alternatives];
-  }
-  return [alternatives];
-}
-
-export function createMissingObservationInstruction(requiredTools: readonly AgentToolName[]): string {
-  return [
-    "Your draft answered a request for user-specific application data without observing the application.",
-    `Call the single most relevant available tool now (${requiredTools.join(" or ")}).`,
-    "Choose its arguments from the user's request and conversation; do not guess or ask the user to look elsewhere.",
-    "After receiving the observation, answer naturally in the user's language without mentioning this correction.",
-  ].join(" ");
 }

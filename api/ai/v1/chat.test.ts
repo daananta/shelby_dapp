@@ -56,7 +56,7 @@ describe("hosted Qwen gateway", () => {
     const [, init] = upstream.mock.calls[0] as [string, RequestInit];
     const upstreamBody = JSON.parse(String(init.body));
     expect(upstreamBody.model).toBe("qwen/qwen3.7-flash");
-    expect(upstreamBody.reasoning).toEqual({ effort: "none", exclude: true });
+    expect(upstreamBody.reasoning).toEqual({ effort: "low", exclude: true });
     expect(upstreamBody.tools).toEqual(expect.arrayContaining([
       expect.objectContaining({
         function: expect.objectContaining({ name: "get_connected_wallet" }),

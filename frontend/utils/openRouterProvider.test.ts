@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { describeImageWithHostedAi, HostedAiError, streamHostedAgentAnswer } from "@/utils/openRouterProvider";
+import { buildAdaptiveGeminiHistory } from "@/utils/conversationMemory";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -232,11 +233,146 @@ describe("hosted Qwen agent", () => {
     }, undefined);
   });
 
-  it("uses the dedicated connected-wallet tool and preserves the public Aptos address", async () => {
+  it("lets Qwen resolve an ambiguous inventory follow-up from the visible answer", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse({
-        message: { role: "assistant", content: "I cannot access your wallet for privacy reasons." },
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "inventory-follow-up",
+            type: "function",
+            function: {
+              name: "get_wallet_blob_inventory",
+              arguments: "{\"detail\":\"sample\"}",
+            },
+          }],
+        },
       }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: "Blob duy nhất là only-note.txt (1 blob).",
+        },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const getWalletBlobInventory = vi.fn().mockResolvedValue({
+      ok: true,
+      network: "shelbynet",
+      count: 1,
+      examples: ["only-note.txt"],
+      answerContract: {
+        scope: "wallet_blob_inventory",
+        requiredExactStrings: ["only-note.txt"],
+        count: {
+          allowedValues: [1],
+          requiredValues: [1],
+          units: ["blob", "blobs", "tệp", "file", "files"],
+        },
+      },
+    });
+    const history = buildAdaptiveGeminiHistory([
+      { role: "user", text: "chào, tôi đang có bao nhiêu blob" },
+      {
+        role: "ai",
+        text: "Hiện tại, ví của bạn đang có 1 blob.",
+        tool: "blob_inventory",
+        toolObservation: {
+          version: 1,
+          kind: "blob_inventory",
+          status: "verified",
+          observedAt: 20,
+          fetchedAt: 10,
+          network: "shelbynet",
+        },
+      },
+    ]);
+
+    const answer = await streamHostedAgentAnswer(
+      {
+        contents: [...history, { role: "user", parts: [{ text: "nó là gì" }] }],
+        systemInstruction: "Resolve follow-ups naturally and use tools for missing user-specific details.",
+        activeNetwork: "shelbynet",
+      },
+      vi.fn(),
+      { searchKnowledge: vi.fn(), getWalletBlobInventory },
+    );
+
+    expect(answer).toBe("Blob duy nhất là only-note.txt (1 blob).");
+    expect(getWalletBlobInventory).toHaveBeenCalledWith({ detail: "sample", nameQuery: undefined }, undefined);
+    const firstBody = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect(JSON.stringify(firstBody.messages)).toContain("Hiện tại, ví của bạn đang có 1 blob.");
+    expect(JSON.stringify(firstBody.messages)).not.toContain("observedAt");
+    expect(JSON.stringify(firstBody.messages)).not.toContain("fetchedAt");
+  });
+
+  it("lets Qwen continue from a singleton identity into document evidence", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "inventory-1",
+            type: "function",
+            function: { name: "get_wallet_blob_inventory", arguments: "{\"detail\":\"sample\"}" },
+          }],
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "search-1",
+            type: "function",
+            function: { name: "search_user_knowledge", arguments: "{\"query\":\"only-note.txt\"}" },
+          }],
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        message: {
+          role: "assistant",
+          content: "only-note.txt là ghi chú giới thiệu Shelby hot storage [S1].",
+        },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const getWalletBlobInventory = vi.fn().mockResolvedValue({
+      ok: true,
+      count: 1,
+      examples: ["only-note.txt"],
+      answerContract: {
+        scope: "wallet_blob_inventory",
+        requiredExactStrings: ["only-note.txt"],
+      },
+    });
+    const searchKnowledge = vi.fn().mockResolvedValue({
+      found: true,
+      evidence: [{ citation: "S1", excerpt: "Shelby is designed as hot storage." }],
+    });
+    const history = buildAdaptiveGeminiHistory([
+      { role: "user", text: "ví tôi có bao nhiêu blob" },
+      { role: "ai", text: "Ví của bạn hiện có 1 blob.", tool: "blob_inventory" },
+    ]);
+
+    const answer = await streamHostedAgentAnswer(
+      {
+        contents: [...history, { role: "user", parts: [{ text: "nói về nó" }] }],
+        systemInstruction: "Resolve the reference, then use document evidence when content is requested.",
+        activeNetwork: "shelbynet",
+      },
+      vi.fn(),
+      { searchKnowledge, getWalletBlobInventory },
+    );
+
+    expect(answer).toBe("only-note.txt là ghi chú giới thiệu Shelby hot storage [S1].");
+    expect(getWalletBlobInventory).toHaveBeenCalledWith({ detail: "sample", nameQuery: undefined }, undefined);
+    expect(searchKnowledge).toHaveBeenCalledWith({ query: "only-note.txt" }, undefined);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("lets Qwen choose the dedicated connected-wallet tool and preserves the public Aptos address", async () => {
+    const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse({
         message: {
           role: "assistant",
@@ -276,15 +412,10 @@ describe("hosted Qwen agent", () => {
       "get_wallet_blob_inventory",
       "get_connected_wallet",
     ]);
-    const recoveryBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
-    expect(recoveryBody.messages.at(-1)).toMatchObject({
-      role: "user",
-      content: expect.stringContaining("get_connected_wallet"),
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("does not accept an irrelevant tool as the required wallet observation", async () => {
+  it("executes Qwen's selected tool without a keyword routing override", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse({
         message: {
@@ -298,26 +429,11 @@ describe("hosted Qwen agent", () => {
         },
       }))
       .mockResolvedValueOnce(jsonResponse({
-        message: {
-          role: "assistant",
-          content: null,
-          tool_calls: [{
-            id: "wallet-1",
-            type: "function",
-            function: { name: "get_connected_wallet", arguments: "{\"detail\":\"address\"}" },
-          }],
-        },
-      }))
-      .mockResolvedValueOnce(jsonResponse({
-        message: { role: "assistant", content: "Your connected Aptos wallet is 0x1234." },
+        message: { role: "assistant", content: "I could not find that in your documents." },
       }));
     vi.stubGlobal("fetch", fetchMock);
     const searchKnowledge = vi.fn().mockResolvedValue({ found: false, evidence: [] });
-    const getConnectedWallet = vi.fn().mockResolvedValue({
-      ok: true,
-      wallet: { connected: true, address: "0x1234" },
-      answerContract: { requiredExactStrings: ["0x1234"] },
-    });
+    const getConnectedWallet = vi.fn();
 
     await expect(streamHostedAgentAnswer(
       { contents: [{ role: "user", parts: [{ text: "What is my wallet address?" }] }] },
@@ -327,12 +443,11 @@ describe("hosted Qwen agent", () => {
         getWalletBlobInventory: vi.fn(),
         getConnectedWallet,
       },
-    )).resolves.toContain("0x1234");
+    )).resolves.toContain("could not find");
 
-    expect(searchKnowledge).not.toHaveBeenCalled();
-    expect(getConnectedWallet).toHaveBeenCalledOnce();
-    const recoveryBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
-    expect(recoveryBody.messages.at(-1).content).toContain("get_connected_wallet");
+    expect(searchKnowledge).toHaveBeenCalledOnce();
+    expect(getConnectedWallet).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("lets Qwen phrase a deterministic application observation", async () => {

@@ -2,54 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   availableAgentToolNames,
   createAgentToolRegistry,
-  requiredObservationPlan,
+  explicitShelbyNetworkTargets,
 } from "@/utils/agentRuntime";
 
 describe("provider-neutral agent runtime", () => {
-  it("requires a wallet observation but leaves the detail argument to the model", () => {
-    const available = [
-      "search_user_knowledge",
-      "get_wallet_blob_inventory",
-      "get_connected_wallet",
-    ] as const;
-
-    expect(requiredObservationPlan("địa chỉ ví của tôi là gì", available))
-      .toEqual([["get_connected_wallet"]]);
-    expect(requiredObservationPlan("Explain how an Aptos wallet works", available))
-      .toEqual([]);
-    expect(requiredObservationPlan("Tôi có những blob nào?", [
-      ...available,
-      "inspect_application",
-    ])).toEqual([["get_wallet_blob_inventory"]]);
-    expect(requiredObservationPlan("How many pages does a typical book have?", available)).toEqual([]);
-    expect(requiredObservationPlan("Open package.json and identify the main libraries used.", [
-      ...available,
-      "inspect_application",
-    ])).toEqual([["search_user_knowledge"]]);
-    expect(requiredObservationPlan("Which indexed image blobs are available?", [
-      ...available,
-      "inspect_application",
-      "analyze_indexed_image",
-    ])).toEqual([["inspect_application"]]);
-    expect(requiredObservationPlan("Describe what is visible in this image.", [
-      ...available,
-      "inspect_application",
-      "analyze_indexed_image",
-    ])).toEqual([["analyze_indexed_image"]]);
-    expect(requiredObservationPlan("Which visible details support that description?", [
-      ...available,
-      "inspect_application",
-      "analyze_indexed_image",
-    ])).toEqual([["analyze_indexed_image"]]);
-    expect(requiredObservationPlan("Refresh my wallet blob count right now", [
-      ...available,
-      "refresh_wallet_blob_inventory",
-    ])).toEqual([
-      ["refresh_wallet_blob_inventory"],
-      ["get_wallet_blob_inventory"],
-    ]);
-  });
-
   it("advertises only handlers that the current browser turn can execute", () => {
     const registry = createAgentToolRegistry({
       searchKnowledge: vi.fn(),
@@ -64,5 +20,56 @@ describe("provider-neutral agent runtime", () => {
     ]);
     expect(registry.has("inspect_application")).toBe(false);
     expect(registry.has("analyze_indexed_image")).toBe(false);
+  });
+
+  it("recognizes explicit network identities without classifying ordinary language", () => {
+    expect(explicitShelbyNetworkTargets("Show my ShelbyNet blobs")).toEqual(["shelbynet"]);
+    expect(explicitShelbyNetworkTargets("Compare ShelbyNet with Shelby Testnet")).toEqual(["shelbynet", "testnet"]);
+    expect(explicitShelbyNetworkTargets("Explain decentralized storage")).toEqual([]);
+  });
+
+  it("pins tool execution and provenance to the active network", async () => {
+    const inventory = vi.fn(async () => ({ ok: true, count: 4 }));
+    const activeRegistry = createAgentToolRegistry({
+      searchKnowledge: vi.fn(),
+      getWalletBlobInventory: inventory,
+    }, "How many blobs are on ShelbyNet?", "shelbynet");
+
+    await expect(activeRegistry.get("get_wallet_blob_inventory")!.execute({ detail: "count" }))
+      .resolves.toMatchObject({ ok: true, count: 4, network: "shelbynet" });
+    expect(inventory).toHaveBeenCalledOnce();
+
+    const comparisonRegistry = createAgentToolRegistry({
+      searchKnowledge: vi.fn(),
+      getWalletBlobInventory: inventory,
+    }, "Compare the blobs I have on ShelbyNet and Testnet", "shelbynet");
+    await expect(comparisonRegistry.get("get_wallet_blob_inventory")!.execute({ detail: "count" }))
+      .resolves.toMatchObject({ ok: true, count: 4, network: "shelbynet" });
+    expect(inventory).toHaveBeenCalledTimes(2);
+
+    const wrongProvenanceRegistry = createAgentToolRegistry({
+      searchKnowledge: vi.fn(),
+      getWalletBlobInventory: vi.fn(async () => ({ ok: true, count: 7, network: "testnet" })),
+    }, "How many blobs are on ShelbyNet?", "shelbynet");
+    await expect(wrongProvenanceRegistry.get("get_wallet_blob_inventory")!.execute({ detail: "count" }))
+      .resolves.toMatchObject({
+        ok: false,
+        code: "tool_network_mismatch",
+        activeNetwork: "shelbynet",
+        observedNetwork: "testnet",
+      });
+
+    const mismatchedRegistry = createAgentToolRegistry({
+      searchKnowledge: vi.fn(),
+      getWalletBlobInventory: inventory,
+    }, "How many blobs are on Testnet?", "shelbynet");
+    await expect(mismatchedRegistry.get("get_wallet_blob_inventory")!.execute({ detail: "count" }))
+      .resolves.toMatchObject({
+        ok: false,
+        code: "network_scope_mismatch",
+        activeNetwork: "shelbynet",
+        requestedNetworks: ["testnet"],
+      });
+    expect(inventory).toHaveBeenCalledTimes(2);
   });
 });

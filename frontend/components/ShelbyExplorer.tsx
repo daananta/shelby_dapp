@@ -491,7 +491,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
   const lifecycleTitle = loadErrorCopy
     ? loadErrorCopy.title
     : !hasLocalRag && hasTestnetLocalRag
-      ? t("Your on-device knowledge base is on Shelby Testnet", "Kho trên thiết bị đang ở Shelby Testnet")
+      ? t("No ShelbyNet knowledge base on this device yet", "Chưa có kho ShelbyNet trên thiết bị")
     : remoteSnapshot.status === "loading"
       ? t("Checking the Shelby knowledge base…", "Đang kiểm tra kho tri thức trên Shelby…")
     : !hasLocalRag && hasRemoteRag
@@ -514,7 +514,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
   const lifecycleDescription = loadErrorCopy
     ? loadErrorCopy.description
     : !hasLocalRag && hasTestnetLocalRag
-      ? t("This Testnet knowledge base is preserved in this browser and will be available when the network reopens.", "Kho Testnet này vẫn được giữ trong trình duyệt và sẽ dùng lại được khi mạng mở lại.")
+      ? t("Build one from eligible ShelbyNet blobs. A previous Testnet knowledge base is preserved separately and is not used in this workspace.", "Hãy tạo kho từ các blob ShelbyNet đủ điều kiện. Kho Testnet trước đây được giữ riêng và không được dùng trong workspace này.")
     : remoteSnapshot.status === "error"
       ? t("The Shelby backup could not be read. Refresh the page or try again later.", "Không đọc được bản sao trên Shelby. Hãy làm mới trang hoặc thử lại sau.")
     : !hasLocalRag && hasRemoteRag
@@ -593,7 +593,7 @@ export function ShelbyExplorer({ registerBlobInventoryRefresh }: ShelbyExplorerP
                 </div>
               </div>
               <div className="flex shrink-0 flex-wrap gap-2 sm:justify-end">
-                {!hasLocalRag && hasTestnetLocalRag && <span className="inline-flex h-8 items-center rounded-lg border border-amber-200 bg-amber-50 px-3 text-[11px] font-bold text-amber-800 dark:border-amber-300/15 dark:bg-amber-300/[0.06] dark:text-amber-200">{t("Testnet data preserved", "Đã giữ dữ liệu Testnet")}</span>}
+                {!hasLocalRag && hasTestnetLocalRag && <span className="inline-flex h-8 items-center rounded-lg border border-amber-200 bg-amber-50 px-3 text-[11px] font-bold text-amber-800 dark:border-amber-300/15 dark:bg-amber-300/[0.06] dark:text-amber-200">{t("Separate Testnet archive", "Kho Testnet được tách riêng")}</span>}
                 {!hasLocalRag && hasRemoteRag && <Button size="sm" disabled={indexingAll || restoringRag || remoteSnapshot.status === "loading"} className="h-8 rounded-lg bg-slate-950 px-3.5 text-[11px] font-extrabold text-white shadow-sm hover:bg-slate-800 transition-all hover:-translate-y-0.5 dark:bg-white dark:text-slate-950 dark:hover:bg-slate-200" onClick={() => void handleRestoreRemoteRag()}><Cloud className="mr-1.5 h-3.5 w-3.5" />{restoringRag ? t("Saving to device…", "Đang lưu về máy…") : t("Save to device (optional)", "Lưu về máy (tuỳ chọn)")}</Button>}
                 {pendingLocalBlobs.length > 0 && <Button size="sm" className="h-8 rounded-lg bg-[#172019] px-3.5 text-[11px] font-bold text-[#c5fb7e] shadow-sm hover:-translate-y-0.5 transition-all hover:bg-[#263029] dark:bg-lime-300 dark:text-slate-950" onClick={() => void handleIndexBlobs(pendingLocalBlobs)}><ScanText className="mr-1.5 h-3.5 w-3.5" />{t("Build RAG", "Tạo RAG")}</Button>}
                 <Button size="sm" disabled={!needsRemoteUpload || syncingRag || uploading} className="h-8 rounded-lg bg-[#172019] px-3.5 text-[11px] font-bold text-[#c5fb7e] shadow-sm hover:-translate-y-0.5 transition-all hover:bg-[#263029] disabled:bg-transparent disabled:text-slate-400 disabled:hover:translate-y-0 dark:bg-lime-300 dark:text-slate-950 dark:disabled:bg-transparent dark:disabled:text-slate-600" onClick={() => void handleUploadRagSnapshot()}><Upload className="mr-1.5 h-3.5 w-3.5" />{syncingRag || uploading ? t("Saving…", "Đang lưu…") : !hasLocalRag || pendingLocalBlobs.length ? t("Sync", "Đồng bộ") : remoteFresh ? t("Synced", "Đã đồng bộ") : t("Save backup to Shelby", "Lưu bản sao lên Shelby")}</Button>

@@ -59,6 +59,50 @@ test("mocks wallet connection and verifies RAG sync dashboard renders", async ({
   await expect(page.getByText("Bản sao không chứa Gemini API key", { exact: false })).toBeVisible();
 });
 
+test("presents preserved Testnet data as a separate archive from ShelbyNet", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(async () => {
+    const owner = "testnet:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open("shelby-rag-explorer-v5", 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        const manifests = db.createObjectStore("manifests", { keyPath: "id" });
+        manifests.createIndex("owner", "owner");
+        manifests.createIndex("ownerSource", ["owner", "source"], { unique: true });
+        const pages = db.createObjectStore("pages", { keyPath: "id" });
+        pages.createIndex("owner", "owner");
+        pages.createIndex("documentId", "documentId");
+        const chunks = db.createObjectStore("chunks", { keyPath: "id" });
+        chunks.createIndex("owner", "owner");
+        chunks.createIndex("documentId", "documentId");
+        db.createObjectStore("workspace", { keyPath: "id" });
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result;
+        const transaction = db.transaction("manifests", "readwrite");
+        transaction.objectStore("manifests").put({
+          id: `${owner}:legacy.txt`,
+          owner,
+          source: "legacy.txt",
+          displayName: "legacy.txt",
+          status: "indexed",
+        });
+        transaction.oncomplete = () => { db.close(); resolve(); };
+        transaction.onerror = () => reject(transaction.error);
+      };
+    });
+  });
+  await page.reload();
+  await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
+
+  await expect(page.getByText("Chưa có kho ShelbyNet trên thiết bị", { exact: true })).toBeVisible();
+  await expect(page.getByText("Kho Testnet trước đây được giữ riêng và không được dùng trong workspace này.", { exact: false })).toBeVisible();
+  await expect(page.getByText("Kho Testnet được tách riêng", { exact: true })).toBeVisible();
+  await expect(page.getByText("Kho trên thiết bị đang ở Shelby Testnet", { exact: true })).toHaveCount(0);
+});
+
 test("desktop workspace keeps both panels usable without scrolling the page", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/");
@@ -334,6 +378,80 @@ test("lets hosted AI phrase inventory observations without requiring a Gemini ke
   expect(hostedTurns).toBe(4);
 });
 
+test("keeps the visible inventory answer as context for a natural follow-up", async ({ page }) => {
+  const requestMessages: any[][] = [];
+  let hostedTurns = 0;
+  await page.route("**/api/ai/v1/chat", async (route) => {
+    const body = route.request().postDataJSON() as any;
+    const messages = body?.messages ?? [];
+    requestMessages.push(messages);
+    const latestTool = [...messages].reverse().find((message: any) => message?.role === "tool");
+    const latestUser = [...messages].reverse().find((message: any) => message?.role === "user")?.content;
+    let toolPayload: Record<string, unknown> = {};
+    if (latestTool?.content) {
+      try {
+        toolPayload = JSON.parse(latestTool.content);
+      } catch {
+        toolPayload = {};
+      }
+    }
+    const examples = Array.isArray(toolPayload.examples)
+      ? toolPayload.examples.filter((value): value is string => typeof value === "string")
+      : [];
+    const followUpAnswer = examples.length > 0
+      ? `Hai blob trong ví là ${examples.join(" và ")} (${String(toolPayload.count ?? examples.length)} blob).`
+      : "Tôi chưa nhận được tên blob từ Shelby.";
+    hostedTurns += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        message: latestTool
+          ? {
+              role: "assistant",
+              content: latestUser === "nó là gì"
+                ? followUpAnswer
+                : "Hiện tại, ví của bạn đang có 2 blob.",
+            }
+          : {
+              role: "assistant",
+              content: null,
+              tool_calls: [{
+                id: `inventory-context-${hostedTurns}`,
+                type: "function",
+                function: {
+                  name: "get_wallet_blob_inventory",
+                  arguments: latestUser === "nó là gì" ? "{\"detail\":\"sample\"}" : "{\"detail\":\"count\"}",
+                },
+              }],
+            },
+      }),
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
+  const chatInput = page.getByLabel("Nhập câu hỏi");
+
+  await chatInput.fill("chào, tôi đang có bao nhiêu blob");
+  await chatInput.press("Enter");
+  await expect(page.getByText("Hiện tại, ví của bạn đang có 2 blob.", { exact: true })).toBeVisible();
+
+  await chatInput.fill("nó là gì");
+  await chatInput.press("Enter");
+  await expect(page.getByText("Hai blob trong ví là HuongDan_Shelby_RAG.txt và KeHoach_Shelby_2026.txt (2 blob).", { exact: true })).toBeVisible();
+
+  const followUpRequest = requestMessages.find((messages) => (
+    messages.some((message: any) => message?.role === "user" && message?.content === "nó là gì")
+    && messages.some((message: any) => message?.role === "assistant" && message?.content === "Hiện tại, ví của bạn đang có 2 blob.")
+  ));
+  expect(followUpRequest).toBeTruthy();
+  const serialized = JSON.stringify(followUpRequest);
+  expect(serialized).not.toContain("observedAt");
+  expect(serialized).not.toContain("fetchedAt");
+  expect(serialized).not.toContain("Previous Shelby inventory observation");
+  expect(hostedTurns).toBe(4);
+});
+
 test("lets the agent read the exact Aptos wallet connected to the app", async ({ page }) => {
   const expectedAddress = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
   const walletPayloads: any[] = [];
@@ -432,13 +550,27 @@ test("lets the agent refresh Shelby live and reread the bounded inventory payloa
   await expect(page.getByText("Tôi vừa cập nhật từ Shelby: ví này hiện có 2 blob.", { exact: true })).toBeVisible();
   expect(toolTurns).toBe(2);
   expect(refreshPayloads).toEqual([
-    expect.objectContaining({ ok: true, source: "demo" }),
+    expect.objectContaining({ ok: true }),
   ]);
-  expect(refreshPayloads.every((payload) => !("count" in payload) && !("names" in payload) && !("examples" in payload))).toBe(true);
+  expect(refreshPayloads.every((payload) => (
+    !("count" in payload)
+    && !("names" in payload)
+    && !("examples" in payload)
+    && !("source" in payload)
+    && !("fetchedAt" in payload)
+    && !("refreshedAt" in payload)
+  ))).toBe(true);
   expect(inventoryPayloads).toEqual([
-    expect.objectContaining({ ok: true, count: 2, status: "verified" }),
+    expect.objectContaining({ ok: true, count: 2 }),
   ]);
-  expect(inventoryPayloads.every((payload) => !("names" in payload) && !("examples" in payload))).toBe(true);
+  expect(inventoryPayloads.every((payload) => (
+    !("names" in payload)
+    && !("examples" in payload)
+    && !("status" in payload)
+    && !("freshness" in payload)
+    && !("fetchedAt" in payload)
+    && !("observedAt" in payload)
+  ))).toBe(true);
 });
 
 test("lets the model choose a free-form blob filename filter", async ({ page }) => {

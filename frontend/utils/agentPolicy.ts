@@ -5,6 +5,12 @@ import documentRetrieval from "../../agent/skills/document-retrieval/SKILL.md?ra
 import walletShelby from "../../agent/skills/wallet-shelby/SKILL.md?raw";
 import imageVision from "../../agent/skills/image-vision/SKILL.md?raw";
 import summarizeStudyGuide from "../../agent/skills/summarize-study-guide/SKILL.md?raw";
+import networkScope from "../../agent/skills/network-scope/SKILL.md?raw";
+import {
+  getShelbyNetworkCapabilities,
+  shelbyNetworkLabel,
+  type SupportedShelbyNetwork,
+} from "@/utils/shelbyNetwork";
 
 const SKILLS: Record<QueryIntent, string[]> = {
   general: [generalKnowledge],
@@ -31,8 +37,24 @@ function removeFrontmatter(markdown: string): string {
 
 /** RAG evidence is deliberately excluded: this is durable agent behavior, not memory. */
 export function buildAgentSystemInstruction(intent: QueryIntent): string {
-  const skills = SKILLS[intent].map(removeFrontmatter).join("\n\n");
+  const skills = [networkScope, ...SKILLS[intent]].map(removeFrontmatter).join("\n\n");
   return `${agentPolicy.trim()}\n\nActive operating skills:\n${skills}`;
+}
+
+export interface AgentRuntimeContext {
+  activeNetwork: SupportedShelbyNetwork;
+}
+
+function buildNetworkRuntimeContext(activeNetwork: SupportedShelbyNetwork): string {
+  const capabilities = getShelbyNetworkCapabilities(activeNetwork);
+  return [
+    "Runtime workspace context (authoritative application state, not user-provided content):",
+    `- Active Shelby network: ${shelbyNetworkLabel(activeNetwork)} (${activeNetwork}).`,
+    `- Network availability: ${capabilities.availability}; reads: ${capabilities.canRead ? "enabled" : "disabled"}; writes: ${capabilities.canWrite ? "enabled" : "disabled"}.`,
+    "- Every available tool is scoped to this active network only.",
+    "- Preserved artifacts from another network are isolated archives and are not active evidence.",
+    "- Never answer another network's wallet, blob, RAG, image, or receipt facts using observations from this workspace.",
+  ].join("\n");
 }
 
 /**
@@ -40,9 +62,11 @@ export function buildAgentSystemInstruction(intent: QueryIntent): string {
  * keyword router remains a fallback for offline/deterministic app actions, not
  * the authority for normal Cloud conversations.
  */
-export function buildAdaptiveAgentSystemInstruction(): string {
-  const skills = [generalKnowledge, walletShelby, documentRetrieval, imageVision]
+export function buildAdaptiveAgentSystemInstruction(
+  context: AgentRuntimeContext = { activeNetwork: "shelbynet" },
+): string {
+  const skills = [networkScope, generalKnowledge, walletShelby, documentRetrieval, imageVision]
     .map(removeFrontmatter)
     .join("\n\n");
-  return `${agentPolicy.trim()}\n\nAvailable operating skills:\n${skills}`;
+  return `${agentPolicy.trim()}\n\n${buildNetworkRuntimeContext(context.activeNetwork)}\n\nAvailable operating skills:\n${skills}`;
 }

@@ -12,15 +12,12 @@ import {
   createToolBudgetFinalizationInstruction,
   createAgentHarnessState,
   executeAgentToolCalls,
-  nextRequiredObservationTools,
   validateAgentFinalAnswer,
   type AgentFunctionCall,
 } from "@/utils/agentHarness";
 import {
   availableAgentToolNames,
-  createMissingObservationInstruction,
   createAgentToolRegistry,
-  requiredObservationPlan,
   type AgentToolHandlers,
   type AiRequest,
 } from "@/utils/agentRuntime";
@@ -312,7 +309,7 @@ export async function streamCloudAnswer(
  * up to three tool rounds without exposing internal execution logs to the UI.
  */
 export async function streamCloudAgentAnswer(
-  { contents, cloudApiKey, systemInstruction }: AiRequest,
+  { contents, cloudApiKey, systemInstruction, activeNetwork }: AiRequest,
   onChunk: (text: string, mode?: "append" | "replace") => void,
   handlers: AgentToolHandlers,
   signal?: AbortSignal,
@@ -327,9 +324,8 @@ export async function streamCloudAgentAnswer(
   if (!Array.isArray(latestParts) || !latestParts.length) throw new Error(localize("The question is invalid.", "Câu hỏi không hợp lệ."));
 
   const latestText = String(latestParts.find((part: { text?: string }) => part.text)?.text ?? "").slice(0, 1_000);
-  const toolRegistry = createAgentToolRegistry(handlers, latestText);
+  const toolRegistry = createAgentToolRegistry(handlers, latestText, activeNetwork);
   const availableTools = availableAgentToolNames(toolRegistry);
-  const observationPlan = requiredObservationPlan(latestText, availableTools);
   const agentTools: Tool = {
     functionDeclarations: geminiFunctionDeclarations(new Set(availableTools)),
   };
@@ -339,8 +335,6 @@ export async function streamCloudAgentAnswer(
     let emitted = false;
     let harnessStarted = false;
     const harnessState = createAgentHarnessState();
-    const recoveredObservationStages = new Set<string>();
-    let requiredTools = nextRequiredObservationTools(harnessState, observationPlan);
     try {
       signal?.throwIfAborted();
       const model = clientFor(normalizedApiKey).getGenerativeModel({
@@ -378,43 +372,6 @@ export async function streamCloudAgentAnswer(
       const firstResponse = await first.response;
       signal?.throwIfAborted();
       let calls = (firstResponse.functionCalls() ?? []) as AgentFunctionCall[];
-
-      if (requiredTools.length && !calls.some((call) => requiredTools.some((name) => name === call.name))) {
-        const rejectedCalls = calls.map((call) => ({
-          functionResponse: {
-            name: call.name,
-            response: {
-              ok: false,
-              code: "wrong_tool_for_required_observation",
-              message: "Choose the relevant application capability from the correction that follows.",
-            },
-          },
-        }));
-        const recovery = await chat.sendMessageStream([
-          ...rejectedCalls,
-          { text: createMissingObservationInstruction(requiredTools) },
-        ], {
-          signal,
-          timeout: CLOUD_AGENT_TIMEOUT_MS,
-        });
-        for await (const chunk of recovery.stream) {
-          signal?.throwIfAborted();
-          // Recovery planning text is intentionally private. Only a completed
-          // tool-grounded final answer is committed to the chat UI.
-          if (typeof chunk.functionCalls === "function") chunk.functionCalls();
-        }
-        const recoveryResponse = await recovery.response;
-        signal?.throwIfAborted();
-        calls = (recoveryResponse.functionCalls() ?? []) as AgentFunctionCall[];
-        recoveredObservationStages.add(requiredTools.join("|"));
-        if (!calls.some((call) => requiredTools.some((name) => name === call.name))) {
-          throw new Error(localize(
-            "The AI did not use the required app data for this request. Please try again.",
-            "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
-          ));
-        }
-        directAnswer = "";
-      }
 
       if (!calls.length) {
         let direct = directAnswer || firstResponse.text().trim();
@@ -483,90 +440,7 @@ export async function streamCloudAgentAnswer(
         const bufferedAnswer = bufferedChunks.join("");
         let answer = bufferedAnswer || finalResponse.text().trim();
         let answerChunks = bufferedChunks;
-        requiredTools = nextRequiredObservationTools(harnessState, observationPlan);
-        const recoveryStageKey = requiredTools.join("|");
-        if (
-          nextCalls.length
-          && requiredTools.length
-          && !nextCalls.some((call) => requiredTools.some((name) => name === call.name))
-        ) {
-          if (recoveredObservationStages.has(recoveryStageKey) || round >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
-            throw new Error(localize(
-              "The AI did not use the required app data for this request. Please try again.",
-              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
-            ));
-          }
-          const recovery = await chat.sendMessageStream([
-            ...nextCalls.map((call) => ({
-              functionResponse: {
-                name: call.name,
-                response: {
-                  ok: false,
-                  code: "wrong_tool_for_required_observation",
-                  message: "Choose the relevant application capability from the correction that follows.",
-                },
-              },
-            })),
-            { text: createMissingObservationInstruction(requiredTools) },
-          ], {
-            signal,
-            timeout: CLOUD_AGENT_TIMEOUT_MS,
-          });
-          for await (const chunk of recovery.stream) {
-            signal?.throwIfAborted();
-            if (typeof chunk.functionCalls === "function") chunk.functionCalls();
-          }
-          const recoveryResponse = await recovery.response;
-          signal?.throwIfAborted();
-          const recoveryCalls = (recoveryResponse.functionCalls() ?? []) as AgentFunctionCall[];
-          recoveredObservationStages.add(recoveryStageKey);
-          if (!recoveryCalls.some((call) => requiredTools.some((name) => name === call.name))) {
-            throw new Error(localize(
-              "The AI did not use the required app data for this request. Please try again.",
-              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
-            ));
-          }
-          calls = recoveryCalls;
-          continue;
-        }
-        if (!nextCalls.length && requiredTools.length) {
-          if (recoveredObservationStages.has(recoveryStageKey) || round >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
-            throw new Error(localize(
-              "The AI did not use the required app data for this request. Please try again.",
-              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
-            ));
-          }
-          const recovery = await chat.sendMessageStream([{
-            text: createMissingObservationInstruction(requiredTools),
-          }], {
-            signal,
-            timeout: CLOUD_AGENT_TIMEOUT_MS,
-          });
-          for await (const chunk of recovery.stream) {
-            signal?.throwIfAborted();
-            if (typeof chunk.functionCalls === "function") chunk.functionCalls();
-          }
-          const recoveryResponse = await recovery.response;
-          signal?.throwIfAborted();
-          const recoveryCalls = (recoveryResponse.functionCalls() ?? []) as AgentFunctionCall[];
-          recoveredObservationStages.add(recoveryStageKey);
-          if (!recoveryCalls.some((call) => requiredTools.some((name) => name === call.name))) {
-            throw new Error(localize(
-              "The AI did not use the required app data for this request. Please try again.",
-              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
-            ));
-          }
-          calls = recoveryCalls;
-          continue;
-        }
         if (nextCalls.length) {
-          if (requiredTools.length
-            && round >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
-            throw new Error(localize(
-              "The AI did not use the required app data for this request. Please try again.",
-              "AI chưa dùng dữ liệu ứng dụng cần thiết cho yêu cầu này. Hãy thử lại.",
-            ));
-          }
           if (round >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
             const finalizationResult = await chat.sendMessageStream([
               ...createToolBudgetExhaustedResponses(nextCalls),

@@ -6,8 +6,6 @@ import {
   createToolBudgetExhaustedResponses,
   createToolBudgetFinalizationInstruction,
   executeAgentToolCalls,
-  hasSatisfiedAgentObservationPlan,
-  nextRequiredObservationTools,
   validateAgentFinalAnswer,
   type AgentToolDefinition,
 } from "@/utils/agentHarness";
@@ -17,34 +15,6 @@ function registry(...definitions: AgentToolDefinition[]) {
 }
 
 describe("bounded agent harness", () => {
-  it("enforces ordered observations for refresh-then-read flows", async () => {
-    const tools = registry(
-      {
-        name: "refresh",
-        maxExecutions: 1,
-        unavailableCode: "refresh_unavailable",
-        execute: vi.fn().mockResolvedValue({ ok: true }),
-      },
-      {
-        name: "inventory",
-        maxExecutions: 2,
-        allowRepeatedSignature: true,
-        unavailableCode: "inventory_unavailable",
-        execute: vi.fn().mockResolvedValue({ ok: true, count: 2 }),
-      },
-    );
-    const state = createAgentHarnessState();
-    const plan = [["refresh"], ["inventory"]] as const;
-
-    expect(nextRequiredObservationTools(state, plan)).toEqual(["refresh"]);
-    await executeAgentToolCalls({ calls: [{ name: "inventory" }], registry: tools, state, round: 1 });
-    expect(nextRequiredObservationTools(state, plan)).toEqual(["refresh"]);
-    await executeAgentToolCalls({ calls: [{ name: "refresh" }], registry: tools, state, round: 2 });
-    expect(nextRequiredObservationTools(state, plan)).toEqual(["inventory"]);
-    await executeAgentToolCalls({ calls: [{ name: "inventory" }], registry: tools, state, round: 3 });
-    expect(hasSatisfiedAgentObservationPlan(state, plan)).toBe(true);
-  });
-
   it("creates a provider-neutral finalization response without exposing internal limits", () => {
     expect(createToolBudgetExhaustedResponses([
       { name: "inspect_application", args: { query: "show image" } },
@@ -349,13 +319,17 @@ describe("bounded agent harness", () => {
       }),
     });
     const state = createAgentHarnessState();
-    await executeAgentToolCalls({
+    const result = await executeAgentToolCalls({
       calls: [{ name: "wallet", args: { detail: "address" } }],
       registry: tools,
       state,
       round: 1,
     });
 
+    expect(result.responses[0].functionResponse.response).toEqual({
+      ok: true,
+      wallet: { connected: true, address: "0x1234" },
+    });
     expect(validateAgentFinalAnswer(state, "I cannot access your wallet.")).toMatchObject({
       valid: false,
       reason: "missing_exact_fact",
@@ -366,6 +340,74 @@ describe("bounded agent harness", () => {
     expect(validateAgentFinalAnswer(state, "Your connected wallet is 0x1234.")).toMatchObject({
       valid: true,
       missingExactFacts: [],
+    });
+  });
+
+  it("keeps inventory cache bookkeeping private while retaining business facts", async () => {
+    const tools = registry({
+      name: "get_wallet_blob_inventory",
+      maxExecutions: 1,
+      unavailableCode: "inventory_unavailable",
+      execute: vi.fn().mockResolvedValue({
+        ok: true,
+        network: "shelbynet",
+        status: "verified",
+        freshness: "recent_cache",
+        count: 1,
+        examples: ["only-note.txt"],
+        fetchedAt: 10,
+        observedAt: 20,
+        ageMs: 10,
+        lastRefreshSucceeded: true,
+        refreshRequired: false,
+        answerContract: { requiredExactStrings: ["only-note.txt"] },
+      }),
+    });
+    const state = createAgentHarnessState();
+    const result = await executeAgentToolCalls({
+      calls: [{ name: "get_wallet_blob_inventory", args: { detail: "sample" } }],
+      registry: tools,
+      state,
+      round: 1,
+    });
+
+    expect(result.responses[0].functionResponse.response).toEqual({
+      ok: true,
+      network: "shelbynet",
+      count: 1,
+      examples: ["only-note.txt"],
+      refreshRequired: false,
+    });
+    expect(validateAgentFinalAnswer(state, "Blob duy nhất là only-note.txt.")).toMatchObject({ valid: true });
+  });
+
+  it("keeps a singleton inventory fact visible without exposing cache bookkeeping", async () => {
+    const tools = registry({
+      name: "get_wallet_blob_inventory",
+      maxExecutions: 1,
+      unavailableCode: "inventory_unavailable",
+      execute: vi.fn().mockResolvedValue({
+        ok: true,
+        network: "shelbynet",
+        status: "verified",
+        count: 1,
+        singleton: "only-note.txt",
+        fetchedAt: 10,
+        observedAt: 20,
+      }),
+    });
+    const result = await executeAgentToolCalls({
+      calls: [{ name: "get_wallet_blob_inventory", args: { detail: "count" } }],
+      registry: tools,
+      state: createAgentHarnessState(),
+      round: 1,
+    });
+
+    expect(result.responses[0].functionResponse.response).toEqual({
+      ok: true,
+      network: "shelbynet",
+      count: 1,
+      singleton: "only-note.txt",
     });
   });
 

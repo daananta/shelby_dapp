@@ -33,9 +33,12 @@ const MAX_VISION_BODY_BYTES = 3 * 1024 * 1024;
 const MAX_VISION_IMAGE_BYTES = 2 * 1024 * 1024;
 const MAX_MESSAGES = 32;
 const MAX_TOTAL_CONTENT = 120_000;
-const MAX_OUTPUT_TOKENS = 1_200;
+const MAX_OUTPUT_TOKENS = 1_800;
 const MAX_VISION_OUTPUT_TOKENS = 700;
-const FAST_REASONING = { effort: "none", exclude: true } as const;
+// Tool selection and conversational reference resolution need a small reasoning
+// budget. Keep the trace private, but do not disable the model's reasoning.
+const AGENT_REASONING = { effort: "low", exclude: true } as const;
+const VISION_REASONING = { effort: "none", exclude: true } as const;
 const RATE_WINDOW_MS = 60_000;
 const CHAT_START_RATE_LIMIT = 15;
 const CHAT_TOTAL_RATE_LIMIT = 60;
@@ -357,7 +360,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
         ],
       }],
       temperature: 0,
-      reasoning: FAST_REASONING,
+      reasoning: VISION_REASONING,
       max_tokens: MAX_VISION_OUTPUT_TOKENS,
     };
   } else {
@@ -381,7 +384,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
         ? { tools, tool_choice: "auto" }
         : { tool_choice: "none" }),
       temperature: 0.2,
-      reasoning: FAST_REASONING,
+      reasoning: AGENT_REASONING,
       max_tokens: MAX_OUTPUT_TOKENS,
     };
   }

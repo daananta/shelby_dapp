@@ -41,7 +41,7 @@ export const AGENT_TOOL_SPECS: readonly AgentToolSpec[] = [
     type: "function",
     function: {
       name: "search_user_knowledge",
-      description: "Search the user's private/imported Shelby documents. Call only when the request depends on document content or follows up on document evidence. Never use for wallet state, blob counts/lists, or general knowledge.",
+      description: "Search the user's private/imported documents in the active Shelby network workspace. Call only when the request depends on document content or follows up on document evidence. Never use for another network, wallet state, blob counts/lists, or general knowledge.",
       parameters: {
         type: "object",
         properties: {
@@ -59,7 +59,7 @@ export const AGENT_TOOL_SPECS: readonly AgentToolSpec[] = [
     type: "function",
     function: {
       name: "get_wallet_blob_inventory",
-      description: "Read the connected wallet's latest app-cached Shelby blob inventory. Use for blob counts/lists and follow-ups that ask to confirm an inventory answer. This does not refresh the network.",
+      description: "Read the connected wallet's latest app-cached blob inventory for the active Shelby network only. Use when the conversation needs blob counts, names, filters, or a missing detail about that inventory. A one-item inventory may include `singleton` even for a count request so you can resolve later references naturally. This does not refresh the network and must not answer for another network.",
       parameters: {
         type: "object",
         properties: {
@@ -82,7 +82,7 @@ export const AGENT_TOOL_SPECS: readonly AgentToolSpec[] = [
     type: "function",
     function: {
       name: "refresh_wallet_blob_inventory",
-      description: "Refresh the connected wallet's Shelby inventory from the network. Use only when the user explicitly requests current/live data or a previous inventory result is stale. Then call get_wallet_blob_inventory before answering.",
+      description: "Refresh the connected wallet's inventory from the active Shelby network. Use only when the user explicitly requests current/live data or a previous inventory result is stale. Then call get_wallet_blob_inventory before answering. Never fall back to another network.",
       parameters: {
         type: "object",
         properties: {},
@@ -94,7 +94,7 @@ export const AGENT_TOOL_SPECS: readonly AgentToolSpec[] = [
     type: "function",
     function: {
       name: "get_connected_wallet",
-      description: "Read the Aptos wallet currently connected to this app. Call whenever the user asks for their connected wallet address, APT or ShelbyUSD balance, sequence number, authentication key, or connected-wallet identity. A public wallet address may be shown to its user; never request or expose a private key or recovery phrase.",
+      description: "Read the Aptos wallet currently connected to the active Shelby network workspace. Call whenever the user asks for their connected wallet address, APT or ShelbyUSD balance, sequence number, authentication key, or connected-wallet identity. A public wallet address may be shown to its user; never request or expose a private key or recovery phrase.",
       parameters: {
         type: "object",
         properties: {
@@ -113,7 +113,7 @@ export const AGENT_TOOL_SPECS: readonly AgentToolSpec[] = [
     type: "function",
     function: {
       name: "inspect_application",
-      description: "Use read-only local app capabilities for indexed image names/previews, indexed document metadata, assistant identity, or deterministic calculations. Use this to list indexed images or show/open a named image; it does not inspect image pixels. Do not use for wallet/account facts, document content, or generic Shelby blob counts/lists.",
+      description: "Use read-only local app capabilities scoped to the active Shelby network for indexed image names/previews, indexed document metadata, assistant identity, or deterministic calculations. Use this to list indexed images or show/open a named image; it does not inspect image pixels. Do not use for another network, wallet/account facts, document content, or generic Shelby blob counts/lists.",
       parameters: {
         type: "object",
         properties: {
@@ -131,7 +131,7 @@ export const AGENT_TOOL_SPECS: readonly AgentToolSpec[] = [
     type: "function",
     function: {
       name: "analyze_indexed_image",
-      description: "Inspect the original pixels of an indexed image. Call when the answer requires visual contents, readable text, objects, actions, or supporting visual details. Do not call merely to list image names or attach an existing preview.",
+      description: "Inspect the original pixels of an image indexed in the active Shelby network workspace. Call when the answer requires visual contents, readable text, objects, actions, or supporting visual details. Do not use an image from another network or call merely to list image names or attach an existing preview.",
       parameters: {
         type: "object",
         properties: {

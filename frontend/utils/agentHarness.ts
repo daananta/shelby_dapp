@@ -96,46 +96,6 @@ export function createAgentHarnessState(): AgentHarnessState {
   };
 }
 
-/** True only after one of the requested capabilities actually returned an observation or a bounded failure. */
-export function hasObservedAgentTool(
-  state: AgentHarnessState,
-  names: ReadonlySet<string> | readonly string[],
-): boolean {
-  const expected = new Set(names);
-  return state.trace.some((item) => (
-    expected.has(item.name) && (item.status === "executed" || item.status === "failed")
-  ));
-}
-
-export type AgentObservationPlan<TName extends string = string> = readonly (readonly TName[])[];
-
-function isCompletedObservation(item: AgentToolTrace): boolean {
-  return item.status === "executed" || item.status === "failed";
-}
-
-/**
- * Returns the next required stage in an ordered observation plan. Each stage
- * contains alternative capabilities; stages themselves must happen in order.
- */
-export function nextRequiredObservationTools<TName extends string>(
-  state: AgentHarnessState,
-  plan: AgentObservationPlan<TName>,
-): TName[] {
-  let stage = 0;
-  for (const item of state.trace) {
-    if (stage >= plan.length) break;
-    if (isCompletedObservation(item) && (plan[stage] as readonly string[]).includes(item.name)) stage += 1;
-  }
-  return stage < plan.length ? [...plan[stage]] : [];
-}
-
-export function hasSatisfiedAgentObservationPlan<TName extends string>(
-  state: AgentHarnessState,
-  plan: AgentObservationPlan<TName>,
-): boolean {
-  return nextRequiredObservationTools(state, plan).length === 0;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -229,7 +189,7 @@ const INTERNAL_INSTRUCTION_MARKERS = [
   /shelby rag explorer agent policy/i,
   /(?:active|available) operating skills\s*:/i,
   /(?:^|\n)\s*order of work\s*:/i,
-  /(?:^|\n)\s*---\s*\n\s*name:\s*(?:wallet-shelby|document-retrieval|image-vision|general-knowledge)/i,
+  /(?:^|\n)\s*---\s*\n\s*name:\s*(?:wallet-shelby|document-retrieval|image-vision|general-knowledge|network-scope|summarize-study-guide)/i,
 ];
 
 function containsInternalInstructionLeak(answer: string): boolean {
@@ -430,6 +390,34 @@ function normalizeToolResponse(
   }
 }
 
+/** Harness-only validation and cache bookkeeping must never become model context. */
+function modelVisibleToolResponse(
+  toolName: string,
+  response: Record<string, unknown>,
+): Record<string, unknown> {
+  const { answerContract: _answerContract, ...withoutContract } = response;
+  if (toolName === "refresh_wallet_blob_inventory") {
+    const {
+      fetchedAt: _fetchedAt,
+      refreshedAt: _refreshedAt,
+      source: _source,
+      ...visible
+    } = withoutContract;
+    return visible;
+  }
+  if (toolName !== "get_wallet_blob_inventory") return withoutContract;
+  const {
+    status: _status,
+    freshness: _freshness,
+    fetchedAt: _fetchedAt,
+    observedAt: _observedAt,
+    ageMs: _ageMs,
+    lastRefreshSucceeded: _lastRefreshSucceeded,
+    ...visible
+  } = withoutContract;
+  return visible;
+}
+
 function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   signal.throwIfAborted();
@@ -537,7 +525,7 @@ export async function executeAgentToolCalls(params: {
     responses.push({
       functionResponse: {
         name: call.name,
-        response,
+        response: modelVisibleToolResponse(call.name, response),
       },
     });
   }

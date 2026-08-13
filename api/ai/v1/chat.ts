@@ -28,6 +28,18 @@ type ChatMessage = {
   }>;
 };
 
+type AgentRequestDiagnostics = {
+  turnId: string;
+  modelCall: number;
+  phase: "route" | "compose" | "repair" | "finalize";
+  toolRound: number;
+  repairCount: number;
+  precedingToolCount: number;
+  precedingToolMs: number;
+  precedingRefreshMs: number;
+  turnElapsedMs: number;
+};
+
 const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 const MODEL = "qwen/qwen3.7-flash";
 const MAX_BODY_BYTES = 160 * 1024;
@@ -54,6 +66,7 @@ const ALLOWED_IMAGE_MIME_TYPES = new Set([
 const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const ALLOWED_TOOL_NAMES = new Set<string>(AGENT_TOOL_NAMES);
 const rateBuckets = new Map<string, { count: number; resetsAt: number }>();
+const DIAGNOSTIC_TURN_ID = /^[A-Za-z0-9_-]{8,64}$/;
 
 function firstHeader(value: HeaderValue) {
   return Array.isArray(value) ? value[0] : value;
@@ -91,6 +104,77 @@ function consumeRateLimit(request: RequestLike, scope: "chat_start" | "chat_tota
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function boundedInteger(value: unknown, minimum: number, maximum: number) {
+  return Number.isSafeInteger(value) && Number(value) >= minimum && Number(value) <= maximum
+    ? Number(value)
+    : undefined;
+}
+
+/** Accepts timing metadata only. User text, wallet data and tool output are never logged. */
+function sanitizeAgentDiagnostics(value: unknown): AgentRequestDiagnostics | undefined {
+  if (!isRecord(value)) return undefined;
+  const turnId = typeof value.turnId === "string" && DIAGNOSTIC_TURN_ID.test(value.turnId)
+    ? value.turnId
+    : undefined;
+  const phase = value.phase === "route"
+    || value.phase === "compose"
+    || value.phase === "repair"
+    || value.phase === "finalize"
+    ? value.phase
+    : undefined;
+  const modelCall = boundedInteger(value.modelCall, 1, 10);
+  const toolRound = boundedInteger(value.toolRound, 0, 5);
+  const repairCount = boundedInteger(value.repairCount, 0, 3);
+  const precedingToolCount = boundedInteger(value.precedingToolCount, 0, 6);
+  const precedingToolMs = boundedInteger(value.precedingToolMs, 0, 120_000);
+  const precedingRefreshMs = boundedInteger(value.precedingRefreshMs, 0, 120_000);
+  const turnElapsedMs = boundedInteger(value.turnElapsedMs, 0, 300_000);
+  if (
+    !turnId
+    || !phase
+    || modelCall === undefined
+    || toolRound === undefined
+    || repairCount === undefined
+    || precedingToolCount === undefined
+    || precedingToolMs === undefined
+    || precedingRefreshMs === undefined
+    || turnElapsedMs === undefined
+  ) return undefined;
+  return {
+    turnId,
+    modelCall,
+    phase,
+    toolRound,
+    repairCount,
+    precedingToolCount,
+    precedingToolMs,
+    precedingRefreshMs,
+    turnElapsedMs,
+  };
+}
+
+function logAgentModelTiming(
+  diagnostics: AgentRequestDiagnostics | undefined,
+  details: {
+    status: number;
+    headersMs: number;
+    totalMs: number;
+    firstTokenMs?: number;
+    outputKind: "answer" | "tool_calls" | "invalid" | "error";
+    inputChars: number;
+    requestBytes: number;
+    messageCount: number;
+    availableToolCount: number;
+  },
+) {
+  if (!diagnostics) return;
+  console.info("Agent model timing", JSON.stringify({
+    event: "agent_model_timing",
+    ...diagnostics,
+    ...details,
+  }));
 }
 
 function sanitizeAvailableToolNames(value: unknown): Set<string> | null {
@@ -322,7 +406,7 @@ async function relayChatStream(
   response: ResponseLike,
   availableTools: ReadonlySet<string>,
 ) {
-  if (!upstream.body || !response.write || !response.end) return false;
+  if (!upstream.body || !response.write || !response.end) return { handled: false as const };
   response.status(200);
   response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   response.setHeader("Cache-Control", "no-cache, no-transform");
@@ -332,6 +416,7 @@ async function relayChatStream(
   const decoder = new TextDecoder();
   let buffer = "";
   let content = "";
+  let firstTokenAt: number | undefined;
   const reasoningDetails: unknown[] = [];
   const streamedCalls = new Map<number, StreamedToolCall>();
 
@@ -354,6 +439,7 @@ async function relayChatStream(
           .join("")
         : "";
     if (text) {
+      if (firstTokenAt === undefined) firstTokenAt = Date.now();
       content += text;
       writeSse(response, "token", { text });
     }
@@ -402,11 +488,15 @@ async function relayChatStream(
   if (!message) {
     writeSse(response, "error", { status: 422, kind: "invalid_response" });
     response.end();
-    return true;
+    return { handled: true as const, firstTokenAt, outputKind: "invalid" as const };
   }
   writeSse(response, "message", { message });
   response.end();
-  return true;
+  return {
+    handled: true as const,
+    firstTokenAt,
+    outputKind: message.tool_calls?.length ? "tool_calls" as const : "answer" as const,
+  };
 }
 
 class UpstreamError extends Error {
@@ -436,6 +526,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
     return;
   }
   const body = isRecord(request.body) ? request.body : {};
+  const diagnostics = sanitizeAgentDiagnostics(body.diagnostics);
   const isVisionRequest = body.mode === "vision";
   const wantsChatStream = !isVisionRequest
     && body.stream === true
@@ -470,6 +561,8 @@ export default async function handler(request: RequestLike, response: ResponseLi
 
   let upstreamRequestBody: Record<string, unknown>;
   let chatAvailableTools: ReadonlySet<string> = new Set();
+  let sanitizedMessageCount = 0;
+  let sanitizedInputChars = 0;
   if (isVisionRequest) {
     const validation = sanitizeVisionRequest(body, bodyBytes);
     if (!validation.ok) {
@@ -504,6 +597,8 @@ export default async function handler(request: RequestLike, response: ResponseLi
       return;
     }
     const tools = selectAgentToolSpecs(availableTools);
+    sanitizedMessageCount = messages.length;
+    sanitizedInputChars = messages.reduce((total, message) => total + (message.content?.length ?? 0), 0);
     upstreamRequestBody = {
       model: MODEL,
       messages,
@@ -517,6 +612,9 @@ export default async function handler(request: RequestLike, response: ResponseLi
     };
   }
 
+  const upstreamRequestBytes = Buffer.byteLength(JSON.stringify(upstreamRequestBody));
+  const requestStartedAt = Date.now();
+  let upstreamHeadersAt: number | undefined;
   try {
     const upstream = await fetch(OPENROUTER_ENDPOINT, {
       method: "POST",
@@ -529,13 +627,30 @@ export default async function handler(request: RequestLike, response: ResponseLi
       body: JSON.stringify(upstreamRequestBody),
       signal: AbortSignal.timeout(45_000),
     });
+    upstreamHeadersAt = Date.now();
     if (!upstream.ok) throw new UpstreamError(upstream.status, upstream.headers.get("retry-after") ?? undefined);
     const upstreamContentType = upstream.headers.get("content-type")?.toLowerCase() ?? "";
     if (
       wantsChatStream
       && upstreamContentType.includes("text/event-stream")
-      && await relayChatStream(upstream, response, chatAvailableTools)
-    ) return;
+    ) {
+      const streamed = await relayChatStream(upstream, response, chatAvailableTools);
+      if (streamed.handled) {
+        const completedAt = Date.now();
+        logAgentModelTiming(diagnostics, {
+          status: streamed.outputKind === "invalid" ? 422 : upstream.status,
+          headersMs: upstreamHeadersAt - requestStartedAt,
+          totalMs: completedAt - requestStartedAt,
+          ...(streamed.firstTokenAt === undefined ? {} : { firstTokenMs: streamed.firstTokenAt - requestStartedAt }),
+          outputKind: streamed.outputKind,
+          inputChars: sanitizedInputChars,
+          requestBytes: upstreamRequestBytes,
+          messageCount: sanitizedMessageCount,
+          availableToolCount: chatAvailableTools.size,
+        });
+        return;
+      }
+    }
     const payload = await upstream.json() as {
       id?: string;
       model?: string;
@@ -544,6 +659,17 @@ export default async function handler(request: RequestLike, response: ResponseLi
     };
     const message = payload.choices?.[0]?.message;
     if (!isRecord(message)) {
+      const completedAt = Date.now();
+      logAgentModelTiming(diagnostics, {
+        status: 422,
+        headersMs: (upstreamHeadersAt ?? completedAt) - requestStartedAt,
+        totalMs: completedAt - requestStartedAt,
+        outputKind: "invalid",
+        inputChars: sanitizedInputChars,
+        requestBytes: upstreamRequestBytes,
+        messageCount: sanitizedMessageCount,
+        availableToolCount: chatAvailableTools.size,
+      });
       response.status(422).json({ error: "Hosted AI response was incomplete", kind: "invalid_response" });
       return;
     }
@@ -551,6 +677,17 @@ export default async function handler(request: RequestLike, response: ResponseLi
       ? sanitizeVisionResponseMessage(message)
       : sanitizeChatResponseMessage(message, chatAvailableTools);
     if (!responseMessage) {
+      const completedAt = Date.now();
+      logAgentModelTiming(diagnostics, {
+        status: 422,
+        headersMs: (upstreamHeadersAt ?? completedAt) - requestStartedAt,
+        totalMs: completedAt - requestStartedAt,
+        outputKind: "invalid",
+        inputChars: sanitizedInputChars,
+        requestBytes: upstreamRequestBytes,
+        messageCount: sanitizedMessageCount,
+        availableToolCount: chatAvailableTools.size,
+      });
       response.status(422).json({
         error: isVisionRequest
           ? "Hosted AI vision response was incomplete"
@@ -559,6 +696,17 @@ export default async function handler(request: RequestLike, response: ResponseLi
       });
       return;
     }
+    const completedAt = Date.now();
+    logAgentModelTiming(diagnostics, {
+      status: upstream.status,
+      headersMs: (upstreamHeadersAt ?? completedAt) - requestStartedAt,
+      totalMs: completedAt - requestStartedAt,
+      outputKind: "tool_calls" in responseMessage && responseMessage.tool_calls?.length ? "tool_calls" : "answer",
+      inputChars: sanitizedInputChars,
+      requestBytes: upstreamRequestBytes,
+      messageCount: sanitizedMessageCount,
+      availableToolCount: chatAvailableTools.size,
+    });
     response.status(200).json({
       id: payload.id,
       model: payload.model ?? MODEL,
@@ -567,6 +715,20 @@ export default async function handler(request: RequestLike, response: ResponseLi
       usage: payload.usage,
     });
   } catch (error) {
+    const completedAt = Date.now();
+    const upstreamStatus = error instanceof UpstreamError
+      ? error.status
+      : isTimeoutError(error) ? 504 : 502;
+    logAgentModelTiming(diagnostics, {
+      status: upstreamStatus,
+      headersMs: (upstreamHeadersAt ?? completedAt) - requestStartedAt,
+      totalMs: completedAt - requestStartedAt,
+      outputKind: "error",
+      inputChars: sanitizedInputChars,
+      requestBytes: upstreamRequestBytes,
+      messageCount: sanitizedMessageCount,
+      availableToolCount: chatAvailableTools.size,
+    });
     if (isTimeoutError(error)) {
       response.status(504).json({ error: "Hosted AI timed out", kind: "timeout" });
       return;

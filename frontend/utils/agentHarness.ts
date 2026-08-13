@@ -33,6 +33,12 @@ export interface AgentToolTrace {
   durationMs: number;
 }
 
+export interface AgentToolBatchTiming {
+  callCount: number;
+  totalMs: number;
+  refreshMs: number;
+}
+
 interface AgentCountContract {
   allowedValues: number[];
   requiredValues: number[];
@@ -448,8 +454,9 @@ export async function executeAgentToolCalls(params: {
   round: number;
   budget?: AgentHarnessBudget;
   signal?: AbortSignal;
-}): Promise<{ responses: AgentFunctionResponsePart[]; executed: boolean }> {
+}): Promise<{ responses: AgentFunctionResponsePart[]; executed: boolean; timing: AgentToolBatchTiming }> {
   const budget = params.budget ?? DEFAULT_AGENT_HARNESS_BUDGET;
+  const batchStartedAt = Date.now();
   params.signal?.throwIfAborted();
   if (params.round < 1 || params.round > budget.maxRounds) {
     throw new AgentHarnessLimitError("agent_round_limit");
@@ -463,6 +470,7 @@ export async function executeAgentToolCalls(params: {
 
   params.state.totalCalls += params.calls.length;
   let executed = false;
+  let refreshMs = 0;
   const responses: AgentFunctionResponsePart[] = [];
   for (const call of params.calls) {
     params.signal?.throwIfAborted();
@@ -522,6 +530,9 @@ export async function executeAgentToolCalls(params: {
       status,
       durationMs: Math.max(0, Date.now() - startedAt),
     });
+    if (call.name === "refresh_wallet_blob_inventory") {
+      refreshMs += Math.max(0, Date.now() - startedAt);
+    }
     responses.push({
       functionResponse: {
         name: call.name,
@@ -529,5 +540,13 @@ export async function executeAgentToolCalls(params: {
       },
     });
   }
-  return { responses, executed };
+  return {
+    responses,
+    executed,
+    timing: {
+      callCount: params.calls.length,
+      totalMs: Math.max(0, Date.now() - batchStartedAt),
+      refreshMs,
+    },
+  };
 }

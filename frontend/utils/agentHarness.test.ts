@@ -66,6 +66,30 @@ describe("bounded agent harness", () => {
     ]);
   });
 
+  it("reports bounded tool and inventory-refresh timing without tool payloads", async () => {
+    const clock = vi.spyOn(Date, "now")
+      .mockReturnValueOnce(100)
+      .mockReturnValueOnce(110)
+      .mockReturnValueOnce(140)
+      .mockReturnValueOnce(145)
+      .mockReturnValueOnce(170);
+    const result = await executeAgentToolCalls({
+      calls: [{ name: "refresh_wallet_blob_inventory" }],
+      registry: registry({
+        name: "refresh_wallet_blob_inventory",
+        maxExecutions: 1,
+        unavailableCode: "refresh_unavailable",
+        execute: vi.fn().mockResolvedValue({ ok: true, count: 1, privateValue: "not-in-timing" }),
+      }),
+      state: createAgentHarnessState(),
+      round: 1,
+    });
+
+    expect(result.timing).toEqual({ callCount: 1, totalMs: 70, refreshMs: 35 });
+    expect(JSON.stringify(result.timing)).not.toContain("privateValue");
+    clock.mockRestore();
+  });
+
   it("does not execute a duplicate or over-budget tool call", async () => {
     const search = vi.fn().mockResolvedValue({ found: true });
     const tools = registry({

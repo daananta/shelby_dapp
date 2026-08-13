@@ -211,10 +211,37 @@ describe("hosted Qwen agent", () => {
       ["hiện có 1 blob.", "append"],
     ]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toMatchObject({
+    const routeBody = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    const composeBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(routeBody).toMatchObject({
+      diagnostics: {
+        turnId: expect.stringMatching(/^[A-Za-z0-9_-]{8,64}$/),
+        modelCall: 1,
+        phase: "route",
+        toolRound: 0,
+        repairCount: 0,
+        precedingToolCount: 0,
+        precedingToolMs: 0,
+        precedingRefreshMs: 0,
+        turnElapsedMs: expect.any(Number),
+      },
+    });
+    expect(composeBody).toMatchObject({
       stream: true,
       toolChoice: "auto",
+      diagnostics: {
+        turnId: routeBody.diagnostics.turnId,
+        modelCall: 2,
+        phase: "compose",
+        toolRound: 1,
+        repairCount: 0,
+        precedingToolCount: 1,
+        precedingToolMs: expect.any(Number),
+        precedingRefreshMs: 0,
+        turnElapsedMs: expect.any(Number),
+      },
     });
+    expect(JSON.stringify(composeBody.diagnostics)).not.toContain("Tôi có bao nhiêu blob?");
   });
 
   it("executes a local RAG tool and returns its result to Qwen in a bounded second request", async () => {
@@ -721,6 +748,13 @@ describe("hosted Qwen agent", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
     const repairBody = JSON.parse(String((fetchMock.mock.calls[2][1] as RequestInit).body));
     expect(repairBody.toolChoice).toBe("none");
+    expect(repairBody.diagnostics).toMatchObject({
+      modelCall: 3,
+      phase: "repair",
+      toolRound: 1,
+      repairCount: 1,
+      precedingToolCount: 0,
+    });
     expect(repairBody.messages.at(-2)).toMatchObject({
       role: "assistant",
       content: "The project uses Shelby and Aptos libraries.",

@@ -6,6 +6,7 @@ const originalEnv = { ...process.env };
 afterEach(() => {
   process.env = { ...originalEnv };
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 function responseRecorder() {
@@ -179,6 +180,7 @@ describe("hosted Qwen gateway", () => {
       status: 200,
       headers: { "content-type": "text/event-stream" },
     })));
+    const timingLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const recorder = streamingResponseRecorder();
 
     await handler({
@@ -188,6 +190,19 @@ describe("hosted Qwen gateway", () => {
         stream: true,
         messages: [{ role: "user", content: "How many blobs do I have?" }],
         availableTools: ["get_wallet_blob_inventory"],
+        diagnostics: {
+          turnId: "turn12345678",
+          modelCall: 2,
+          phase: "compose",
+          toolRound: 1,
+          repairCount: 0,
+          precedingToolCount: 1,
+          precedingToolMs: 17,
+          precedingRefreshMs: 0,
+          turnElapsedMs: 3_200,
+          userPrompt: "must-not-be-logged",
+          walletAddress: "0xsecret",
+        },
       },
     }, recorder.response);
 
@@ -199,6 +214,29 @@ describe("hosted Qwen gateway", () => {
       .toContain("event: token\ndata: {\"text\":\"Your wallet \"}");
     expect(result.chunks.join(""))
       .toContain("event: message\ndata: {\"message\":{\"role\":\"assistant\",\"content\":\"Your wallet has one blob.\"}}");
+    expect(timingLog).toHaveBeenCalledOnce();
+    const timing = JSON.parse(String(timingLog.mock.calls[0]?.[1]));
+    expect(timing).toMatchObject({
+      event: "agent_model_timing",
+      turnId: "turn12345678",
+      modelCall: 2,
+      phase: "compose",
+      toolRound: 1,
+      precedingToolCount: 1,
+      precedingToolMs: 17,
+      outputKind: "answer",
+      status: 200,
+      inputChars: "How many blobs do I have?".length,
+      requestBytes: expect.any(Number),
+      messageCount: 1,
+      availableToolCount: 1,
+      headersMs: expect.any(Number),
+      firstTokenMs: expect.any(Number),
+      totalMs: expect.any(Number),
+    });
+    expect(JSON.stringify(timing)).not.toContain("must-not-be-logged");
+    expect(JSON.stringify(timing)).not.toContain("0xsecret");
+    timingLog.mockRestore();
   });
 
   it("assembles fragmented streamed tool calls before returning them to the browser", async () => {

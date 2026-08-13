@@ -43,6 +43,18 @@ type HostedChatResponse = {
 
 type HostedGatewayPayload = HostedChatResponse & { error?: string; kind?: string };
 
+type AgentRequestDiagnostics = {
+  turnId: string;
+  modelCall: number;
+  phase: "route" | "compose" | "repair" | "finalize";
+  toolRound: number;
+  repairCount: number;
+  precedingToolCount: number;
+  precedingToolMs: number;
+  precedingRefreshMs: number;
+  turnElapsedMs: number;
+};
+
 const MAX_HOSTED_IMAGE_BYTES = 2 * 1024 * 1024;
 const MAX_HOSTED_IMAGE_SOURCE_BYTES = 12 * 1024 * 1024;
 const MAX_HOSTED_IMAGE_EDGE = 1_600;
@@ -488,6 +500,7 @@ async function requestHostedChat(
   toolChoice: "auto" | "none" = "auto",
   availableTools: AgentToolName[] = [],
   onToken?: (text: string) => void,
+  diagnostics?: AgentRequestDiagnostics,
 ): Promise<HostedChatResponse["message"]> {
   signal?.throwIfAborted();
   if (onToken) {
@@ -496,7 +509,7 @@ async function requestHostedChat(
       response = await fetch("/api/ai/v1/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages, toolChoice, availableTools, stream: true }),
+        body: JSON.stringify({ messages, toolChoice, availableTools, stream: true, diagnostics }),
         signal,
       });
     } catch (error) {
@@ -530,7 +543,7 @@ async function requestHostedChat(
     if (!payload.message) throw new HostedAiError("invalid_response", localize("Qwen returned an incomplete response.", "Qwen trả về phản hồi chưa hoàn chỉnh."));
     return payload.message;
   }
-  const { response, payload } = await requestHostedGateway({ messages, toolChoice, availableTools }, signal);
+  const { response, payload } = await requestHostedGateway({ messages, toolChoice, availableTools, diagnostics }, signal);
   if (!response.ok) throw hostedGatewayFailure(response, payload, "chat");
   if (!payload.message) {
     throw new HostedAiError(
@@ -630,12 +643,20 @@ export async function streamHostedAgentAnswer(
   const availableTools = availableAgentToolNames(toolRegistry);
 
   const harnessState = createAgentHarnessState();
+  const turnStartedAt = Date.now();
+  const turnId = globalThis.crypto?.randomUUID?.().replace(/-/g, "")
+    ?? `turn_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
   let toolRound = 0;
   let repairOnly = false;
   let repairAttempts = 0;
+  let modelCall = 0;
+  let precedingToolCount = 0;
+  let precedingToolMs = 0;
+  let precedingRefreshMs = 0;
   while (toolRound <= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
     signal?.throwIfAborted();
     let streamedThisRequest = false;
+    modelCall += 1;
     const response = await requestHostedChat(
       messages,
       signal,
@@ -645,7 +666,21 @@ export async function streamHostedAgentAnswer(
         streamedThisRequest = true;
         onChunk(text, "append");
       },
+      {
+        turnId,
+        modelCall,
+        phase: repairOnly ? "repair" : toolRound === 0 ? "route" : "compose",
+        toolRound,
+        repairCount: repairAttempts,
+        precedingToolCount,
+        precedingToolMs,
+        precedingRefreshMs,
+        turnElapsedMs: Math.max(0, Date.now() - turnStartedAt),
+      },
     );
+    precedingToolCount = 0;
+    precedingToolMs = 0;
+    precedingRefreshMs = 0;
     const calls = parseToolCalls(response?.tool_calls);
     if (!calls.length) {
       const answer = typeof response?.content === "string" ? response.content.trim() : "";
@@ -705,10 +740,24 @@ export async function streamHostedAgentAnswer(
       });
       messages.push({ role: "user", content: createToolBudgetFinalizationInstruction() });
       let finalStreamed = false;
+      modelCall += 1;
       const finalResponse = await requestHostedChat(messages, signal, "none", availableTools, (text) => {
         finalStreamed = true;
         onChunk(text, "append");
+      }, {
+        turnId,
+        modelCall,
+        phase: "finalize",
+        toolRound,
+        repairCount: repairAttempts,
+        precedingToolCount,
+        precedingToolMs,
+        precedingRefreshMs,
+        turnElapsedMs: Math.max(0, Date.now() - turnStartedAt),
       });
+      precedingToolCount = 0;
+      precedingToolMs = 0;
+      precedingRefreshMs = 0;
       let finalAnswer = typeof finalResponse?.content === "string" ? finalResponse.content.trim() : "";
       if (!finalAnswer || parseToolCalls(finalResponse?.tool_calls).length) {
         throw new HostedAiError(
@@ -732,10 +781,24 @@ export async function streamHostedAgentAnswer(
         });
         messages.push({ role: "user", content: repairInstruction });
         finalStreamed = false;
+        modelCall += 1;
         const repaired = await requestHostedChat(messages, signal, "none", availableTools, (text) => {
           finalStreamed = true;
           onChunk(text, "append");
+        }, {
+          turnId,
+          modelCall,
+          phase: "repair",
+          toolRound,
+          repairCount: repairAttempts,
+          precedingToolCount,
+          precedingToolMs,
+          precedingRefreshMs,
+          turnElapsedMs: Math.max(0, Date.now() - turnStartedAt),
         });
+        precedingToolCount = 0;
+        precedingToolMs = 0;
+        precedingRefreshMs = 0;
         const repairedAnswer = typeof repaired?.content === "string" ? repaired.content.trim() : "";
         if (!repairedAnswer || parseToolCalls(repaired?.tool_calls).length) break;
         finalAnswer = repairedAnswer;
@@ -793,6 +856,9 @@ export async function streamHostedAgentAnswer(
         content: JSON.stringify(part.functionResponse.response),
       });
     });
+    precedingToolCount = batch.timing.callCount;
+    precedingToolMs = batch.timing.totalMs;
+    precedingRefreshMs = batch.timing.refreshMs;
   }
   throw new HostedAiError(
     "invalid_response",

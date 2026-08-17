@@ -719,4 +719,88 @@ describe("Gemini agent tool orchestration", () => {
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
     expect(agentSdk.sendMessageStream).not.toHaveBeenCalled();
   });
+
+  it("handles conversational follow-up questions like 'là gì' naturally without failing contracts", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([
+      { name: "get_wallet_blob_inventory", args: { detail: "sample" } },
+    ]));
+    agentSdk.sendMessageStream.mockResolvedValue(streamedResponse(
+      "Các blob trong ví của bạn bao gồm tệp hình ảnh 9grufvtqnhh1.jpeg. Blob là đơn vị lưu trữ dữ liệu nhị phân trên mạng Shelby."
+    ));
+    const onChunk = vi.fn();
+    const getWalletBlobInventory = vi.fn().mockResolvedValue({
+      ok: true,
+      network: "shelbynet",
+      count: 2,
+      examples: ["9grufvtqnhh1.jpeg", "KeHoach_Shelby_2026.txt"],
+      answerContract: {
+        scope: "wallet_blob_inventory",
+        requiredExactStrings: [],
+        count: {
+          allowedValues: [2, 0],
+          requiredValues: [],
+          units: ["blob", "blobs", "tệp", "file", "files"],
+        },
+      },
+    });
+
+    const history = buildAdaptiveGeminiHistory([
+      { role: "user", text: "Tôi có bao nhiêu blob?" },
+      { role: "ai", text: "Ví của bạn hiện có 2 blob trên mạng ShelbyNet." },
+    ]);
+
+    const answer = await streamCloudAgentAnswer(
+      {
+        contents: [...history, { role: "user", parts: [{ text: "là gì" }] }],
+        cloudApiKey: "test-key",
+        systemInstruction: "test",
+      },
+      onChunk,
+      { searchKnowledge: vi.fn(), getWalletBlobInventory },
+    );
+
+    expect(answer).toContain("9grufvtqnhh1.jpeg");
+    expect(answer).toContain("Blob");
+    expect(getWalletBlobInventory).toHaveBeenCalledWith(
+      expect.objectContaining({ detail: "sample" }),
+      undefined,
+    );
+  });
+
+  it("validates Vietnamese word numbers like 'hai blob' correctly", async () => {
+    agentSdk.sendMessage.mockResolvedValue(firstResponse([
+      { name: "get_wallet_blob_inventory", args: { detail: "count" } },
+    ]));
+    agentSdk.sendMessageStream.mockResolvedValue(streamedResponse(
+      "Hiện tại trong ví của bạn có hai blob được lưu trữ an toàn."
+    ));
+    const onChunk = vi.fn();
+    const getWalletBlobInventory = vi.fn().mockResolvedValue({
+      ok: true,
+      network: "shelbynet",
+      count: 2,
+      answerContract: {
+        scope: "wallet_blob_inventory",
+        requiredExactStrings: [],
+        count: {
+          allowedValues: [2],
+          requiredValues: [2],
+          units: ["blob", "blobs", "tệp", "file", "files"],
+        },
+      },
+    });
+
+    const answer = await streamCloudAgentAnswer(
+      {
+        contents: [{ role: "user", parts: [{ text: "tôi có bao nhiêu blob" }] }],
+        cloudApiKey: "test-key",
+        systemInstruction: "test",
+      },
+      onChunk,
+      { searchKnowledge: vi.fn(), getWalletBlobInventory },
+    );
+
+    expect(answer).toBe("Hiện tại trong ví của bạn có hai blob được lưu trữ an toàn.");
+    expect(getWalletBlobInventory).toHaveBeenCalledOnce();
+  });
 });

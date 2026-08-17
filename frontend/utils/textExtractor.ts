@@ -1,5 +1,6 @@
 import type { MetadataValue } from "@/utils/ragTypes";
 import { localize } from "@/i18n";
+import { getPdfJs } from "@/utils/pdfLoader";
 
 export interface ExtractedPage {
   pageNumber: number;
@@ -128,9 +129,8 @@ export async function extractPagesFromUrl(
   // PDF.js owns the parsing worker. Running PDF.js inside our own Worker makes
   // its browser build access `window` and breaks in Chromium. Keep page
   // orchestration light on the UI thread while PDF parsing stays off-thread.
-  const pdfjs = await import("pdfjs-dist");
+  const pdfjs = await getPdfJs();
   signal?.throwIfAborted();
-  pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
   const loadingTask = pdfjs.getDocument(requestHeaders ? { url, httpHeaders: requestHeaders } : url);
   const abortLoading = () => { void loadingTask.destroy(); };
   signal?.addEventListener("abort", abortLoading, { once: true });
@@ -193,8 +193,7 @@ export async function extractSinglePageFromUrl(
     const [page] = await extractPagesFromUrl(url, fileName, 1, undefined, detectedMimeType, signal, requestHeaders);
     return page;
   }
-  const pdfjs = await import("pdfjs-dist");
-  pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
+  const pdfjs = await getPdfJs();
   signal?.throwIfAborted();
   const loadingTask = pdfjs.getDocument(requestHeaders ? { url, httpHeaders: requestHeaders } : url);
   const abortLoading = () => { void loadingTask.destroy(); };

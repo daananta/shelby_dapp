@@ -59,6 +59,28 @@ test("mocks wallet connection and verifies RAG sync dashboard renders", async ({
   await expect(page.getByText("Bản sao không chứa Gemini API key", { exact: false })).toBeVisible();
 });
 
+test("keeps all three model choices visible on a narrow mobile viewport", async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 780 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
+  await page.getByRole("tab", { name: "Chat", exact: true }).click();
+
+  const selector = page.getByTestId("chat-model-selector");
+  await expect(selector).toBeVisible();
+  const options = selector.getByRole("radio");
+  await expect(options).toHaveCount(3);
+  await expect(options.nth(0)).toContainText("Qwen 3.7 Flash");
+  await expect(options.nth(1)).toContainText("Qwen 3.8 Flash");
+  await expect(options.nth(2)).toContainText("Gemini");
+  await options.nth(0).focus();
+  await options.nth(0).press("ArrowRight");
+  await expect(options.nth(1)).toHaveAttribute("aria-checked", "true");
+  expect(await page.evaluate(() => localStorage.getItem("shelby-rag-explorer.hosted-model"))).toBe("qwen/qwen3.8-max-free");
+  await options.nth(1).press("ArrowLeft");
+  await expect(options.nth(0)).toHaveAttribute("aria-checked", "true");
+  expect(await selector.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+});
+
 test("presents preserved Testnet data as a separate archive from ShelbyNet", async ({ page }) => {
   await page.goto("/");
   await page.evaluate(async () => {
@@ -221,9 +243,20 @@ test("keeps a temporarily limited Gemini key locally and accepts it on retry", a
   let observedApiKey = "";
   let observedThinkingBudget: number | undefined;
   let qwenRequests = 0;
+  let observedHostedModel = "";
   const authorizationKey = "AQ.mock-project-key-2222";
   page.on("request", (request) => {
     if (request.url().includes("/api/ai/v1/chat")) qwenRequests += 1;
+  });
+  await page.route("**/api/ai/v1/chat", async (route) => {
+    observedHostedModel = route.request().postDataJSON()?.model ?? "";
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        message: { role: "assistant", content: "Qwen 3.7 đang trả lời cuộc trò chuyện này." },
+      }),
+    });
   });
   await page.route("https://generativelanguage.googleapis.com/**", async (route) => {
     observedApiKey = route.request().headers()["x-goog-api-key"] ?? "";
@@ -276,8 +309,17 @@ test("keeps a temporarily limited Gemini key locally and accepts it on retry", a
 
   await page.goto("/");
   await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
-  await page.getByRole("button", { name: "Dùng Gemini", exact: true }).click();
+  const modelOptions = page.getByRole("radiogroup", { name: "Mô hình trò chuyện" }).getByRole("radio");
+  await expect(modelOptions).toHaveCount(3);
+  await expect(modelOptions.nth(0)).toContainText("Qwen 3.7 Flash");
+  await expect(modelOptions.nth(1)).toContainText("Qwen 3.8 Flash");
+  await expect(modelOptions.nth(2)).toContainText("Gemini");
+  await expect(modelOptions.nth(0)).toHaveAttribute("aria-checked", "true");
+
+  const geminiOption = page.getByRole("radio", { name: /Gemini/ });
+  await geminiOption.click();
   const keyInput = page.getByPlaceholder("Dán Gemini API key…");
+  await expect(keyInput).toBeFocused();
   await keyInput.fill(`  ${authorizationKey}  `);
   await page.getByRole("button", { name: "Lưu & kiểm tra", exact: true }).click();
   await expect(page.getByText(/Key …2222 đã được lưu cục bộ.*không bị từ chối.*Thử lại/)).toBeVisible();
@@ -293,9 +335,9 @@ test("keeps a temporarily limited Gemini key locally and accepts it on retry", a
   providerState = "ready";
   await page.getByRole("button", { name: "Thử lại", exact: true }).click();
   await expect(page.getByText("✓ Key …2222 đã được Gemini chấp nhận; gemini-2.5-flash khả dụng.", { exact: true })).toBeVisible();
-  const readyGeminiButton = page.getByRole("button", { name: "Gemini sẵn sàng", exact: true });
-  await expect(readyGeminiButton).toHaveAttribute("data-state", "ready");
-  await expect(readyGeminiButton).toHaveAttribute("aria-expanded", "true");
+  await expect(geminiOption).toHaveAttribute("data-key-state", "ready");
+  await expect(geminiOption).toHaveAttribute("aria-checked", "true");
+  await expect(geminiOption).toHaveAttribute("aria-expanded", "true");
   expect(observedApiKey).toBe(authorizationKey);
   expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBe(authorizationKey);
 
@@ -306,7 +348,18 @@ test("keeps a temporarily limited Gemini key locally and accepts it on retry", a
   expect(qwenRequests).toBe(0);
   expect(observedThinkingBudget).toBe(0);
 
+  const qwen37Option = page.getByRole("radio", { name: /Qwen 3\.7 Flash/ });
+  await qwen37Option.click();
+  await expect(qwen37Option).toHaveAttribute("aria-checked", "true");
+  await chatInput.fill("Tiếp tục bằng Qwen");
+  await chatInput.press("Enter");
+  await expect(page.getByText("Qwen 3.7 đang trả lời cuộc trò chuyện này.", { exact: true })).toBeVisible();
+  expect(qwenRequests).toBe(1);
+  expect(observedHostedModel).toBe("qwen/qwen3.7-flash");
+  expect(await page.evaluate(() => sessionStorage.getItem("shelby-rag-explorer.gemini-api-key"))).toBe(authorizationKey);
+
   providerState = "invalid";
+  await geminiOption.click();
   await keyInput.fill("AQ.invalid-replacement");
   await page.getByRole("button", { name: "Lưu & kiểm tra", exact: true }).click();
   await expect(page.getByText(/Key trước đó …2222 vẫn hoạt động/)).toBeVisible();
@@ -325,7 +378,7 @@ test("rejects only a Gemini key that the provider explicitly marks invalid", asy
 
   await page.goto("/");
   await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
-  await page.getByRole("button", { name: "Dùng Gemini", exact: true }).click();
+  await page.getByRole("radio", { name: /Gemini/ }).click();
   await page.getByPlaceholder("Dán Gemini API key…").fill("AQ.invalid-key");
   await page.getByRole("button", { name: "Lưu & kiểm tra", exact: true }).click();
 

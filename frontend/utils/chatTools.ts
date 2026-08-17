@@ -325,11 +325,6 @@ export function readBlobInventoryForAgent(
     ? inventory.names.filter((name) => name.toLocaleLowerCase("en-US").includes(normalizedQuery))
     : [];
   const matchingNames = allMatchingNames.slice(0, BLOB_LIST_LIMIT);
-  const disclosedNames = nameQuery
-    ? matchingNames.slice(0, BLOB_EXAMPLE_LIMIT)
-    : request.detail === "sample" || request.detail === "all"
-      ? inventory.names.slice(0, BLOB_EXAMPLE_LIMIT)
-      : [];
   const expectedCount = nameQuery ? allMatchingNames.length : inventory.names.length;
   const singleton = inventory.names.length === 1 ? inventory.names[0] : undefined;
 
@@ -361,11 +356,16 @@ export function readBlobInventoryForAgent(
     lastRefreshSucceeded: inventory.verified,
     answerContract: {
       scope: "wallet_blob_inventory",
-      requiredExactStrings: disclosedNames,
+      requiredExactStrings: nameQuery && matchingNames.length === 1 ? matchingNames : [],
       count: {
-        allowedValues: [...new Set([inventory.names.length, expectedCount])],
-        requiredValues: expectedCount > 0 ? [expectedCount] : [],
-        units: ["blob", "blobs", "tệp", "file", "files"],
+        allowedValues: [...new Set(expectedCount === 0 ? [inventory.names.length, 0] : [inventory.names.length, expectedCount])],
+        requiredValues: (request.detail === "count" || Boolean(nameQuery && request.detail === "all")) && expectedCount > 0
+          ? [expectedCount]
+          : [],
+        units: [
+          "blob",
+          "blobs",
+        ],
       },
     },
   };

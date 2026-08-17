@@ -179,16 +179,42 @@ function recordAnswerContract(state: AgentHarnessState, response: Record<string,
   state.countContracts.push(...countContracts);
 }
 
+function stripMarkdownDecorations(text: string): string {
+  return text
+    .replace(/[*`~#]/g, "")
+    .replace(/__([^_]+)__/g, "$1");
+}
+
+const WORD_TO_NUMBER: Record<string, number> = {
+  không: 0, zero: 0,
+  một: 1, one: 1,
+  hai: 2, two: 2,
+  ba: 3, three: 3,
+  bốn: 4, four: 4,
+  năm: 5, five: 5,
+  sáu: 6, six: 6,
+  bảy: 7, seven: 7,
+  tám: 8, eight: 8,
+  chín: 9, nine: 9,
+  mười: 10, ten: 10,
+};
+
 function extractCountFacts(answer: string, units: string[]): number[] {
+  const cleanAnswer = stripMarkdownDecorations(answer);
   const escapedUnits = units
     .map((unit) => unit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
     .sort((left, right) => right.length - left.length)
     .join("|");
   if (!escapedUnits) return [];
-  const pattern = new RegExp(`(\\d[\\d\\s.,]*)\\s*(?:${escapedUnits})(?![\\p{L}])`, "giu");
-  return [...answer.matchAll(pattern)]
+  const digitPattern = new RegExp(`(\\d[\\d\\s.,]*)\\s*(?:${escapedUnits})(?![\\p{L}])`, "giu");
+  const wordPattern = new RegExp(`\\b(${Object.keys(WORD_TO_NUMBER).join("|")})\\s+(?:${escapedUnits})(?![\\p{L}])`, "giu");
+  const digitMatches = [...cleanAnswer.matchAll(digitPattern)]
     .map((match) => Number(match[1].replace(/\D/g, "")))
     .filter(Number.isSafeInteger);
+  const wordMatches = [...cleanAnswer.matchAll(wordPattern)]
+    .map((match) => WORD_TO_NUMBER[match[1].toLowerCase()])
+    .filter((val): val is number => val !== undefined);
+  return [...new Set([...digitMatches, ...wordMatches])];
 }
 
 const INTERNAL_INSTRUCTION_MARKERS = [
@@ -202,20 +228,28 @@ function containsInternalInstructionLeak(answer: string): boolean {
   return INTERNAL_INSTRUCTION_MARKERS.some((pattern) => pattern.test(answer));
 }
 
+function factMatchesAnswer(fact: string, normalizedAnswer: string): boolean {
+  const cleanFact = stripMarkdownDecorations(fact).normalize("NFC").toLocaleLowerCase("en-US");
+  if (!cleanFact) return true;
+  if (normalizedAnswer.includes(cleanFact)) return true;
+  const withoutExt = cleanFact.replace(/\.(txt|pdf|png|jpe?g|webp|gif|json|md|bin|doc|docx)$/i, "");
+  if (withoutExt.length >= 4 && normalizedAnswer.includes(withoutExt)) return true;
+  return false;
+}
+
 export function validateAgentFinalAnswer(
   state: AgentHarnessState,
   answer: string,
 ): AgentFinalAnswerValidation {
   const allowedCitationIds = [...state.evidenceCitationIds];
   const citedCitationIds = [...extractAnswerCitationIds(answer)];
-  const normalizedAnswer = answer.normalize("NFC").toLocaleLowerCase("en-US");
+  const cleanAnswer = stripMarkdownDecorations(answer);
+  const normalizedAnswer = cleanAnswer.normalize("NFC").toLocaleLowerCase("en-US");
   const exactFacts = new Set([
     ...state.requiredExactFacts,
     ...[...state.scopedExactFacts.values()].flatMap((facts) => [...facts]),
   ]);
-  const missingExactFacts = [...exactFacts].filter((fact) => (
-    !normalizedAnswer.includes(fact.toLocaleLowerCase("en-US"))
-  ));
+  const missingExactFacts = [...exactFacts].filter((fact) => !factMatchesAnswer(fact, normalizedAnswer));
   const invalidCountFacts: number[] = [];
   const missingCountFacts: number[] = [];
   const countContracts = [

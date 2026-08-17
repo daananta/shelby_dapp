@@ -17,6 +17,7 @@ import {
 } from "@/utils/agentRuntime";
 import type { AgentToolName } from "../../shared/agentTools";
 import { localize } from "@/i18n";
+import { getStoredHostedModel } from "@/utils/hostedModelStorage";
 
 type OpenRouterToolCall = {
   id: string;
@@ -82,10 +83,11 @@ async function requestHostedGateway(
 ): Promise<{ response: Response; payload: HostedGatewayPayload }> {
   let response: Response;
   try {
+    const payloadBody = { model: getStoredHostedModel(), ...body };
     response = await fetch("/api/ai/v1/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payloadBody),
       signal,
     });
   } catch (error) {
@@ -509,7 +511,7 @@ async function requestHostedChat(
       response = await fetch("/api/ai/v1/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages, toolChoice, availableTools, stream: true, diagnostics }),
+        body: JSON.stringify({ messages, toolChoice, availableTools, stream: true, diagnostics, model: getStoredHostedModel() }),
         signal,
       });
     } catch (error) {
@@ -656,15 +658,20 @@ export async function streamHostedAgentAnswer(
   while (toolRound <= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
     signal?.throwIfAborted();
     let streamedThisRequest = false;
+    let roundBuffer = "";
     modelCall += 1;
+    const isDirectAnswerPhase = repairOnly || toolRound > 0;
     const response = await requestHostedChat(
       messages,
       signal,
       repairOnly || toolRound >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds ? "none" : "auto",
       availableTools,
       (text) => {
-        streamedThisRequest = true;
-        onChunk(text, "append");
+        roundBuffer += text;
+        if (isDirectAnswerPhase) {
+          streamedThisRequest = true;
+          onChunk(text, "append");
+        }
       },
       {
         turnId,
@@ -683,7 +690,7 @@ export async function streamHostedAgentAnswer(
     precedingRefreshMs = 0;
     const calls = parseToolCalls(response?.tool_calls);
     if (!calls.length) {
-      const answer = typeof response?.content === "string" ? response.content.trim() : "";
+      const answer = typeof response?.content === "string" ? response.content.trim() : (roundBuffer.trim() || "");
       const finalAnswer = answer || localize(
         "There is not enough information for a confident answer.",
         "Không tìm thấy đủ thông tin để trả lời chắc chắn.",
@@ -718,7 +725,6 @@ export async function streamHostedAgentAnswer(
       if (!streamedThisRequest) onChunk(finalAnswer);
       return finalAnswer;
     }
-    if (streamedThisRequest) onChunk("", "replace");
     if (toolRound >= DEFAULT_AGENT_HARNESS_BUDGET.maxRounds) {
       messages.push({
         role: "assistant",

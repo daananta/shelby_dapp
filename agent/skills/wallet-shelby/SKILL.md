@@ -14,8 +14,8 @@ When the user asks for blobs matching a word, extension, or category, pass that
 substring as `nameQuery` to `get_wallet_blob_inventory` and summarize its
 `matches`; do not guess from sample names.
 Use the same inventory tool when a natural follow-up refers to an earlier blob
-count or list and asks for an omitted identity or detail. Choose `sample` when
-the user needs to know which item or items the previous count referred to.
+count or list and asks for an omitted identity or detail (such as "là gì", "cụ thể là gì", "có những tệp nào", "which files"). Choose `sample` (or `all`) when
+the user needs to know which item or items are present, name them clearly, and describe their types.
 For a follow-up that asks whether a blob count or list is correct, call
 `get_wallet_blob_inventory` again. Do not search document contents. If the tool
 returns `refreshRequired: true`, call `refresh_wallet_blob_inventory`

@@ -84,7 +84,7 @@ describe("hosted Qwen gateway", () => {
     const [, init] = upstream.mock.calls[0] as [string, RequestInit];
     const upstreamBody = JSON.parse(String(init.body));
     expect(upstreamBody.model).toBe("qwen/qwen3.7-flash");
-    expect(upstreamBody.reasoning).toEqual({ effort: "low", exclude: true });
+    expect(upstreamBody.reasoning).toEqual({ effort: "none" });
     expect(upstreamBody.tools).toEqual(expect.arrayContaining([
       expect.objectContaining({
         function: expect.objectContaining({ name: "get_connected_wallet" }),
@@ -120,6 +120,33 @@ describe("hosted Qwen gateway", () => {
     const upstreamBody = JSON.parse(String(init.body));
     expect(upstreamBody.tools.map((tool: { function: { name: string } }) => tool.function.name))
       .toEqual(["search_user_knowledge", "get_connected_wallet"]);
+  });
+
+  it("accepts a final text answer with an empty tool_calls array", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.OPENROUTER_API_KEY = "server-only-test-key";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      model: "qwen/qwen3.7-flash",
+      choices: [{
+        message: { role: "assistant", content: "Final answer.", tool_calls: [] },
+        finish_reason: "stop",
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } })));
+    const recorder = responseRecorder();
+
+    await handler({
+      method: "POST",
+      headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.66" },
+      body: { messages: [{ role: "user", content: "Answer directly" }] },
+    }, recorder.response);
+
+    expect(recorder.read()).toMatchObject({
+      statusCode: 200,
+      payload: {
+        model: "qwen/qwen3.7-flash",
+        message: { role: "assistant", content: "Final answer." },
+      },
+    });
   });
 
   it("normalizes provider tool calls with object arguments and a missing id", async () => {

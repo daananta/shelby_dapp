@@ -40,8 +40,9 @@ type AgentRequestDiagnostics = {
   turnElapsedMs: number;
 };
 
+const TOKENROUTER_ENDPOINT = "https://api.tokenrouter.com/v1/chat/completions";
 const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-const MODEL = "qwen/qwen3.7-flash";
+const DEFAULT_MODEL = "qwen/qwen3.8-max-free";
 const MAX_BODY_BYTES = 160 * 1024;
 const MAX_VISION_BODY_BYTES = 3 * 1024 * 1024;
 const MAX_VISION_IMAGE_BYTES = 2 * 1024 * 1024;
@@ -49,9 +50,8 @@ const MAX_MESSAGES = 32;
 const MAX_TOTAL_CONTENT = 120_000;
 const MAX_OUTPUT_TOKENS = 1_800;
 const MAX_VISION_OUTPUT_TOKENS = 700;
-// Tool selection and conversational reference resolution need a small reasoning
-// budget. Keep the trace private, but do not disable the model's reasoning.
-const AGENT_REASONING = { effort: "low", exclude: true } as const;
+// Fast agent response: disable high-latency reasoning on OpenRouter so tokens stream instantly
+const AGENT_REASONING = { effort: "none" } as const;
 const VISION_REASONING = { effort: "none", exclude: true } as const;
 const RATE_WINDOW_MS = 60_000;
 const CHAT_START_RATE_LIMIT = 15;
@@ -68,6 +68,11 @@ const ALLOWED_TOOL_NAMES = new Set<string>(AGENT_TOOL_NAMES);
 const rateBuckets = new Map<string, { count: number; resetsAt: number }>();
 const DIAGNOSTIC_TURN_ID = /^[A-Za-z0-9_-]{8,64}$/;
 
+function sanitizeRequestedModel(value: unknown): "qwen/qwen3.8-max-free" | "qwen/qwen3.7-flash" {
+  if (value === "qwen/qwen3.7-flash") return "qwen/qwen3.7-flash";
+  return "qwen/qwen3.8-max-free";
+}
+
 function firstHeader(value: HeaderValue) {
   return Array.isArray(value) ? value[0] : value;
 }
@@ -79,15 +84,29 @@ function allowedOrigin() {
 }
 
 function isOriginAllowed(request: RequestLike) {
+  const origin = firstHeader(request.headers?.origin)?.replace(/\/$/, "");
+  if (
+    process.env.NODE_ENV !== "production"
+    && origin
+    && (origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:"))
+  ) {
+    return true;
+  }
   const expected = allowedOrigin();
   if (!expected) return process.env.NODE_ENV !== "production";
-  const origin = firstHeader(request.headers?.origin)?.replace(/\/$/, "");
   if (!origin) return process.env.RAG_GATEWAY_ALLOW_SERVER_CALLS === "true";
   return origin === expected;
 }
 
 function consumeRateLimit(request: RequestLike, scope: "chat_start" | "chat_total" | "vision", limit: number) {
   const forwarded = firstHeader(request.headers?.["x-forwarded-for"])?.split(",")[0]?.trim();
+  const origin = firstHeader(request.headers?.origin);
+  const isLocalDev = Boolean(
+    process.env.NODE_ENV !== "production"
+    && origin
+    && (origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:")),
+  );
+  const effectiveLimit = isLocalDev ? limit * 10 : limit;
   const identity = `${scope}:${forwarded || request.socket?.remoteAddress || "unknown"}`;
   const now = Date.now();
   if (rateBuckets.size > 10_000) {
@@ -99,7 +118,7 @@ function consumeRateLimit(request: RequestLike, scope: "chat_start" | "chat_tota
     return true;
   }
   bucket.count += 1;
-  return bucket.count <= limit;
+  return bucket.count <= effectiveLimit;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -270,7 +289,7 @@ function sanitizeChatResponseMessage(
     allowObjectArguments: true,
     generateMissingIds: true,
   });
-  if (Array.isArray(value.tool_calls) && !toolCalls) return null;
+  if (Array.isArray(value.tool_calls) && value.tool_calls.length > 0 && !toolCalls) return null;
   const reasoningDetails = Array.isArray(value.reasoning_details)
     && JSON.stringify(value.reasoning_details).length <= 16_000
     ? value.reasoning_details
@@ -545,11 +564,20 @@ export default async function handler(request: RequestLike, response: ResponseLi
     return;
   }
 
-  const apiKey = process.env.OPENROUTER_API_KEY?.trim();
-  if (!apiKey) {
+  const requestedModel = sanitizeRequestedModel(body.model);
+  const tokenRouterKey = process.env.TOKENROUTER_API_KEY?.trim();
+  const openRouterKey = process.env.OPENROUTER_API_KEY?.trim();
+  const hasHostedKey = Boolean(tokenRouterKey || openRouterKey);
+
+  if (!hasHostedKey) {
     response.status(503).json({ error: "Hosted AI is not configured" });
     return;
   }
+
+  const preferTokenRouter = (requestedModel === "qwen/qwen3.8-max-free" || !openRouterKey) && Boolean(tokenRouterKey);
+  const primaryEndpoint = preferTokenRouter ? TOKENROUTER_ENDPOINT : OPENROUTER_ENDPOINT;
+  const primaryKey = preferTokenRouter ? tokenRouterKey! : (openRouterKey || tokenRouterKey!);
+  const primaryUpstreamModel = preferTokenRouter ? "qwen/qwen3.8-max-free" : "qwen/qwen3.7-flash";
 
   let bodyBytes = 0;
   try {
@@ -571,7 +599,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
     }
     const { data, mimeType, language, question } = validation.value;
     upstreamRequestBody = {
-      model: MODEL,
+      model: primaryUpstreamModel,
       messages: [{
         role: "user",
         content: [
@@ -600,7 +628,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
     sanitizedMessageCount = messages.length;
     sanitizedInputChars = messages.reduce((total, message) => total + (message.content?.length ?? 0), 0);
     upstreamRequestBody = {
-      model: MODEL,
+      model: primaryUpstreamModel,
       messages,
       ...(toolChoice === "auto" && tools.length
         ? { tools, tool_choice: "auto" }
@@ -616,17 +644,55 @@ export default async function handler(request: RequestLike, response: ResponseLi
   const requestStartedAt = Date.now();
   let upstreamHeadersAt: number | undefined;
   try {
-    const upstream = await fetch(OPENROUTER_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": allowedOrigin() ?? "https://shelby-rag-explorer.vercel.app",
-        "X-Title": "Shelby RAG Explorer",
-      },
-      body: JSON.stringify(upstreamRequestBody),
-      signal: AbortSignal.timeout(45_000),
-    });
+    let upstream: Response;
+    let actualUpstreamModel = primaryUpstreamModel;
+    try {
+      upstream = await fetch(primaryEndpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${primaryKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": allowedOrigin() ?? "https://shelby-rag-explorer.vercel.app",
+          "X-Title": "Shelby RAG Explorer",
+        },
+        body: JSON.stringify(upstreamRequestBody),
+        signal: AbortSignal.timeout(45_000),
+      });
+      // Fallback from TokenRouter to OpenRouter if TokenRouter is overloaded/down/rate-limited
+      if (!upstream.ok && preferTokenRouter && openRouterKey && (upstream.status >= 500 || upstream.status === 429)) {
+        const fallbackBody = { ...upstreamRequestBody, model: "qwen/qwen3.7-flash" };
+        actualUpstreamModel = "qwen/qwen3.7-flash";
+        upstream = await fetch(OPENROUTER_ENDPOINT, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${openRouterKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": allowedOrigin() ?? "https://shelby-rag-explorer.vercel.app",
+            "X-Title": "Shelby RAG Explorer",
+          },
+          body: JSON.stringify(fallbackBody),
+          signal: AbortSignal.timeout(45_000),
+        });
+      }
+    } catch (fetchErr) {
+      if (preferTokenRouter && openRouterKey) {
+        const fallbackBody = { ...upstreamRequestBody, model: "qwen/qwen3.7-flash" };
+        actualUpstreamModel = "qwen/qwen3.7-flash";
+        upstream = await fetch(OPENROUTER_ENDPOINT, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${openRouterKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": allowedOrigin() ?? "https://shelby-rag-explorer.vercel.app",
+            "X-Title": "Shelby RAG Explorer",
+          },
+          body: JSON.stringify(fallbackBody),
+          signal: AbortSignal.timeout(45_000),
+        });
+      } else {
+        throw fetchErr;
+      }
+    }
     upstreamHeadersAt = Date.now();
     if (!upstream.ok) throw new UpstreamError(upstream.status, upstream.headers.get("retry-after") ?? undefined);
     const upstreamContentType = upstream.headers.get("content-type")?.toLowerCase() ?? "";
@@ -709,7 +775,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
     });
     response.status(200).json({
       id: payload.id,
-      model: payload.model ?? MODEL,
+      model: payload.model ?? actualUpstreamModel,
       message: responseMessage,
       finishReason: payload.choices?.[0]?.finish_reason,
       usage: payload.usage,

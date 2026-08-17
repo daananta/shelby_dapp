@@ -84,6 +84,20 @@ function emitRagState() {
   if (typeof window !== "undefined") window.dispatchEvent(new Event("shelby:rag-state"));
 }
 
+function clearActiveWorkspaceState(emit = true) {
+  activeOwner = null;
+  manifests.clear();
+  pages.clear();
+  chunks.clear();
+  workspace = null;
+  lexicalDb = null;
+  contentLoaded = false;
+  queryEmbeddingCache.clear();
+  remoteRagProvider = null;
+  remoteRagCache = null;
+  if (emit) emitRagState();
+}
+
 /**
  * `eligibleNames` is written only after a successful Shelby inventory + policy
  * refresh. Older workspaces intentionally fall back to their previous behavior
@@ -381,17 +395,7 @@ export async function setActiveRagOwner(owner: string, shouldActivate: () => boo
     if (!shouldActivate() && activeOwner === normalized) {
       // A wallet/request can become stale while IndexedDB is hydrating. Do not
       // leave that old owner authoritative until another component switches it.
-      activeOwner = null;
-      manifests.clear();
-      pages.clear();
-      chunks.clear();
-      workspace = null;
-      lexicalDb = null;
-      contentLoaded = false;
-      queryEmbeddingCache.clear();
-      remoteRagProvider = null;
-      remoteRagCache = null;
-      emitRagState();
+      clearActiveWorkspaceState(true);
       return;
     }
     activated = activeOwner === normalized;
@@ -410,18 +414,8 @@ export async function deactivateActiveRagOwner(expectedOwner?: string): Promise<
   let deactivated = false;
   ownerSwitch = ownerSwitch.then(async () => {
     if (normalizedExpectedOwner && activeOwner !== normalizedExpectedOwner) return;
-    activeOwner = null;
-    manifests.clear();
-    pages.clear();
-    chunks.clear();
-    workspace = null;
-    lexicalDb = null;
-    contentLoaded = false;
-    queryEmbeddingCache.clear();
-    remoteRagProvider = null;
-    remoteRagCache = null;
+    clearActiveWorkspaceState(true);
     deactivated = true;
-    emitRagState();
   });
   await ownerSwitch;
   return deactivated;
@@ -1568,6 +1562,7 @@ export async function clearActiveRagWorkspace(expectedOwner = activeOwner) {
   workspace = null;
   lexicalDb = null;
   contentLoaded = false;
+  queryEmbeddingCache.clear();
   emitRagState();
   return true;
 }

@@ -38,9 +38,16 @@ function allowedOrigin() {
 }
 
 function isOriginAllowed(request: RequestLike) {
+  const origin = firstHeader(request.headers?.origin)?.replace(/\/$/, "");
+  if (
+    process.env.NODE_ENV !== "production"
+    && origin
+    && (origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:"))
+  ) {
+    return true;
+  }
   const expected = allowedOrigin();
   if (!expected) return process.env.NODE_ENV !== "production";
-  const origin = firstHeader(request.headers?.origin)?.replace(/\/$/, "");
   if (!origin) return process.env.RAG_GATEWAY_ALLOW_SERVER_CALLS === "true";
   return origin === expected;
 }

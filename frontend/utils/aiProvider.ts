@@ -35,8 +35,20 @@ export type {
   KnowledgeSearchResponse,
 } from "@/utils/agentRuntime";
 
-const CLOUD_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"];
-const ROUTER_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"];
+const CLOUD_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.6-flash",
+];
+const ROUTER_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.6-flash",
+];
 const GEMINI_MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000";
 const CLOUD_AGENT_TIMEOUT_MS = 30_000;
 const conversationRouteCache = new Map<string, ConversationRoute>();
@@ -129,7 +141,10 @@ function agentGenerationConfig(modelName: string) {
   if (modelName === "gemini-2.5-flash") {
     return { thinkingConfig: { thinkingBudget: 0 } };
   }
-  return { thinkingConfig: { thinkingLevel: "low" } };
+  if (modelName.includes("3.5") || modelName.includes("3.6")) {
+    return { thinkingConfig: { thinkingLevel: "low" } };
+  }
+  return {};
 }
 
 function geminiHttpError(status: number, body: unknown): Error & { status: number } {
@@ -554,7 +569,35 @@ export async function streamCloudAgentAnswer(
   throw normalizeCloudError(lastError);
 }
 
+function patchFetchForGeminiRoles(): void {
+  if (typeof globalThis.fetch !== "function") return;
+  const currentFetch = globalThis.fetch;
+  if ((currentFetch as { __geminiRolePatched?: boolean }).__geminiRolePatched) return;
+  const patched = async function geminiRolePatchFetch(
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const url = typeof input === "string"
+      ? input
+      : input instanceof URL
+        ? input.href
+        : (input && typeof (input as Request).url === "string" ? (input as Request).url : "");
+    if (
+      url.includes("generativelanguage.googleapis.com")
+      && typeof init?.body === "string"
+      && init.body.includes('"role":"function"')
+    ) {
+      const patchedBody = init.body.replace(/"role"\s*:\s*"function"/g, '"role":"user"');
+      return currentFetch(input, { ...init, body: patchedBody });
+    }
+    return currentFetch(input, init);
+  };
+  (patched as { __geminiRolePatched?: boolean }).__geminiRolePatched = true;
+  globalThis.fetch = patched;
+}
+
 function clientFor(apiKey: string): GoogleGenerativeAI {
+  patchFetchForGeminiRoles();
   return new GoogleGenerativeAI(normalizeGeminiApiKey(apiKey));
 }
 

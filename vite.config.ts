@@ -18,6 +18,8 @@ export default defineConfig(({ mode }) => {
     }
   }
 
+  Object.assign(process.env, env);
+
   return ({
   build: {
     outDir: "dist",
@@ -36,6 +38,86 @@ export default defineConfig(({ mode }) => {
   },
   plugins: [
     react(),
+    {
+      name: "api-dev-server",
+      configureServer(server: any) {
+        server.middlewares.use(async (req: any, res: any, next: any) => {
+          const url = req.url ? new URL(req.url, "http://localhost").pathname : "";
+          if (url === "/api/ai/v1/chat" || url === "/api/rag/v1/embeddings") {
+            try {
+              let rawBody = "";
+              for await (const chunk of req) {
+                rawBody += chunk;
+              }
+              let body = {};
+              if (rawBody) {
+                try {
+                  body = JSON.parse(rawBody);
+                } catch {
+                  body = {};
+                }
+              }
+              const requestLike = {
+                method: req.method,
+                headers: req.headers,
+                body,
+                socket: req.socket,
+              };
+              const responseLike = {
+                statusCode: 200,
+                setHeader(name: string, value: string) {
+                  res.setHeader(name, value);
+                },
+                status(code: number) {
+                  this.statusCode = code;
+                  res.statusCode = code;
+                  return this;
+                },
+                json(data: unknown) {
+                  if (!res.headersSent) {
+                    res.setHeader("Content-Type", "application/json");
+                    res.statusCode = this.statusCode;
+                  }
+                  res.end(JSON.stringify(data));
+                },
+                write(chunk: unknown) {
+                  if (!res.headersSent) {
+                    res.writeHead(this.statusCode || 200);
+                    res.flushHeaders?.();
+                  }
+                  const ok = res.write(chunk);
+                  res.flush?.();
+                  return ok;
+                },
+                end(data?: unknown) {
+                  return res.end(data);
+                },
+              };
+
+              if (url === "/api/ai/v1/chat") {
+                const chatModule = await server.ssrLoadModule("./api/ai/v1/chat.ts");
+                await chatModule.default(requestLike, responseLike);
+                return;
+              }
+              if (url === "/api/rag/v1/embeddings") {
+                const embModule = await server.ssrLoadModule("./api/rag/v1/embeddings.ts");
+                await embModule.default(requestLike, responseLike);
+                return;
+              }
+            } catch (err) {
+              console.error("Vite API dev server error:", err);
+              if (!res.headersSent) {
+                res.statusCode = 500;
+                res.setHeader("Content-Type", "application/json");
+                res.end(JSON.stringify({ error: "Internal dev server error" }));
+              }
+              return;
+            }
+          }
+          next();
+        });
+      },
+    },
   ],
   resolve: {
     alias: {

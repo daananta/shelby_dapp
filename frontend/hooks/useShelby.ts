@@ -483,7 +483,16 @@ export function useShelby() {
           if (existingIndex >= 0) next[existingIndex] = mockBlob;
           else next.push(mockBlob);
         }
-        sessionStorage.setItem(storageKey, JSON.stringify(next));
+        try {
+          sessionStorage.setItem(storageKey, JSON.stringify(next));
+        } catch (storageError) {
+          console.warn("sessionStorage quota reached for mock uploads; trimming older items.", storageError);
+          try {
+            sessionStorage.setItem(storageKey, JSON.stringify(next.slice(-10)));
+          } catch {
+            /* Keep in-memory if storage is fully exhausted */
+          }
+        }
         assertCurrentUpload();
         setUploadProgress({ phase: "done", completedBytes: totalBytes, totalBytes });
         toast({

@@ -1,6 +1,7 @@
 import { isUsefulExtractedText, type ExtractedPage } from "@/utils/textExtractor";
 import { getCloudErrorKind, ocrPageWithCloud } from "./aiProvider";
 import { localize } from "@/i18n";
+import { getPdfJs } from "@/utils/pdfLoader";
 
 export interface OcrPageResult {
   pageNumber: number;
@@ -39,9 +40,8 @@ export async function ocrPdfPages(
   if (!targets.length) return { pages: [], attemptedPages: 0 };
   if (isCancelled()) return { pages: [], attemptedPages: 0, cancelled: true };
 
-  const [pdfjs, tesseract] = await Promise.all([import("pdfjs-dist"), import("tesseract.js")]);
+  const [pdfjs, tesseract] = await Promise.all([getPdfJs(), import("tesseract.js")]);
   signal?.throwIfAborted();
-  pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
   const loadingTask = pdfjs.getDocument(url);
   let worker: Awaited<ReturnType<typeof tesseract.createWorker>> | null = null;
   let activeRenderTask: { cancel: () => void; promise: Promise<unknown> } | null = null;

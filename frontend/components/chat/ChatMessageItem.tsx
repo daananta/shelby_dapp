@@ -1,6 +1,7 @@
+import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Bookmark, ChevronDown, Database, FileCheck2, ShieldCheck, Sparkles } from "lucide-react";
+import { Bookmark, Check, ChevronDown, Copy, Database, FileCheck2, ShieldCheck, Sparkles } from "lucide-react";
 import type { ChatMessage } from "@/hooks/useChatManager";
 import type { RetrievalResult } from "@/utils/ragTypes";
 import { LiveProofMeter } from "@/components/chat/LiveProofMeter";
@@ -20,6 +21,29 @@ export function ChatMessageItem({
   receiptBusyId,
 }: ChatMessageItemProps) {
   const { t } = useLanguage();
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
+  const copyResetTimerRef = useRef<number | null>(null);
+
+  useEffect(() => () => {
+    if (copyResetTimerRef.current !== null) window.clearTimeout(copyResetTimerRef.current);
+  }, []);
+
+  const copyAnswer = async () => {
+    try {
+      await navigator.clipboard.writeText(message.text);
+      setCopyState("copied");
+    } catch {
+      setCopyState("error");
+    }
+    if (copyResetTimerRef.current !== null) window.clearTimeout(copyResetTimerRef.current);
+    copyResetTimerRef.current = window.setTimeout(() => setCopyState("idle"), 1_800);
+  };
+
+  const copyLabel = copyState === "copied"
+    ? t("Copied", "Đã sao chép")
+    : copyState === "error"
+      ? t("Copy failed", "Không thể sao chép")
+      : t("Copy answer", "Sao chép câu trả lời");
 
   return (
     <div
@@ -32,35 +56,53 @@ export function ChatMessageItem({
       }`}
     >
       {/* Message header */}
-      <div className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-slate-400 dark:text-slate-500">
-        {message.role === "user" ? (
-          <span className="text-indigo-500 dark:text-indigo-400">{t("You", "Bạn")}</span>
-        ) : message.tool === "document_lookup" ? (
-          <>
-            <Bookmark className="h-3 w-3 text-emerald-600" />
-            <span>{t("Sourced answer", "Trả lời có nguồn")}</span>
-          </>
-        ) : message.tool === "blob_inventory" ? (
-          <>
-            <Database className="h-3 w-3 text-emerald-600" />
-            <span>{t("Shelby data", "Dữ liệu Shelby")}</span>
-          </>
-        ) : message.tool === "show_images" ? (
-          <>
-            <Sparkles className="h-3 w-3 text-emerald-600" />
-            <span>{t("AI · Image", "AI · Hình ảnh")}</span>
-          </>
-        ) : message.tool ? (
-          <>
-            <Database className="h-3 w-3 text-emerald-600" />
-            <span>{t("App data", "Dữ liệu từ ứng dụng")}</span>
-          </>
-        ) : (
-          <>
-            <Sparkles className="w-3 h-3 text-indigo-400" />
-            <span>AI</span>
-          </>
-        )}
+      <div className="mb-2 flex min-h-6 items-center justify-between gap-3 text-[11px] font-semibold text-slate-400 dark:text-slate-500">
+        <span className="flex min-w-0 items-center gap-1.5">
+          {message.role === "user" ? (
+            <span className="text-indigo-500 dark:text-indigo-400">{t("You", "Bạn")}</span>
+          ) : message.tool === "document_lookup" ? (
+            <>
+              <Bookmark className="h-3 w-3 text-emerald-600" />
+              <span>{t("Sourced answer", "Trả lời có nguồn")}</span>
+            </>
+          ) : message.tool === "blob_inventory" ? (
+            <>
+              <Database className="h-3 w-3 text-emerald-600" />
+              <span>{t("Shelby data", "Dữ liệu Shelby")}</span>
+            </>
+          ) : message.tool === "show_images" ? (
+            <>
+              <Sparkles className="h-3 w-3 text-emerald-600" />
+              <span>{t("AI · Image", "AI · Hình ảnh")}</span>
+            </>
+          ) : message.tool ? (
+            <>
+              <Database className="h-3 w-3 text-emerald-600" />
+              <span>{t("App data", "Dữ liệu từ ứng dụng")}</span>
+            </>
+          ) : (
+            <>
+              <Sparkles className="h-3 w-3 text-indigo-400" />
+              <span>AI</span>
+            </>
+          )}
+        </span>
+        {message.role === "ai" && !message.typing && message.text.trim() ? (
+          <button
+            type="button"
+            onClick={() => void copyAnswer()}
+            className={`flex h-7 shrink-0 items-center gap-1 rounded-md border px-2 text-[10px] font-bold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+              copyState === "error"
+                ? "border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-400/20 dark:bg-rose-400/10 dark:text-rose-300"
+                : "border-slate-200/80 bg-white/60 text-slate-500 hover:border-emerald-200 hover:text-emerald-700 dark:border-white/10 dark:bg-white/[0.03] dark:text-slate-400 dark:hover:text-lime-300"
+            }`}
+            aria-label={copyLabel}
+            title={copyLabel}
+          >
+            {copyState === "copied" ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+            <span className="hidden sm:inline" aria-live="polite">{copyLabel}</span>
+          </button>
+        ) : null}
       </div>
 
       {/* Message content parsed with react-markdown */}

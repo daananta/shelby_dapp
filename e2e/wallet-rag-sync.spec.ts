@@ -81,6 +81,41 @@ test("keeps all three model choices visible on a narrow mobile viewport", async 
   expect(await selector.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
 });
 
+test("copies a completed AI answer with accessible feedback", async ({ page }) => {
+  const answer = "Shelby keeps document data available for fast, verifiable retrieval.";
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (text: string) => {
+          (window as any).__SHELBY_COPIED_TEXT__ = text;
+        },
+      },
+    });
+  });
+  await page.route("**/api/ai/v1/chat", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ message: { role: "assistant", content: answer } }),
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Kết nối ví để bắt đầu", exact: true }).first().click();
+  await expect(page.getByTestId("wallet-runtime")).toBeVisible();
+  const chatInput = page.getByPlaceholder("Hỏi kiến thức chung hoặc dùng công cụ…");
+  await chatInput.fill("Shelby dùng để làm gì?");
+  await chatInput.press("Enter");
+  await expect(page.getByText(answer, { exact: true })).toBeVisible();
+
+  const copyButton = page.getByRole("button", { name: "Sao chép câu trả lời", exact: true });
+  await expect(copyButton).toHaveCount(1);
+  await copyButton.click();
+  await expect(page.getByRole("button", { name: "Đã sao chép", exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (window as any).__SHELBY_COPIED_TEXT__)).toBe(answer);
+});
+
 test("presents preserved Testnet data as a separate archive from ShelbyNet", async ({ page }) => {
   await page.goto("/");
   await page.evaluate(async () => {

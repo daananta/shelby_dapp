@@ -80,7 +80,7 @@ export function readBlobAccessInfo(blob: unknown): BlobAccessInfo {
   const record = asRecord(blob);
   const onChainPolicy = asRecord(record.accessPolicy) as Partial<AccessPolicyInfo>;
   const onChainType = onChainPolicy.type;
-  if (onChainType && onChainType !== "unknown" && onChainType !== "custom") {
+  if (onChainType && ["none", "timelock", "purchasable", "allowlist"].includes(onChainType)) {
     const tag: BlobAccessTag = onChainType === "none" ? "public" : onChainType === "timelock" ? "time_lock" : onChainType === "purchasable" ? "purchasable" : "allowlist";
     return {
       tag,
@@ -94,7 +94,7 @@ export function readBlobAccessInfo(blob: unknown): BlobAccessInfo {
       onChain: true,
     };
   }
-  if (onChainType === "unknown" || onChainType === "custom") return { tag: "public", allowlist: [], purchasers: [], canAccess: null, onChain: true, unresolved: true };
+  if (record.accessPolicy != null) return { tag: "public", allowlist: [], purchasers: [], canAccess: null, onChain: true, unresolved: true };
   const metadata = asRecord(record.metadata);
   const access = asRecord(record.access ?? metadata.access ?? record.accessControl ?? metadata.accessControl);
   const tags = Array.isArray(record.tags) ? record.tags : Array.isArray(metadata.tags) ? metadata.tags : [];
@@ -157,7 +157,7 @@ export function getBlobAccessDecision(blob: unknown, walletAddress?: string, now
     };
     return { info, eligible: true, needsBroker: false };
   }
-  if (info.onChain && info.canAccess === null) return {
+  if (info.onChain && typeof info.canAccess !== "boolean") return {
     info,
     eligible: false,
     needsBroker: false,
@@ -292,7 +292,10 @@ export async function downloadBlobForRag(params: {
   const response = await fetch(grant.url, { headers: grant.headers, signal: params.signal });
   if (!response.ok) throw new Error(localize(`Unable to download the blob (${response.status}).`, `Không thể tải blob (${response.status}).`));
   const declaredBytes = Number(response.headers.get("content-length") ?? 0);
-  if (declaredBytes > maxBytes) throw new Error(sizeLimitError());
+  if (declaredBytes > maxBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(sizeLimitError());
+  }
   const contentType = response.headers.get("content-type") || "application/octet-stream";
   let readable = response.body;
   if (!readable) {
@@ -311,6 +314,7 @@ export async function downloadBlobForRag(params: {
       while (!streamDone) {
         params.signal?.throwIfAborted();
         const { done, value } = await reader.read();
+        params.signal?.throwIfAborted();
         streamDone = done;
         if (done) continue;
         receivedBytes += value.byteLength;
@@ -322,9 +326,13 @@ export async function downloadBlobForRag(params: {
       throw error;
     } finally {
       params.signal?.removeEventListener("abort", abortReader);
+      reader.releaseLock();
     }
   }
-  if (declaredBytes > 0 && receivedBytes !== declaredBytes) {
+  params.signal?.throwIfAborted();
+  // Fetch exposes decoded bytes, while Content-Length can describe compressed bytes.
+  const encoding = response.headers.get("content-encoding");
+  if ((!encoding || encoding.toLowerCase() === "identity") && declaredBytes > 0 && receivedBytes !== declaredBytes) {
     throw new Error(localize(
       `The Shelby response ended early (${receivedBytes}/${declaredBytes} bytes).`,
       `Dữ liệu Shelby kết thúc sớm (${receivedBytes}/${declaredBytes} byte).`,

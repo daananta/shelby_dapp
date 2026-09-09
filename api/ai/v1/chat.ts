@@ -644,55 +644,38 @@ export default async function handler(request: RequestLike, response: ResponseLi
   const requestStartedAt = Date.now();
   let upstreamHeadersAt: number | undefined;
   try {
-    let upstream: Response;
+    let upstream: Response | undefined;
     let actualUpstreamModel = primaryUpstreamModel;
-    try {
-      upstream = await fetch(primaryEndpoint, {
+    // Primary, fallback and response consumption share one request deadline.
+    const signal = AbortSignal.timeout(45_000);
+    const requestProvider = (endpoint: string, key: string, model: string) => {
+      signal.throwIfAborted();
+      return fetch(endpoint, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${primaryKey}`,
+          Authorization: `Bearer ${key}`,
           "Content-Type": "application/json",
           "HTTP-Referer": allowedOrigin() ?? "https://shelby-rag-explorer.vercel.app",
           "X-Title": "Shelby RAG Explorer",
         },
-        body: JSON.stringify(upstreamRequestBody),
-        signal: AbortSignal.timeout(45_000),
+        body: JSON.stringify({ ...upstreamRequestBody, model }),
+        signal,
       });
-      // Fallback from TokenRouter to OpenRouter if TokenRouter is overloaded/down/rate-limited
-      if (!upstream.ok && preferTokenRouter && openRouterKey && (upstream.status >= 500 || upstream.status === 429)) {
-        const fallbackBody = { ...upstreamRequestBody, model: "qwen/qwen3.7-flash" };
-        actualUpstreamModel = "qwen/qwen3.7-flash";
-        upstream = await fetch(OPENROUTER_ENDPOINT, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${openRouterKey}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": allowedOrigin() ?? "https://shelby-rag-explorer.vercel.app",
-            "X-Title": "Shelby RAG Explorer",
-          },
-          body: JSON.stringify(fallbackBody),
-          signal: AbortSignal.timeout(45_000),
-        });
-      }
+    };
+    try {
+      upstream = await requestProvider(primaryEndpoint, primaryKey, primaryUpstreamModel);
     } catch (fetchErr) {
-      if (preferTokenRouter && openRouterKey) {
-        const fallbackBody = { ...upstreamRequestBody, model: "qwen/qwen3.7-flash" };
-        actualUpstreamModel = "qwen/qwen3.7-flash";
-        upstream = await fetch(OPENROUTER_ENDPOINT, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${openRouterKey}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": allowedOrigin() ?? "https://shelby-rag-explorer.vercel.app",
-            "X-Title": "Shelby RAG Explorer",
-          },
-          body: JSON.stringify(fallbackBody),
-          signal: AbortSignal.timeout(45_000),
-        });
-      } else {
+      if (!preferTokenRouter || !openRouterKey || signal.aborted || isTimeoutError(fetchErr)) {
         throw fetchErr;
       }
     }
+    if (preferTokenRouter && openRouterKey
+      && (!upstream || upstream.status >= 500 || upstream.status === 429)) {
+      await upstream?.body?.cancel().catch(() => undefined);
+      actualUpstreamModel = "qwen/qwen3.7-flash";
+      upstream = await requestProvider(OPENROUTER_ENDPOINT, openRouterKey, actualUpstreamModel);
+    }
+    if (!upstream) throw new Error("Hosted AI returned no response");
     upstreamHeadersAt = Date.now();
     if (!upstream.ok) throw new UpstreamError(upstream.status, upstream.headers.get("retry-after") ?? undefined);
     const upstreamContentType = upstream.headers.get("content-type")?.toLowerCase() ?? "";

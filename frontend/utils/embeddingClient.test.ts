@@ -10,7 +10,7 @@ describe("Gemini embedding credentials", () => {
       const headers = new Headers(init?.headers);
       expect(headers.get("x-goog-api-key")).toBe(authorizationKey);
       return new Response(JSON.stringify({
-        embeddings: [{ values: [3, 4] }],
+        embeddings: [{ values: [3, 4, ...Array(766).fill(0)] }],
       }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -19,7 +19,14 @@ describe("Gemini embedding credentials", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(embedTexts(["hello"], "passage", undefined, "gemini", ` ${authorizationKey} `))
-      .resolves.toEqual([[0.6, 0.8]]);
+      .resolves.toEqual([[0.6, 0.8, ...Array(766).fill(0)]]);
     expect(fetchMock).toHaveBeenCalledOnce();
   });
+
+  it.each([null, { embeddings: [null] }, { embeddings: [{ values: [3, 4] }] }, { embeddings: [{ values: Array(768).fill(0) }] }])(
+    "rejects malformed embeddings before indexing (case %#)", async (payload) => {
+      vi.stubGlobal("fetch", vi.fn(async () => Response.json(payload)));
+      await expect(embedTexts(["hello"], "passage", undefined, "gemini", "AQ.mock-key")).rejects.toThrow();
+    },
+  );
 });

@@ -59,6 +59,48 @@ function streamingResponseRecorder() {
 }
 
 describe("hosted Qwen gateway", () => {
+  it("does not retry a failed fallback after the primary returns 503", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.TOKENROUTER_API_KEY = "primary-test-key";
+    process.env.OPENROUTER_API_KEY = "fallback-test-key";
+    const cancel = vi.fn();
+    const upstream = vi.fn()
+      .mockResolvedValueOnce(new Response(new ReadableStream({ cancel }), { status: 503 }))
+      .mockRejectedValue(new TypeError("Network failed"));
+    vi.stubGlobal("fetch", upstream);
+    const recorder = responseRecorder();
+    await handler({ method: "POST", headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.201" }, body: { messages: [{ role: "user", content: "Hello" }] } }, recorder.response);
+    expect(recorder.read().statusCode).toBe(502);
+    expect(upstream).toHaveBeenCalledTimes(2);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(upstream.mock.calls[0][1].signal).toBe(upstream.mock.calls[1][1].signal);
+  });
+
+  it("uses the fallback once when the primary has a network failure", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.TOKENROUTER_API_KEY = "primary-test-key";
+    process.env.OPENROUTER_API_KEY = "fallback-test-key";
+    const upstream = vi.fn().mockRejectedValueOnce(new TypeError("Network failed"))
+      .mockResolvedValueOnce(Response.json({ choices: [{ message: { role: "assistant", content: "Recovered." } }] }));
+    vi.stubGlobal("fetch", upstream);
+    const recorder = responseRecorder();
+    await handler({ method: "POST", headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.202" }, body: { messages: [{ role: "user", content: "Hello" }] } }, recorder.response);
+    expect(recorder.read()).toMatchObject({ statusCode: 200, payload: { model: "qwen/qwen3.7-flash" } });
+    expect(upstream).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not start a fallback after the provider deadline expires", async () => {
+    process.env.APP_ORIGIN = "https://example.test";
+    process.env.TOKENROUTER_API_KEY = "primary-test-key";
+    process.env.OPENROUTER_API_KEY = "fallback-test-key";
+    const upstream = vi.fn().mockRejectedValue(new DOMException("Timed out", "TimeoutError"));
+    vi.stubGlobal("fetch", upstream);
+    const recorder = responseRecorder();
+    await handler({ method: "POST", headers: { origin: "https://example.test", "x-forwarded-for": "203.0.113.203" }, body: { messages: [{ role: "user", content: "Hello" }] } }, recorder.response);
+    expect(recorder.read().statusCode).toBe(504);
+    expect(upstream).toHaveBeenCalledOnce();
+  });
+
   it("keeps the provider key server-side and pins the model", async () => {
     process.env.APP_ORIGIN = "https://example.test";
     process.env.OPENROUTER_API_KEY = "server-only-test-key";

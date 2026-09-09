@@ -49,16 +49,16 @@ Requirements:
 
 ```bash
 npm install
-cp .env.example .env
+cp .env.example .env.local
 npm run dev:fullstack
 ```
 
 Open `http://localhost:5173`, connect a wallet, select eligible blobs, and
 choose **Create RAG**.
 
-`npm run dev` starts the Vite frontend only. Use it for UI work that does not
-need the server-side AI routes; hosted Qwen chat and vision require
-`npm run dev:fullstack` or a deployed environment.
+`npm run dev` starts Vite with local middleware for the chat and embedding
+gateways. `npm run dev:fullstack` runs the Vercel development environment.
+Both need the relevant server credentials in `.env.local` for real AI calls.
 
 ## Configuration
 
@@ -89,6 +89,8 @@ See [.env.example](.env.example) for the complete template and
   RAG snapshot, and are not uploaded to Shelby.
 - Local indexes, chat history, remote caches, and upload journals are isolated by network and wallet address.
 - Unknown or unverifiable access policies fail closed.
+- Restricted on-chain allowlist and purchase policies require an explicit
+  boolean access decision; an omitted decision never grants access.
 - Access metadata does not encrypt raw blob bytes; sensitive content still
   requires end-to-end encryption.
 - Optional cloud OCR and semantic indexing can send selected document content to
@@ -96,6 +98,20 @@ See [.env.example](.env.example) for the complete template and
   available without them.
 - AI chat sends the question and only the retrieved excerpts or indexed image
   needed for that answer to the selected provider.
+- Each hosted AI request shares a 45-second deadline across the primary
+  provider and at most one fallback. This is a per-request limit, not a
+  whole-agent-turn limit.
+- Browser and hosted embedding paths reject malformed, zero-length-magnitude,
+  and non-768-dimensional vectors before indexing. Hosted embedding batches
+  share one 25-second deadline.
+
+## GitHub-only review branch
+
+`vercel.json` disables automatic Git deployments for
+`codex/shelby-rag-hardening`. Pushing this review branch does not request a
+Vercel deployment; other branches retain their existing deployment behavior.
+Merging into a deployment-enabled branch can deploy and requires a separate
+release decision.
 
 ## Supported content
 

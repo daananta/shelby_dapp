@@ -1,15 +1,11 @@
 import { getStoredCloudApiKey } from "@/utils/cloudKeyStorage";
 import { normalizeGeminiApiKey } from "@/utils/geminiApiKey";
 import { localize } from "@/i18n";
+import { EMBEDDING_DIMENSIONS, normalizeEmbeddingVector } from "../../shared/embeddingVectors";
 
 export type EmbeddingProvider = "gemini" | "gateway";
 export const RAG_GATEWAY_URL = (import.meta.env.VITE_RAG_PIPELINE_API_URL ?? "").replace(/\/$/, "");
 const GEMINI_EMBEDDING_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents";
-
-function normalizeVector(vector: number[]): number[] {
-  const magnitude = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
-  return vector.map((value) => value / magnitude);
-}
 
 async function embedRemote(
   texts: string[],
@@ -45,7 +41,7 @@ async function embedRemote(
             model: "models/gemini-embedding-001",
             content: { parts: [{ text }] },
             taskType: kind === "query" ? "RETRIEVAL_QUERY" : "RETRIEVAL_DOCUMENT",
-            outputDimensionality: 768,
+            outputDimensionality: EMBEDDING_DIMENSIONS,
           })),
         }),
         cache: "no-store",
@@ -61,13 +57,17 @@ async function embedRemote(
         `Nguồn tạo tìm kiếm theo ý nghĩa ${provider} thất bại (${response.status})${detail ? `: ${detail}` : ""}`,
       ));
     }
-    const payload = await response.json() as { embeddings?: Array<{ values?: number[] }>; vectors?: number[][] };
-    const vectors = payload.vectors ?? payload.embeddings?.map((item) => item.values ?? []) ?? [];
-    if (vectors.length !== batch.length || vectors.some((vector) => !vector.length)) throw new Error(localize(
+    const payload = await response.json() as { embeddings?: unknown; vectors?: unknown } | null;
+    signal?.throwIfAborted();
+    const vectors = provider === "gateway" ? payload?.vectors
+      : Array.isArray(payload?.embeddings) ? payload.embeddings.map((item: unknown) => (
+        item && typeof item === "object" && "values" in item ? item.values : undefined
+      )) : undefined;
+    if (!Array.isArray(vectors) || vectors.length !== batch.length) throw new Error(localize(
       `Semantic search provider ${provider} returned incomplete data.`,
       `Nguồn tạo tìm kiếm theo ý nghĩa ${provider} trả dữ liệu không đầy đủ.`,
     ));
-    output.push(...vectors.map(normalizeVector));
+    output.push(...vectors.map(normalizeEmbeddingVector));
     onProgress?.(`Embedding ${provider}: ${Math.min(offset + batch.length, texts.length)}/${texts.length} chunks…`);
   }
   return output;

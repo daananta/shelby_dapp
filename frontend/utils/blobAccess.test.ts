@@ -4,6 +4,70 @@ import { downloadBlobForRag, getBlobAccessDecision, isRagSourceEligible, parseTi
 afterEach(() => vi.unstubAllGlobals());
 
 describe("blob access policy", () => {
+  it.each([
+    {},
+    { type: "future-policy", canAccess: true },
+    { type: "allowlist" },
+    { type: "purchasable", canAccess: "true" },
+  ])("rejects incomplete or unsupported on-chain policy %j before downloading", async (accessPolicy) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const blob = { accessPolicy };
+    expect(getBlobAccessDecision(blob, "0x1").eligible).toBe(false);
+    await expect(downloadBlobForRag({
+      owner: "0x1", blobName: "private.pdf", walletAddress: "0x1",
+      signMessage: async () => ({}), blob,
+    })).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects cancellation while a stream read is waiting instead of returning a partial blob", async () => {
+    const controller = new AbortController();
+    let reading!: () => void;
+    const readStarted = new Promise<void>((resolve) => { reading = resolve; });
+    const stream = new ReadableStream<Uint8Array>({ pull() { reading(); } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(stream)));
+    const pending = downloadBlobForRag({
+      owner: "0x1", blobName: "slow.pdf", walletAddress: "0x1",
+      signMessage: async () => ({}), blob: {}, signal: controller.signal,
+    });
+    await readStarted;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(stream.locked).toBe(false);
+  });
+
+  it("cancels an oversized response before consuming its body", async () => {
+    const cancel = vi.fn();
+    const stream = new ReadableStream<Uint8Array>({ cancel });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(stream, { headers: { "content-length": "100" } })));
+    await expect(downloadBlobForRag({
+      owner: "0x1", blobName: "large.pdf", walletAddress: "0x1",
+      signMessage: async () => ({}), blob: {}, maxBytes: 10,
+    })).rejects.toThrow(/download limit/);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("checks decoded size without mistaking compressed content length for truncation", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("decoded document", {
+      headers: { "content-length": "5", "content-encoding": "gzip" },
+    })));
+    const downloaded = await downloadBlobForRag({
+      owner: "0x1", blobName: "document.txt", walletAddress: "0x1",
+      signMessage: async () => ({}), blob: {},
+    });
+    expect(await downloaded.content.text()).toBe("decoded document");
+    downloaded.dispose();
+  });
+
+  it("rejects a truncated uncompressed response", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("short", { headers: { "content-length": "100" } })));
+    await expect(downloadBlobForRag({
+      owner: "0x1", blobName: "document.txt", walletAddress: "0x1",
+      signMessage: async () => ({}), blob: {},
+    })).rejects.toThrow(/ended early/);
+  });
+
   it("normalizes extension tags and allowlists", () => {
     const info = readBlobAccessInfo({ metadata: { access: { tag: "allow-list", addresses: ["0xAbC"] } } });
     expect(info).toMatchObject({ tag: "allowlist", allowlist: ["0xabc"] });

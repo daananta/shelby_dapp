@@ -44,7 +44,11 @@ function validRecord(value: unknown): value is UploadJournalRecord {
 export function loadUploadJournal(network: SupportedShelbyNetwork, owner: string): UploadJournalRecord[] {
   try {
     const parsed = JSON.parse(localStorage.getItem(uploadJournalKey(network, owner)) ?? "[]");
-    return Array.isArray(parsed) ? parsed.filter(validRecord) : [];
+    return Array.isArray(parsed) ? parsed.filter((record): record is UploadJournalRecord => (
+      validRecord(record)
+      && record.network === network
+      && record.owner.toLowerCase() === owner.toLowerCase()
+    )) : [];
   } catch {
     return [];
   }

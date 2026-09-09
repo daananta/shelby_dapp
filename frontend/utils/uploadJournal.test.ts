@@ -40,6 +40,20 @@ describe("network-scoped upload journal", () => {
     expect(loadUploadJournal("testnet", "0xabc")).toEqual([]);
   });
 
+  it("rejects a valid record copied into another wallet or network storage key", () => {
+    const record = {
+      version: 1, network: "shelbynet", owner: "0xABC", blobName: "report.pdf",
+      size: 42, merkleRoot: "abcd", uid: "7", registrationHash: "0xregister",
+      expirationMicros: 1_900_000_000_000_000, stage: "registered", updatedAt: 1,
+    };
+    localStorage.setItem(uploadJournalKey("shelbynet", "0xdef"), JSON.stringify([record]));
+    localStorage.setItem(uploadJournalKey("testnet", "0xabc"), JSON.stringify([record]));
+    expect(loadUploadJournal("shelbynet", "0xdef")).toEqual([]);
+    expect(loadUploadJournal("testnet", "0xabc")).toEqual([]);
+    localStorage.setItem(uploadJournalKey("shelbynet", "0xabc"), JSON.stringify([record]));
+    expect(loadUploadJournal("shelbynet", "0xabc")).toEqual([record]);
+  });
+
   it("does not abort an upload flow when browser storage is unavailable", () => {
     vi.stubGlobal("localStorage", {
       getItem: () => null,

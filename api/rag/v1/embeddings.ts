@@ -1,3 +1,5 @@
+import { EMBEDDING_DIMENSIONS, normalizeEmbeddingVector } from "../../../shared/embeddingVectors.js";
+
 type HeaderValue = string | string[] | undefined;
 type RequestLike = { method?: string; body?: unknown; headers?: Record<string, HeaderValue>; socket?: { remoteAddress?: string } };
 type ResponseLike = {
@@ -68,11 +70,6 @@ function consumeRateLimit(request: RequestLike) {
   return bucket.count <= RATE_LIMIT;
 }
 
-function normalize(vector: number[]): number[] {
-  const magnitude = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
-  return vector.map((value) => value / magnitude);
-}
-
 /** Same-origin Vercel gateway. Set GEMINI_API_KEY only in the deployment environment. */
 export default async function handler(request: RequestLike, response: ResponseLike) {
   response.setHeader("Cache-Control", "no-store");
@@ -108,6 +105,7 @@ export default async function handler(request: RequestLike, response: ResponseLi
 
   try {
     const vectors: number[][] = [];
+    const signal = AbortSignal.timeout(25_000);
     for (let offset = 0; offset < texts.length; offset += 20) {
       const batch = texts.slice(offset, offset + 20);
       const upstream = await fetch(ENDPOINT, {
@@ -118,18 +116,21 @@ export default async function handler(request: RequestLike, response: ResponseLi
             model: "models/gemini-embedding-001",
             content: { parts: [{ text }] },
             taskType: kind === "query" ? "RETRIEVAL_QUERY" : "RETRIEVAL_DOCUMENT",
-            outputDimensionality: 768,
+            outputDimensionality: EMBEDDING_DIMENSIONS,
           })),
         }),
-        signal: AbortSignal.timeout(25_000),
+        signal,
       });
       if (!upstream.ok) throw new EmbeddingProviderError(upstream.status, upstream.headers.get("retry-after") ?? undefined);
-      const payload = await upstream.json() as { embeddings?: Array<{ values?: number[] }> };
-      const batchVectors = payload.embeddings?.map((item) => item.values ?? []) ?? [];
-      if (batchVectors.length !== batch.length || batchVectors.some((vector) => !vector.length)) throw new Error("Gemini embedding response was incomplete");
-      vectors.push(...batchVectors.map(normalize));
+      const payload = await upstream.json() as { embeddings?: unknown } | null;
+      if (!Array.isArray(payload?.embeddings) || payload.embeddings.length !== batch.length) {
+        throw new Error("Gemini embedding response was incomplete");
+      }
+      vectors.push(...payload.embeddings.map((item: unknown) => normalizeEmbeddingVector(
+        item && typeof item === "object" && "values" in item ? item.values : undefined,
+      )));
     }
-    response.status(200).json({ vectors, model: "gemini-embedding-001", dimensions: 768 });
+    response.status(200).json({ vectors, model: "gemini-embedding-001", dimensions: EMBEDDING_DIMENSIONS });
   } catch (error) {
     console.error("RAG gateway embedding failure", error);
     if (isTimeoutError(error)) {
